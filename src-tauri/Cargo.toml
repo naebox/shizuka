@@ -1,0 +1,54 @@
+[package]
+name = "shizuka"
+version = "0.1.0"
+description = "Shizuka — Local Real-Time AI Microphone Noise Cancellation powered by DeepFilterNet3 + Neural VAD Gate"
+authors = ["seedling-nae"]
+edition = "2021"
+
+[lib]
+name = "shizuka_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+dirs = "5"
+
+# Cross-platform low-latency audio & lock-free buffers
+cpal = "0.15"
+ringbuf = "0.4"
+rubato = "0.16"
+audio_thread_priority = "0.34"
+
+# DeepFilterNet3 native Rust engine (Low-Latency 0-lookahead model bundled)
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", package = "deep_filter", default-features = false, features = ["tract", "default-model-ll"] }
+# Pin tract sub-crates to 0.21.4 (the exact version DeepFilterNet3 libDF targets before tract's 0.21.8+ breaking API change)
+tract-onnx = "=0.21.4"
+tract-core = "=0.21.4"
+tract-hir = "=0.21.4"
+tract-pulse = "=0.21.4"
+tract-data = "=0.21.4"
+tract-linalg = "=0.21.4"
+tract-onnx-opl = "=0.21.4"
+ndarray = "0.15"
+
+# Important: build dependencies (tract / rubato / deep_filter) with opt-level = 3 and debug-assertions = false
+# so real-time 10ms budget never glitches AND tract-core 0.21.4 does not trip its debug-only duplicate const name
+# assertion (`/convt3/Conv.bias`) when loading official DeepFilterNet3_onnx.tar.gz!
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
+
+[profile.test.package."*"]
+opt-level = 3
+debug-assertions = false
+
+[profile.release]
+strip = true

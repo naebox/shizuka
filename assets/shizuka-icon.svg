@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="512" height="512" role="img" aria-label="Shizuka">
+  <defs>
+    <linearGradient id="outer-ripple-fade" x1="0.15" y1="0.1" x2="0.85" y2="0.9">
+      <stop offset="0%" stop-color="#3E3E44" stop-opacity="0.85" />
+      <stop offset="65%" stop-color="#2E2E33" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#242428" stop-opacity="0.18" />
+    </linearGradient>
+    <radialGradient id="jade-led-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#10B981" stop-opacity="0.42" />
+      <stop offset="55%" stop-color="#10B981" stop-opacity="0.14" />
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <!-- Matte Sumi-Black Squircle Tile -->
+  <rect x="4" y="4" width="92" height="92" rx="22" fill="#0B0B0C" stroke="#2B2B30" stroke-width="1.5" />
+
+  <!-- Subtle Outer Stillness Ripple Ring -->
+  <circle cx="50" cy="50" r="39.5" fill="none" stroke="url(#outer-ripple-fade)" stroke-width="1.35" />
+
+  <!-- Bold Zen Ensō Ring with 4:30 Opening -->
+  <path
+    d="M 60.43 78.66 A 30.5 30.5 0 1 1 78.66 60.43"
+    fill="none"
+    stroke="#FAFAFA"
+    stroke-width="5.4"
+    stroke-linecap="round"
+  />
+
+  <!-- Integrated Precision Jade-Emerald LED Dot in the Ensō Opening -->
+  <circle cx="71.57" cy="71.57" r="9.8" fill="url(#jade-led-glow)" />
+  <circle cx="71.57" cy="71.57" r="4.3" fill="#10B981" />
+
+  <!-- 3 Bold Symmetrical Pure-White Voice Bars -->
+  <rect x="35.1" y="39.5" width="6.8" height="21" rx="3.4" fill="#FAFAFA" />
+  <rect x="46.6" y="32.5" width="6.8" height="35" rx="3.4" fill="#FAFAFA" />
+  <rect x="58.1" y="39.5" width="6.8" height="21" rx="3.4" fill="#FAFAFA" />
+</svg>
