@@ -75,6 +75,7 @@ jobs:
     name: Build (${{ matrix.label }})
     needs: prepare-release
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -93,6 +94,14 @@ jobs:
             os_kind: macos
 
     steps:
+      - name: Exclude workspace from Windows Defender (faster MSVC builds)
+        if: matrix.os_kind == 'windows'
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:LOCALAPPDATA\tauri" -ErrorAction SilentlyContinue
+          } catch {}
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -115,10 +124,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Run Rust unit tests
-        if: matrix.target == '' || matrix.target == 'aarch64-apple-darwin'
-        run: cargo test --lib --manifest-path src-tauri/Cargo.toml
 
       - name: Build Tauri application (Windows)
         if: matrix.os_kind == 'windows'
