@@ -13,6 +13,23 @@
 
 **Shizuka（静か）** は、クラウド送信なしで動作するタスクトレイ常駐型のリアルタイム AI マイクノイズ除去アプリです。キーボード打鍵音・エアコン音・周囲の生活音を強力に抑えつつ、自然な声だけを仮想マイク経由で Discord / Zoom / Teams / Google Meet 等へ届けます。プロジェクト全体が **MIT ライセンス**（他社プロプライエタリ／GPL バイナリの同梱なし）で構成されています。
 
+## ダウンロード（ビルド済みアプリ）
+
+最新版のインストーラ／実行ファイルは **[GitHub Releases](https://github.com/seedling-nae/shizuka/releases/latest)** からそのままダウンロードできます。
+
+| OS | ファイル | 説明 |
+| --- | --- | --- |
+| **Windows (x64)** | `Shizuka_*_x64-setup.exe` | 推奨インストーラ（NSIS・日本語対応） |
+| **Windows (x64)** | `Shizuka_*_windows_x64_portable.zip` | インストール不要のポータブル版 |
+| **Windows (x64)** | `Shizuka_*_x64_en-US.msi` | MSI パッケージ |
+| **macOS (Apple Silicon)** | `Shizuka_*_aarch64.dmg` | M1 / M2 / M3 / M4 搭載 Mac 向け |
+| **macOS (Intel)** | `Shizuka_*_x64.dmg` | Intel Mac 向け |
+
+> [!NOTE]
+> 個人ビルド（未署名）のため、初回起動時に OS の警告が表示される場合があります。
+> - **Windows**: SmartScreen が表示された場合は「詳細情報」→「実行」をクリックしてください。
+> - **macOS**: 初回はアプリを右クリック →「開く」（または「システム設定 → プライバシーとセキュリティ → このまま開く」）から起動してください。
+
 ## 主な特徴
 
 - **2 つの DeepFilterNet3 モデルをアプリ内で即時切替**

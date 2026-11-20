@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(target_os = "windows")]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
