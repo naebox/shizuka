@@ -3,16 +3,81 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crate::audio::devices::list_audio_devices;
+use crate::diagnostics;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+static INSTALL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct InstallLockGuard;
+
+impl InstallLockGuard {
+    fn acquire() -> Result<Self> {
+        if INSTALL_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Ok(Self)
+        } else {
+            Err(anyhow!("仮想マイクドライバのセットアップがすでに進行中です。"))
+        }
+    }
+}
+
+impl Drop for InstallLockGuard {
+    fn drop(&mut self) {
+        INSTALL_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+/// RAII cleanup guard guaranteeing temporary driver archives and extracted files are
+/// ALWAYS removed on every normal or early-error return path (AGENTS.md Invariant #1).
+struct TempDirGuard(PathBuf);
+
+impl TempDirGuard {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Escapes a path for safe embedding inside POSIX single-quoted strings (`'...'`).
+pub fn escape_posix_single_quoted(raw: &str) -> String {
+    raw.replace('\'', "'\\''")
+}
+
+/// Escapes an arbitrary string for safe embedding inside an AppleScript double-quoted string literal.
+pub fn escape_applescript_string(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Builds the full AppleScript `do shell script "..." with administrator privileges` command
+/// with proper two-layer escaping (POSIX single quotes first, then AppleScript double quotes).
+pub fn build_macos_hal_applescript(bundle_path: &Path) -> String {
+    let escaped_path = escape_posix_single_quoted(&bundle_path.to_string_lossy());
+    let shell_cmd = format!(
+        "rm -rf '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && cp -R '{}' '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && (xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' 2>/dev/null || true) && chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && launchctl kickstart -kp system/com.apple.audio.coreaudiod",
+        escaped_path
+    );
+    format!(
+        "do shell script \"{}\" with administrator privileges",
+        escape_applescript_string(&shell_cmd)
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallDriverResult {
@@ -41,6 +106,8 @@ pub fn find_bundled_macos_driver(resource_dir: Option<&Path>) -> Option<PathBuf>
 }
 
 pub fn install_virtual_audio_driver(resource_dir: Option<PathBuf>) -> Result<InstallDriverResult> {
+    let _lock = InstallLockGuard::acquire()?;
+    diagnostics::info("Starting virtual audio driver setup");
     #[cfg(target_os = "windows")]
     {
         let _ = resource_dir;
@@ -144,9 +211,11 @@ fn find_setup_exe(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
-    let work_dir = std::env::temp_dir().join("shizuka-vbcable-setup");
-    let _ = fs::remove_dir_all(&work_dir);
-    fs::create_dir_all(&work_dir).context("一時作業フォルダの作成に失敗しました")?;
+    let work_path = std::env::temp_dir().join(format!("shizuka-vbcable-setup-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&work_path);
+    fs::create_dir_all(&work_path).context("一時作業フォルダの作成に失敗しました")?;
+    let work_guard = TempDirGuard(work_path);
+    let work_dir = work_guard.path();
 
     let zip_path = work_dir.join("vbcable_official.zip");
     let extract_dir = work_dir.join("extracted");
@@ -176,7 +245,6 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
     }
 
     if !downloaded {
-        let _ = fs::remove_dir_all(&work_dir);
         return Err(anyhow!(
             "VB-Audio 公式サイトからドライバパッケージを取得できませんでした。インターネット接続をご確認ください。"
         ));
@@ -187,12 +255,10 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
     let ext_str = extract_dir.to_string_lossy().to_string();
     let tar_out = run_hidden(Command::new("tar.exe").args(["-xf", &zip_str, "-C", &ext_str]))?;
     if !tar_out.status.success() {
-        let _ = fs::remove_dir_all(&work_dir);
         return Err(anyhow!("ダウンロードしたドライバ ZIP の展開に失敗しました。"));
     }
 
     let setup_exe = find_setup_exe(&extract_dir).ok_or_else(|| {
-        let _ = fs::remove_dir_all(&work_dir);
         anyhow!("展開されたアーカイブ内に VBCABLE_Setup 実行ファイルが見つかりませんでした。")
     })?;
 
@@ -221,8 +287,8 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
         &ps_script,
     ]));
 
-    // Clean up temporary downloaded files regardless of outcome
-    let _ = fs::remove_dir_all(&work_dir);
+    // Clean up temporary downloaded files immediately after installer exits
+    drop(work_guard);
 
     match install_out {
         Ok(out) if out.status.success() => {}
@@ -269,9 +335,11 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
 
 #[cfg(target_os = "macos")]
 fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDriverResult> {
-    let work_dir = std::env::temp_dir().join("shizuka-hal-install");
-    let _ = fs::remove_dir_all(&work_dir);
-    fs::create_dir_all(&work_dir).context("一時作業フォルダの作成に失敗しました")?;
+    let work_path = std::env::temp_dir().join(format!("shizuka-hal-install-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&work_path);
+    fs::create_dir_all(&work_path).context("一時作業フォルダの作成に失敗しました")?;
+    let work_guard = TempDirGuard(work_path);
+    let work_dir = work_guard.path();
     let bundle_dir = work_dir.join("ShizukaAudio.driver");
 
     if let Some(prebuilt) = find_bundled_macos_driver(resource_dir) {
@@ -286,7 +354,6 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
             .context("同梱ドライバの一時コピーに失敗しました")?;
         if !copy_out.status.success() {
             let stderr = String::from_utf8_lossy(&copy_out.stderr);
-            let _ = fs::remove_dir_all(&work_dir);
             return Err(anyhow!("同梱ドライバの展開に失敗しました: {}", stderr));
         }
     } else {
@@ -306,6 +373,7 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
 
         let compile = Command::new("clang")
             .args([
+                "-std=c11",
                 "-O3",
                 "-bundle",
                 "-arch",
@@ -326,11 +394,10 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
 
         if !compile.status.success() {
             let stderr = String::from_utf8_lossy(&compile.stderr);
-            let _ = fs::remove_dir_all(&work_dir);
             return Err(anyhow!("MIT 仮想オーディオドライバのビルドに失敗しました: {}", stderr));
         }
 
-        let _ = Command::new("codesign")
+        let sign_out = Command::new("codesign")
             .args([
                 "--force",
                 "--deep",
@@ -338,21 +405,25 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
                 "-",
                 bundle_dir.to_str().unwrap_or_default(),
             ])
-            .output();
+            .output()
+            .context("ドライバへのアドホック署名 (codesign) の起動に失敗しました")?;
+        if !sign_out.status.success() {
+            let stderr = String::from_utf8_lossy(&sign_out.stderr);
+            return Err(anyhow!(
+                "仮想オーディオドライバの署名 (codesign) に失敗しました: {}",
+                stderr
+            ));
+        }
     }
 
-    let bundle_escaped = bundle_dir.to_string_lossy().replace('\'', "'\\''");
-    let osa_cmd = format!(
-        "do shell script \"rm -rf '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && cp -R '{}' '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && (xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' 2>/dev/null || true) && chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && launchctl kickstart -kp system/com.apple.audio.coreaudiod\" with administrator privileges",
-        bundle_escaped
-    );
+    let osa_cmd = build_macos_hal_applescript(&bundle_dir);
 
     let osa_out = Command::new("osascript")
         .args(["-e", &osa_cmd])
         .output()
         .context("管理者権限プロンプトの起動に失敗しました")?;
 
-    let _ = fs::remove_dir_all(&work_dir);
+    drop(work_guard);
 
     if !osa_out.status.success() {
         return Err(anyhow!("ドライバの配置がキャンセルされたか失敗しました。"));
@@ -408,5 +479,15 @@ mod tests {
         assert_eq!(find_bundled_macos_driver(Some(&dir)), Some(drv));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_macos_applescript_two_layer_escaping() {
+        let tricky = Path::new(r#"/tmp/a'b"c\d/ShizukaAudio.driver"#);
+        let script = build_macos_hal_applescript(tricky);
+        // Backslashes and double-quotes inside the AppleScript literal must be escaped
+        assert!(script.starts_with("do shell script \""));
+        assert!(script.ends_with("\" with administrator privileges"));
+        assert!(script.contains(r#"a'\\''b\"c\\d"#));
     }
 }

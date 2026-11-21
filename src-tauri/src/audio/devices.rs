@@ -226,3 +226,33 @@ pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: boo
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_device_filtering_and_virtual_priority() {
+        // AGENTS.md Invariant #4: hide auxiliary 16ch virtual endpoints
+        assert!(should_hide_device("CABLE In 16ch (VB-Audio Virtual Cable)"));
+        assert!(should_hide_device("CABLE Out 16ch (VB-Audio Virtual Cable)"));
+        assert!(!should_hide_device("CABLE Input (VB-Audio Virtual Cable)"));
+        assert!(!should_hide_device("CABLE Output (VB-Audio Virtual Cable)"));
+        assert!(!should_hide_device("Shizuka Virtual Mic"));
+
+        assert!(is_virtual_audio_device("Shizuka Virtual Mic"));
+        assert!(is_virtual_audio_device("CABLE Input (VB-Audio Virtual Cable)"));
+        assert!(is_virtual_audio_device("BlackHole 2ch"));
+        assert!(!is_virtual_audio_device("In 1-2 (MOTU M Series)"));
+
+        assert!(
+            virtual_output_priority("Shizuka Virtual Mic")
+                > virtual_output_priority("BlackHole 2ch")
+        );
+        assert!(
+            virtual_output_priority("CABLE Input (VB-Audio Virtual Cable)")
+                > virtual_output_priority("VoiceMeeter Input")
+        );
+        assert_eq!(virtual_output_priority("Realtek High Definition Audio"), 0);
+    }
+}

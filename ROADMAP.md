@@ -82,7 +82,25 @@ flowchart LR
 
 ---
 
-## Phase 4: `v1.0.0` — 正式版リリース（両 OS 実機検証・長時間耐久・仕上げ）
+## Phase 4: `v1.0.0` — 正式版リリース（品質強化・両 OS 実機検証・長時間耐久・仕上げ）
+
+### 正式版前の品質強化（ハードニング）
+
+- [x] **リアルタイム音声エンジン＆メモリ安全性強化** ([engine.rs](./src-tauri/src/audio/engine.rs), [processor.rs](./src-tauri/src/audio/processor.rs), [resampler.rs](./src-tauri/src/audio/resampler.rs))
+  - 入力ストリーム初期化失敗時の RT スレッド・モデルメモリリークを RAII ドロップガード＋`RunningPipeline::Drop` で完全防止。
+  - OS コールバックサイズに応じた動的出力バッファ目標・出力側スタール検知 Watchdog・健全稼働継続時のみバックオフ解除・モニター明示指定時のスピーカー誤フォールバック（ハウリング）防止を実装。
+  - ミュート中再接続／モデル切替時の先頭 10ms 音漏れゼロ化、入力ゲインのサンプル単位スムージング、無音時 Denormal フラッシュ＆`NaN/Inf` ガード、4ch 以上オーディオ I/F の単一 XLR 音量維持、非 48kHz のアンチエイリアス Sinc リサンプリング、停止中マイク切替時のプロファイル保護を実装。
+- [x] **macOS CoreAudio HAL ドライバ品質修正** ([ShizukaAudio.c](./drivers/macos-hal/ShizukaAudio.c), [build_driver.sh](./drivers/macos-hal/build_driver.sh))
+  - `ReadInput` の未書込み領域をフレーム単位で即無音化（停止・再開時の残響ノイズ根絶）、`CV_GetZeroTimeStamp` のロックフリー seqlock による C11 データ競合解消、`kAudioPlugInPropertyResourceBundle` の `CFRetain` 規約準拠、`-std=c11 -Werror` ビルド検証化。
+- [x] **常駐省電力・クリーン終了・アップデータ／インストーラ堅牢化** ([telemetryStore.ts](./src/telemetryStore.ts), [LiveTelemetryWidgets.tsx](./src/components/LiveTelemetryWidgets.tsx), [config.rs](./src-tauri/src/config.rs), [lib.rs](./src-tauri/src/lib.rs), [updater.rs](./src-tauri/src/updater.rs), [installer.rs](./src-tauri/src/installer.rs))
+  - ウィンドウ非表示時（通知領域／メニューバー常駐中）の 20Hz IPC ポーリングを完全停止し、表示中もメーター系リーフコンポーネントのみ分離更新。設定保存をバックグラウンドデバウンス書き込み（`ConfigSaver`）へ移行してスライダー操作時の同期 `fsync` 嵐を解消。
+  - 完了待ち付き `stop_and_wait`＋`RunEvent::Exit`＋macOS `RunEvent::Reopen`、アップデータの署名検証後停止＆失敗時自動復帰＆多重実行ガード、インストーラの RAII 一時ファイル確実削除＆AppleScript 2 重エスケープ＆MSI カスタムパス判定改善を実装。
+- [x] **セキュリティ・UX 整合性・診断ログ強化・アトミックリリース化** ([tauri.conf.json](./src-tauri/tauri.conf.json), [default.json](./src-tauri/capabilities/default.json), [release.yml](./.github/workflows/release.yml), [diagnostics.rs](./src-tauri/src/diagnostics.rs), [App.tsx](./src/App.tsx))
+  - WebView CSP を有効化し、最小権限 capability・バンドルメタデータ・macOS Entitlements を整備。
+  - 起動時フリッカー解消（初期化完了後表示）、ショートカット録音中の非表示時自動解除＆アクション別デバウンス、抜線中デバイスの `(未接続)` 表示、全 IPC ハンドラのエラー処理、トレイメニューのチェック状態同期を実装。
+  - 本番用インメモリ診断イベントログ（直近 64 件＋RT 優先度・ドロップ・エラー統計）を診断コピーへ統合し、`release.yml` をバージョン一致検証＋Draft 作成→全資産完了後のアトミック公開へ刷新。
+
+### 実機検証・長時間耐久・正式公開
 
 - [ ] **Windows 11 実機フル検証**: NSIS 導入、VB-CABLE 連携、USB 抜き差し＆スリープ復帰、自動起動、多重起動防止、HPF / AGC / マイク別設定、ホットキー＆操作音、アプリ内自動更新（`v0.4.0` → `v1.0.0`）
 - [ ] **macOS 14+ 実機フル検証**: DMG 導入、事前同梱 `Shizuka Virtual Mic` ワンクリック導入（CLT なし）、マイク権限（[Info.plist](./src-tauri/Info.plist)）、メニューバー常駐・ダーク／ライト切替、ホットキー＆操作音、アプリ内自動更新

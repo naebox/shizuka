@@ -1,15 +1,43 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 
+use crate::diagnostics;
+
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct UpdateInProgressGuard;
+
+impl UpdateInProgressGuard {
+    fn acquire() -> Option<Self> {
+        if UPDATE_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for UpdateInProgressGuard {
+    fn drop(&mut self) {
+        UPDATE_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
 
 pub const RELEASES_PAGE_URL: &str = "https://github.com/naebox/shizuka/releases/latest";
 
@@ -47,6 +75,9 @@ impl Default for UpdateProgressSnapshot {
 /// Returns `true` when `exe_dir` looks like a standalone portable ZIP extraction rather than
 /// an NSIS (`uninstall.exe` present) or MSI / per-user installer location.
 pub fn is_portable_windows_dir(exe_dir: &Path) -> bool {
+    if exe_dir.join(".portable").is_file() {
+        return true;
+    }
     if exe_dir.join("uninstall.exe").is_file() {
         return false;
     }
@@ -60,13 +91,56 @@ pub fn is_portable_windows_dir(exe_dir: &Path) -> bool {
         || norm.contains("/appdata/local/shizuka"))
 }
 
+#[cfg(target_os = "windows")]
+fn is_registered_msi_install_dir(exe_dir: &Path) -> bool {
+    // Explicit portable ZIP bundles ship README.md + LICENSE alongside Shizuka.exe
+    if exe_dir.join(".portable").is_file()
+        || (exe_dir.join("README.md").is_file() && exe_dir.join("LICENSE").is_file())
+    {
+        return false;
+    }
+    let dir_str = exe_dir.to_string_lossy().trim_end_matches('\\').to_string();
+    if dir_str.is_empty() {
+        return false;
+    }
+    for root in [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        if let Ok(out) = Command::new("reg.exe")
+            .args(["query", root, "/s", "/v", "InstallLocation", "/f", &dir_str])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+                if text.contains(&dir_str.to_ascii_lowercase()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn is_current_build_portable() -> bool {
     #[cfg(target_os = "windows")]
     {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(is_portable_windows_dir))
-            .unwrap_or(true)
+        static CACHED_PORTABLE: OnceLock<bool> = OnceLock::new();
+        *CACHED_PORTABLE.get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| {
+                    p.parent().map(|dir| {
+                        if !is_portable_windows_dir(dir) {
+                            false
+                        } else {
+                            !is_registered_msi_install_dir(dir)
+                        }
+                    })
+                })
+                .unwrap_or(true)
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -133,13 +207,15 @@ pub async fn check_for_update_impl(app: &AppHandle) -> Result<UpdateCheckResult,
     }
 }
 
-pub async fn install_update_impl<F>(
+pub async fn install_update_impl<FStop, FResume>(
     app: &AppHandle,
     progress: Arc<Mutex<UpdateProgressSnapshot>>,
-    stop_audio: F,
+    stop_audio: FStop,
+    resume_audio: FResume,
 ) -> Result<(), String>
 where
-    F: FnOnce() + Send + 'static,
+    FStop: FnOnce() + Send + 'static,
+    FResume: FnOnce() + Send + 'static,
 {
     if is_current_build_portable() {
         return Err(
@@ -147,6 +223,9 @@ where
                 .to_string(),
         );
     }
+
+    let _guard = UpdateInProgressGuard::acquire()
+        .ok_or_else(|| "アップデートの適用がすでに進行中です。".to_string())?;
 
     if let Ok(mut p) = progress.lock() {
         *p = UpdateProgressSnapshot {
@@ -161,6 +240,7 @@ where
         Ok(u) => u,
         Err(e) => {
             let msg = format!("アップデータの初期化に失敗しました: {}", e);
+            diagnostics::error(&msg);
             if let Ok(mut p) = progress.lock() {
                 p.phase = "error".to_string();
                 p.error = Some(msg.clone());
@@ -179,6 +259,7 @@ where
         }
         Err(e) => {
             let msg = format!("アップデートの確認に失敗しました: {}", e);
+            diagnostics::warn(&msg);
             if let Ok(mut p) = progress.lock() {
                 p.phase = "error".to_string();
                 p.error = Some(msg.clone());
@@ -187,11 +268,13 @@ where
         }
     };
 
+    diagnostics::info(format!("Downloading update v{}", update.version));
     let prog_chunk = Arc::clone(&progress);
-    let prog_finish = Arc::clone(&progress);
 
-    let install_res = update
-        .download_and_install(
+    // Step 1: Download AND verify Ed25519 signature BEFORE touching the live audio pipeline.
+    // If download or signature verification fails, the user's microphone stays uninterrupted.
+    let verified_bytes = match update
+        .download(
             move |chunk_len, content_len| {
                 if let Ok(mut p) = prog_chunk.lock() {
                     p.phase = "downloading".to_string();
@@ -201,17 +284,38 @@ where
                     }
                 }
             },
-            move || {
-                if let Ok(mut p) = prog_finish.lock() {
-                    p.phase = "installing".to_string();
-                }
-                stop_audio();
-            },
+            || {},
         )
-        .await;
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let msg = format!("アップデートのダウンロードまたは署名検証に失敗しました: {}", e);
+            diagnostics::error(&msg);
+            if let Ok(mut p) = progress.lock() {
+                p.phase = "error".to_string();
+                p.error = Some(msg.clone());
+            }
+            return Err(msg);
+        }
+    };
+
+    // Step 2: Signature verified — cleanly stop audio & flush settings before launching installer.
+    if let Ok(mut p) = progress.lock() {
+        p.phase = "installing".to_string();
+    }
+    diagnostics::info("Update signature verified; stopping audio before install");
+    let _ = tauri::async_runtime::spawn_blocking(stop_audio).await;
+
+    let install_res = tauri::async_runtime::spawn_blocking(move || update.install(&verified_bytes))
+        .await
+        .map_err(|e| format!("アップデート適用タスクの実行に失敗しました: {}", e))?;
 
     if let Err(e) = install_res {
         let msg = format!("アップデートの適用に失敗しました: {}", e);
+        diagnostics::error(&msg);
+        // Restore microphone pipeline if installer failed or user cancelled UAC prompt
+        resume_audio();
         if let Ok(mut p) = progress.lock() {
             p.phase = "error".to_string();
             p.error = Some(msg.clone());

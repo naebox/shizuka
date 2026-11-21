@@ -8,7 +8,7 @@ rm -rf "${OUT_BUNDLE}"
 mkdir -p "${OUT_BUNDLE}/Contents/MacOS"
 cp "${SCRIPT_DIR}/Info.plist" "${OUT_BUNDLE}/Contents/Info.plist"
 
-clang -O3 -Wall -Wextra \
+clang -std=c11 -O3 -Wall -Wextra -Werror \
   -bundle \
   -arch arm64 -arch x86_64 \
   -mmacosx-version-min=12.0 \

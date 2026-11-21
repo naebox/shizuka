@@ -17,6 +17,7 @@ use crate::audio::devices::{
 use crate::audio::processor::{soft_limit, NoiseProcessor, DFN_HOP_SIZE, DFN_SAMPLE_RATE};
 use crate::audio::resampler::{AdaptiveOutputResampler, DriftController, InputResampler48k};
 use crate::config::{AppConfig, ModelVariant};
+use crate::diagnostics;
 
 #[inline]
 fn store_f32(atom: &AtomicU32, val: f32) {
@@ -126,9 +127,16 @@ pub struct SharedAudioState {
     pub process_time_us: AtomicU32,
 
     pub input_callback_frames: AtomicU64,
+    pub output_callback_frames: AtomicU64,
     pub input_drop_count: AtomicU64,
+    pub output_drop_count: AtomicU64,
     pub output_underrun_count: AtomicU64,
     pub reconnect_count: AtomicU32,
+    pub rt_priority_active: AtomicBool,
+    pub dfn_error_count: AtomicU64,
+    pub resampler_error_count: AtomicU64,
+    pub observed_in_block_frames: AtomicU32,
+    pub observed_out_block_frames: AtomicU32,
 
     pub status: Mutex<EngineDeviceStatus>,
 }
@@ -181,9 +189,16 @@ impl SharedAudioState {
             process_time_us: AtomicU32::new(0),
 
             input_callback_frames: AtomicU64::new(0),
+            output_callback_frames: AtomicU64::new(0),
             input_drop_count: AtomicU64::new(0),
+            output_drop_count: AtomicU64::new(0),
             output_underrun_count: AtomicU64::new(0),
             reconnect_count: AtomicU32::new(0),
+            rt_priority_active: AtomicBool::new(false),
+            dfn_error_count: AtomicU64::new(0),
+            resampler_error_count: AtomicU64::new(0),
+            observed_in_block_frames: AtomicU32::new(0),
+            observed_out_block_frames: AtomicU32::new(0),
 
             status: Mutex::new(EngineDeviceStatus::default()),
         }
@@ -288,7 +303,8 @@ enum EngineCommand {
         profile_already_applied: bool,
     },
     SetModelVariant(ModelVariant),
-    Stop,
+    SyncLastProfileMic(Option<String>),
+    Stop(Option<mpsc::SyncSender<()>>),
     SetLiveMonitor {
         enabled: bool,
         monitor_device: Option<String>,
@@ -311,6 +327,7 @@ struct MonitorSink {
     resampler: AdaptiveOutputResampler,
     drift: DriftController,
     target_frames: usize,
+    sr_mon: u32,
 }
 
 struct RunningPipeline {
@@ -323,10 +340,43 @@ struct RunningPipeline {
 }
 
 impl RunningPipeline {
-    fn stop(mut self) {
+    fn stop_inner(&mut self) {
         let _ = self.mon_tx.send(None);
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(jh) = self.worker_join.take() {
+            jh.thread().unpark();
+            let _ = jh.join();
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop_inner();
+    }
+}
+
+impl Drop for RunningPipeline {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// RAII guard ensuring the real-time DSP worker thread is always stopped and joined
+/// if `build_main_pipeline` fails before constructing `RunningPipeline`.
+struct WorkerInitGuard {
+    stop_flag: Arc<AtomicBool>,
+    worker_join: Option<JoinHandle<()>>,
+}
+
+impl WorkerInitGuard {
+    fn disarm(&mut self) -> Option<JoinHandle<()>> {
+        self.worker_join.take()
+    }
+}
+
+impl Drop for WorkerInitGuard {
+    fn drop(&mut self) {
+        if let Some(jh) = self.worker_join.take() {
+            self.stop_flag.store(true, Ordering::SeqCst);
             jh.thread().unpark();
             let _ = jh.join();
         }
@@ -371,8 +421,22 @@ impl AudioEngineHandle {
         });
     }
 
+    pub fn sync_last_profile_mic(&self, mic_name: Option<String>) {
+        let _ = self.cmd_tx.send(EngineCommand::SyncLastProfileMic(mic_name));
+    }
+
     pub fn stop(&self) {
-        let _ = self.cmd_tx.send(EngineCommand::Stop);
+        let _ = self.cmd_tx.send(EngineCommand::Stop(None));
+    }
+
+    /// Stops all audio streams, joins the real-time DSP thread, and waits up to `timeout`
+    /// for completion before returning (used for clean app exit & pre-update shutdown).
+    pub fn stop_and_wait(&self, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+        if self.cmd_tx.send(EngineCommand::Stop(Some(ack_tx))).is_err() {
+            return true;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
     }
 
     pub fn set_nc_enabled(&self, enabled: bool) {
@@ -451,6 +515,46 @@ fn reconnect_backoff_duration(attempt: u32) -> Duration {
     }
 }
 
+fn virtual_reattach_backoff_duration(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::from_secs(3),
+        1 => Duration::from_secs(6),
+        2 => Duration::from_secs(12),
+        3 => Duration::from_secs(30),
+        _ => Duration::from_secs(60),
+    }
+}
+
+struct WatchdogState {
+    retry_attempt: u32,
+    next_retry_at: Option<Instant>,
+    virt_reattach_attempt: u32,
+    next_virt_reattach_at: Option<Instant>,
+    pipe_started_at: Instant,
+    last_seen_in_frames: u64,
+    last_seen_out_frames: u64,
+    in_stall_ticks: u32,
+    out_stall_ticks: u32,
+    last_mon_reopen_at: Option<Instant>,
+}
+
+impl WatchdogState {
+    fn new() -> Self {
+        Self {
+            retry_attempt: 0,
+            next_retry_at: None,
+            virt_reattach_attempt: 0,
+            next_virt_reattach_at: None,
+            pipe_started_at: Instant::now(),
+            last_seen_in_frames: 0,
+            last_seen_out_frames: 0,
+            in_stall_ticks: 0,
+            out_stall_ticks: 0,
+            last_mon_reopen_at: None,
+        }
+    }
+}
+
 fn reset_audio_meters(shared: &SharedAudioState) {
     store_f32(&shared.input_rms_db_bits, -90.0);
     store_f32(&shared.output_rms_db_bits, -90.0);
@@ -479,11 +583,7 @@ fn audio_control_loop(
 
     let mut main_gen: u64 = 0;
     let mut mon_gen: u64 = 0;
-    let mut retry_attempt: u32 = 0;
-    let mut next_retry_at: Option<Instant> = None;
-    let mut pipe_started_at = Instant::now();
-    let mut last_seen_frames: u64 = 0;
-    let mut stall_ticks: u32 = 0;
+    let mut wd = WatchdogState::new();
     let mut watchdog_ticks: u32 = 0;
 
     // Auto-select recommended virtual cable on first run if none configured
@@ -535,6 +635,7 @@ fn audio_control_loop(
                     true
                 }
                 Err(e) => {
+                    diagnostics::warn(format!("Live monitor failed to start: {:#}", e));
                     shared.live_monitor_enabled.store(false, Ordering::Relaxed);
                     if let Ok(mut st) = shared.status.lock() {
                         st.active_monitor_name = None;
@@ -549,6 +650,7 @@ fn audio_control_loop(
         }
     };
 
+    #[allow(clippy::too_many_arguments)]
     let start_main = |in_name: Option<String>,
                       out_name: Option<String>,
                       mon_name: Option<String>,
@@ -557,11 +659,7 @@ fn audio_control_loop(
                       want_mon: &mut bool,
                       main_gen: &mut u64,
                       mon_gen: &mut u64,
-                      retry_attempt: &mut u32,
-                      next_retry_at: &mut Option<Instant>,
-                      pipe_started_at: &mut Instant,
-                      last_seen_frames: &mut u64,
-                      stall_ticks: &mut u32,
+                      wd: &mut WatchdogState,
                       main_pipe: &mut Option<RunningPipeline>,
                       live_mon_pipe: &mut Option<MonitorPipeline>| {
         *main_gen = main_gen.wrapping_add(1);
@@ -582,20 +680,44 @@ fn audio_control_loop(
             profile_already_applied,
         ) {
             Ok(pipe) => {
+                let in_label = pipe.active_input_name.clone();
+                let virt_ok = shared.virtual_out_connected.load(Ordering::Relaxed);
                 *main_pipe = Some(pipe);
-                *retry_attempt = 0;
-                *next_retry_at = None;
-                *pipe_started_at = Instant::now();
-                *last_seen_frames = shared.input_callback_frames.load(Ordering::Relaxed);
-                *stall_ticks = 0;
+                // Keep retry_attempt until the stream proves healthy for >= 10s so flapping
+                // devices cannot trigger an unthrottled ONNX reload storm.
+                wd.next_retry_at = None;
+                wd.pipe_started_at = Instant::now();
+                wd.last_seen_in_frames = shared.input_callback_frames.load(Ordering::Relaxed);
+                wd.last_seen_out_frames = shared.output_callback_frames.load(Ordering::Relaxed);
+                wd.in_stall_ticks = 0;
+                wd.out_stall_ticks = 0;
+                if virt_ok {
+                    wd.virt_reattach_attempt = 0;
+                    wd.next_virt_reattach_at = None;
+                } else if out_name.as_deref().is_some_and(|s| !s.is_empty()) {
+                    wd.next_virt_reattach_at =
+                        Some(Instant::now() + virtual_reattach_backoff_duration(wd.virt_reattach_attempt));
+                    wd.virt_reattach_attempt = wd.virt_reattach_attempt.saturating_add(1);
+                }
+                diagnostics::info(format!(
+                    "Pipeline started: mic='{}', virtual_out_connected={}",
+                    in_label, virt_ok
+                ));
                 if *want_mon {
                     *want_mon = apply_live_monitor(true, mon_name, mon_gen, main_pipe, live_mon_pipe);
                 }
             }
             Err(PipelineStartError::WaitingForDevice(missing_name)) => {
+                if wd.retry_attempt == 0 {
+                    diagnostics::info(format!(
+                        "Waiting for input device: {:?}",
+                        missing_name
+                    ));
+                }
                 shared.stream_running.store(false, Ordering::Relaxed);
                 shared.virtual_out_connected.store(false, Ordering::Relaxed);
                 shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                shared.rt_priority_active.store(false, Ordering::Relaxed);
                 reset_audio_meters(&shared);
                 if let Ok(mut st) = shared.status.lock() {
                     st.connection_state = ConnectionState::WaitingDevice;
@@ -605,13 +727,21 @@ fn audio_control_loop(
                     st.active_monitor_name = None;
                     st.last_error = None;
                 }
-                *next_retry_at = Some(Instant::now() + reconnect_backoff_duration(*retry_attempt));
-                *retry_attempt = retry_attempt.saturating_add(1);
+                wd.next_retry_at = Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
+                wd.retry_attempt = wd.retry_attempt.saturating_add(1);
             }
             Err(PipelineStartError::Other(e)) => {
+                if wd.retry_attempt == 0 || wd.retry_attempt.is_multiple_of(10) {
+                    diagnostics::error(format!(
+                        "Pipeline start failed (attempt {}): {:#}",
+                        wd.retry_attempt + 1,
+                        e
+                    ));
+                }
                 shared.stream_running.store(false, Ordering::Relaxed);
                 shared.virtual_out_connected.store(false, Ordering::Relaxed);
                 shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                shared.rt_priority_active.store(false, Ordering::Relaxed);
                 reset_audio_meters(&shared);
                 if let Ok(mut st) = shared.status.lock() {
                     st.connection_state = ConnectionState::Reconnecting;
@@ -619,8 +749,8 @@ fn audio_control_loop(
                     st.active_monitor_name = None;
                     st.last_error = Some(format!("{:#}", e));
                 }
-                *next_retry_at = Some(Instant::now() + reconnect_backoff_duration(*retry_attempt));
-                *retry_attempt = retry_attempt.saturating_add(1);
+                wd.next_retry_at = Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
+                wd.retry_attempt = wd.retry_attempt.saturating_add(1);
             }
         }
     };
@@ -635,11 +765,7 @@ fn audio_control_loop(
             &mut want_mon,
             &mut main_gen,
             &mut mon_gen,
-            &mut retry_attempt,
-            &mut next_retry_at,
-            &mut pipe_started_at,
-            &mut last_seen_frames,
-            &mut stall_ticks,
+            &mut wd,
             &mut main_pipe,
             &mut live_mon_pipe,
         );
@@ -660,7 +786,9 @@ fn audio_control_loop(
                     cur_out_dev = output_device;
                     cur_mon_dev = monitor_device;
                     want_running = true;
-                    retry_attempt = 0;
+                    wd.retry_attempt = 0;
+                    wd.virt_reattach_attempt = 0;
+                    wd.next_virt_reattach_at = None;
                     start_main(
                         cur_in_dev.clone(),
                         cur_out_dev.clone(),
@@ -670,11 +798,7 @@ fn audio_control_loop(
                         &mut want_mon,
                         &mut main_gen,
                         &mut mon_gen,
-                        &mut retry_attempt,
-                        &mut next_retry_at,
-                        &mut pipe_started_at,
-                        &mut last_seen_frames,
-                        &mut stall_ticks,
+                        &mut wd,
                         &mut main_pipe,
                         &mut live_mon_pipe,
                     );
@@ -685,6 +809,8 @@ fn audio_control_loop(
                         .model_variant_u8
                         .store(variant_to_u8(variant), Ordering::SeqCst);
                     if main_pipe.is_some() && prev != variant {
+                        diagnostics::info(format!("Switching AI model variant to {:?}", variant));
+                        wd.retry_attempt = 0;
                         start_main(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
@@ -694,23 +820,25 @@ fn audio_control_loop(
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
-                            &mut retry_attempt,
-                            &mut next_retry_at,
-                            &mut pipe_started_at,
-                            &mut last_seen_frames,
-                            &mut stall_ticks,
+                            &mut wd,
                             &mut main_pipe,
                             &mut live_mon_pipe,
                         );
                     }
                 }
-                EngineCommand::Stop => {
+                EngineCommand::SyncLastProfileMic(mic_name) => {
+                    last_profile_mic = mic_name;
+                }
+                EngineCommand::Stop(ack) => {
+                    diagnostics::info("Stopping audio pipeline");
                     want_running = false;
                     want_mon = false;
                     main_gen = main_gen.wrapping_add(1);
                     mon_gen = mon_gen.wrapping_add(1);
-                    next_retry_at = None;
-                    retry_attempt = 0;
+                    wd.next_retry_at = None;
+                    wd.retry_attempt = 0;
+                    wd.virt_reattach_attempt = 0;
+                    wd.next_virt_reattach_at = None;
                     if let Some(old) = main_pipe.take() {
                         old.stop();
                     }
@@ -718,11 +846,15 @@ fn audio_control_loop(
                     shared.stream_running.store(false, Ordering::Relaxed);
                     shared.virtual_out_connected.store(false, Ordering::Relaxed);
                     shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                    shared.rt_priority_active.store(false, Ordering::Relaxed);
                     reset_audio_meters(&shared);
                     if let Ok(mut st) = shared.status.lock() {
                         st.connection_state = ConnectionState::Stopped;
                         st.waiting_device_name = None;
                         st.active_monitor_name = None;
+                    }
+                    if let Some(tx) = ack {
+                        let _ = tx.send(());
                     }
                 }
                 EngineCommand::SetLiveMonitor {
@@ -731,9 +863,10 @@ fn audio_control_loop(
                 } => {
                     cur_mon_dev = monitor_device;
                     want_mon = enabled;
+                    wd.last_mon_reopen_at = None;
                     if enabled && main_pipe.is_none() {
                         want_running = true;
-                        retry_attempt = 0;
+                        wd.retry_attempt = 0;
                         start_main(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
@@ -743,11 +876,7 @@ fn audio_control_loop(
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
-                            &mut retry_attempt,
-                            &mut next_retry_at,
-                            &mut pipe_started_at,
-                            &mut last_seen_frames,
-                            &mut stall_ticks,
+                            &mut wd,
                             &mut main_pipe,
                             &mut live_mon_pipe,
                         );
@@ -768,26 +897,49 @@ fn audio_control_loop(
                 } => match kind {
                     StreamKind::Monitor => {
                         if generation == mon_gen && want_mon {
-                            log::warn!(
-                                "Live monitor stream interrupted ({}); attempting immediate reopen",
-                                message
-                            );
-                            want_mon = apply_live_monitor(
-                                true,
-                                cur_mon_dev.clone(),
-                                &mut mon_gen,
-                                &mut main_pipe,
-                                &mut live_mon_pipe,
-                            );
+                            let can_retry = wd
+                                .last_mon_reopen_at
+                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+                            if can_retry {
+                                diagnostics::warn(format!(
+                                    "Live monitor interrupted ({}); attempting single reopen",
+                                    message
+                                ));
+                                wd.last_mon_reopen_at = Some(Instant::now());
+                                want_mon = apply_live_monitor(
+                                    true,
+                                    cur_mon_dev.clone(),
+                                    &mut mon_gen,
+                                    &mut main_pipe,
+                                    &mut live_mon_pipe,
+                                );
+                            } else {
+                                diagnostics::warn(format!(
+                                    "Live monitor failed repeatedly ({}); disabling monitor to prevent storm",
+                                    message
+                                ));
+                                want_mon = apply_live_monitor(
+                                    false,
+                                    cur_mon_dev.clone(),
+                                    &mut mon_gen,
+                                    &mut main_pipe,
+                                    &mut live_mon_pipe,
+                                );
+                                if let Ok(mut st) = shared.status.lock() {
+                                    st.last_error = Some(format!(
+                                        "マイクテスト再生デバイスが切断されました: {}",
+                                        message
+                                    ));
+                                }
+                            }
                         }
                     }
                     StreamKind::Input | StreamKind::VirtualOutput => {
                         if generation == main_gen && want_running {
-                            log::warn!(
+                            diagnostics::warn(format!(
                                 "Audio {:?} stream interrupted ({}); scheduling auto-reconnect",
-                                kind,
-                                message
-                            );
+                                kind, message
+                            ));
                             main_gen = main_gen.wrapping_add(1);
                             if let Some(old) = main_pipe.take() {
                                 old.stop();
@@ -796,6 +948,7 @@ fn audio_control_loop(
                             shared.stream_running.store(false, Ordering::Relaxed);
                             shared.virtual_out_connected.store(false, Ordering::Relaxed);
                             shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                            shared.rt_priority_active.store(false, Ordering::Relaxed);
                             shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
                             reset_audio_meters(&shared);
 
@@ -817,9 +970,10 @@ fn audio_control_loop(
                                     ));
                                 }
                             }
-                            retry_attempt = 0;
-                            next_retry_at =
-                                Some(Instant::now() + reconnect_backoff_duration(retry_attempt));
+                            // Preserve exponential backoff on flapping streams (healthy streams already reset retry_attempt after 10s)
+                            wd.next_retry_at =
+                                Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
+                            wd.retry_attempt = wd.retry_attempt.saturating_add(1);
                         }
                     }
                 },
@@ -831,14 +985,14 @@ fn audio_control_loop(
                 }
 
                 if main_pipe.is_some() {
-                    // 1. Sleep/wake & silent USB stall watchdog (after 2s startup grace period)
-                    if pipe_started_at.elapsed() >= Duration::from_secs(2) {
-                        let cur_frames = shared.input_callback_frames.load(Ordering::Relaxed);
-                        if cur_frames == last_seen_frames {
-                            stall_ticks = stall_ticks.saturating_add(1);
-                            if stall_ticks >= 5 {
-                                log::warn!(
-                                    "Input audio stream stalled for 2.5s (sleep/wake or USB disconnect); reconnecting"
+                    // 1. Sleep/wake & silent USB/virtual-output stall watchdog (after 2s startup grace period)
+                    if wd.pipe_started_at.elapsed() >= Duration::from_secs(2) {
+                        let cur_in_frames = shared.input_callback_frames.load(Ordering::Relaxed);
+                        if cur_in_frames == wd.last_seen_in_frames {
+                            wd.in_stall_ticks = wd.in_stall_ticks.saturating_add(1);
+                            if wd.in_stall_ticks >= 5 {
+                                diagnostics::warn(
+                                    "Input audio stream stalled for 2.5s (sleep/wake or USB disconnect); reconnecting",
                                 );
                                 shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
                                 start_main(
@@ -850,19 +1004,55 @@ fn audio_control_loop(
                                     &mut want_mon,
                                     &mut main_gen,
                                     &mut mon_gen,
-                                    &mut retry_attempt,
-                                    &mut next_retry_at,
-                                    &mut pipe_started_at,
-                                    &mut last_seen_frames,
-                                    &mut stall_ticks,
+                                    &mut wd,
                                     &mut main_pipe,
                                     &mut live_mon_pipe,
                                 );
                                 continue;
                             }
                         } else {
-                            last_seen_frames = cur_frames;
-                            stall_ticks = 0;
+                            wd.last_seen_in_frames = cur_in_frames;
+                            wd.in_stall_ticks = 0;
+                        }
+
+                        if shared.virtual_out_connected.load(Ordering::Relaxed) {
+                            let cur_out_frames =
+                                shared.output_callback_frames.load(Ordering::Relaxed);
+                            if cur_out_frames == wd.last_seen_out_frames {
+                                wd.out_stall_ticks = wd.out_stall_ticks.saturating_add(1);
+                                if wd.out_stall_ticks >= 5 {
+                                    diagnostics::warn(
+                                        "Virtual output audio stream stalled for 2.5s; reconnecting pipeline",
+                                    );
+                                    shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                                    start_main(
+                                        cur_in_dev.clone(),
+                                        cur_out_dev.clone(),
+                                        cur_mon_dev.clone(),
+                                        true,
+                                        &mut last_profile_mic,
+                                        &mut want_mon,
+                                        &mut main_gen,
+                                        &mut mon_gen,
+                                        &mut wd,
+                                        &mut main_pipe,
+                                        &mut live_mon_pipe,
+                                    );
+                                    continue;
+                                }
+                            } else {
+                                wd.last_seen_out_frames = cur_out_frames;
+                                wd.out_stall_ticks = 0;
+                            }
+                        }
+
+                        // Reset reconnect backoff only once the pipeline has streamed healthily for >= 10s
+                        if wd.retry_attempt > 0
+                            && wd.in_stall_ticks == 0
+                            && wd.out_stall_ticks == 0
+                            && wd.pipe_started_at.elapsed() >= Duration::from_secs(10)
+                        {
+                            wd.retry_attempt = 0;
                         }
                     }
 
@@ -873,11 +1063,12 @@ fn audio_control_loop(
                                 .as_ref()
                                 .is_some_and(|p| p.active_input_name != os_default);
                             if changed {
-                                log::info!(
+                                diagnostics::info(format!(
                                     "OS default microphone changed to '{}'; switching automatically",
                                     os_default
-                                );
+                                ));
                                 shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                                wd.retry_attempt = 0;
                                 start_main(
                                     cur_in_dev.clone(),
                                     cur_out_dev.clone(),
@@ -887,11 +1078,7 @@ fn audio_control_loop(
                                     &mut want_mon,
                                     &mut main_gen,
                                     &mut mon_gen,
-                                    &mut retry_attempt,
-                                    &mut next_retry_at,
-                                    &mut pipe_started_at,
-                                    &mut last_seen_frames,
-                                    &mut stall_ticks,
+                                    &mut wd,
                                     &mut main_pipe,
                                     &mut live_mon_pipe,
                                 );
@@ -900,33 +1087,39 @@ fn audio_control_loop(
                         }
                     }
 
-                    // 3. Reattach virtual output automatically if it reappears after driver install/reset (~every 3s)
+                    // 3. Reattach virtual output automatically with exponential backoff (3s -> 60s)
+                    // so a broken/locked virtual endpoint never causes an endless 3s DFN3 reload storm
                     if cur_out_dev.is_some()
                         && !shared.virtual_out_connected.load(Ordering::Relaxed)
-                        && watchdog_ticks.is_multiple_of(6)
-                        && find_output_device(cur_out_dev.as_deref(), false).is_some()
+                        && wd.next_virt_reattach_at.is_none_or(|t| Instant::now() >= t)
                     {
-                        log::info!("Configured virtual output reappeared; reconnecting pipeline");
-                        shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
-                        start_main(
-                            cur_in_dev.clone(),
-                            cur_out_dev.clone(),
-                            cur_mon_dev.clone(),
-                            true,
-                            &mut last_profile_mic,
-                            &mut want_mon,
-                            &mut main_gen,
-                            &mut mon_gen,
-                            &mut retry_attempt,
-                            &mut next_retry_at,
-                            &mut pipe_started_at,
-                            &mut last_seen_frames,
-                            &mut stall_ticks,
-                            &mut main_pipe,
-                            &mut live_mon_pipe,
-                        );
+                        if find_output_device(cur_out_dev.as_deref(), false).is_some() {
+                            diagnostics::info(
+                                "Configured virtual output available; attempting reattach",
+                            );
+                            shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                            start_main(
+                                cur_in_dev.clone(),
+                                cur_out_dev.clone(),
+                                cur_mon_dev.clone(),
+                                true,
+                                &mut last_profile_mic,
+                                &mut want_mon,
+                                &mut main_gen,
+                                &mut mon_gen,
+                                &mut wd,
+                                &mut main_pipe,
+                                &mut live_mon_pipe,
+                            );
+                        } else {
+                            wd.next_virt_reattach_at = Some(
+                                Instant::now()
+                                    + virtual_reattach_backoff_duration(wd.virt_reattach_attempt),
+                            );
+                            wd.virt_reattach_attempt = wd.virt_reattach_attempt.saturating_add(1);
+                        }
                     }
-                } else if next_retry_at.is_none_or(|t| Instant::now() >= t) {
+                } else if wd.next_retry_at.is_none_or(|t| Instant::now() >= t) {
                     // Waiting for disconnected physical microphone or transient retry
                     if find_input_device(cur_in_dev.as_deref()).is_some() {
                         shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
@@ -939,11 +1132,7 @@ fn audio_control_loop(
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
-                            &mut retry_attempt,
-                            &mut next_retry_at,
-                            &mut pipe_started_at,
-                            &mut last_seen_frames,
-                            &mut stall_ticks,
+                            &mut wd,
                             &mut main_pipe,
                             &mut live_mon_pipe,
                         );
@@ -952,9 +1141,9 @@ fn audio_control_loop(
                             st.connection_state = ConnectionState::WaitingDevice;
                             st.waiting_device_name = cur_in_dev.clone();
                         }
-                        next_retry_at =
-                            Some(Instant::now() + reconnect_backoff_duration(retry_attempt));
-                        retry_attempt = retry_attempt.saturating_add(1);
+                        wd.next_retry_at =
+                            Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
+                        wd.retry_attempt = wd.retry_attempt.saturating_add(1);
                     }
                 }
             }
@@ -973,8 +1162,20 @@ fn build_live_monitor_stream(
     mon_name: Option<&str>,
     err_notifier: StreamErrorNotifier,
 ) -> Result<(MonitorPipeline, MonitorSink, String)> {
-    let mon_dev = find_output_device(mon_name, true)
-        .ok_or_else(|| anyhow!("マイクテスト用のスピーカー／ヘッドホンが見つかりません"))?;
+    // Only fall back to OS default speakers when user chose "auto" (None/empty);
+    // when an explicit headset/monitor is configured and unplugged, fail cleanly instead of
+    // switching to laptop speakers and causing acoustic feedback howl.
+    let explicit = mon_name.filter(|s| !s.is_empty());
+    let mon_dev = find_output_device(explicit, explicit.is_none()).ok_or_else(|| {
+        if let Some(name) = explicit {
+            anyhow!(
+                "指定された再生デバイス「{}」が見つかりません（スピーカーへの誤出力を防ぐためマイクテストを停止しました）",
+                name
+            )
+        } else {
+            anyhow!("マイクテスト用のスピーカー／ヘッドホンが見つかりません")
+        }
+    })?;
     let actual_mon_name = mon_dev
         .name()
         .unwrap_or_else(|_| "Default Output".to_string());
@@ -1014,6 +1215,7 @@ fn build_live_monitor_stream(
             resampler,
             drift,
             target_frames: mon_target,
+            sr_mon,
         },
         actual_mon_name,
     ))
@@ -1138,6 +1340,10 @@ fn build_main_pipeline(
         }
     }
 
+    // Reset observed OS callback block sizes for the new pipeline
+    shared.observed_in_block_frames.store(0, Ordering::Relaxed);
+    shared.observed_out_block_frames.store(0, Ordering::Relaxed);
+
     // Initialize Resamplers BEFORE launching real-time thread (DfTract holds Rc<Tensor> so it initializes on the worker thread)
     let init_variant = u8_to_variant(shared.model_variant_u8.load(Ordering::Relaxed));
     let init_atten = load_f32(&shared.atten_lim_bits);
@@ -1147,6 +1353,9 @@ fn build_main_pipeline(
     let init_vad_thresh = load_f32(&shared.vad_threshold_bits);
     let init_hpf_en = shared.hpf_enabled.load(Ordering::Relaxed);
     let init_agc_en = shared.agc_enabled.load(Ordering::Relaxed);
+    let init_nc_en = shared.nc_enabled.load(Ordering::Relaxed);
+    let init_mic_muted = shared.mic_muted.load(Ordering::Relaxed);
+    let init_gain_db = load_f32(&shared.input_gain_bits);
     let mut in_resampler =
         InputResampler48k::new(sr_in).map_err(PipelineStartError::Other)?;
     let mut out_resampler =
@@ -1172,6 +1381,9 @@ fn build_main_pipeline(
                 init_vad_thresh,
                 init_hpf_en,
                 init_agc_en,
+                init_nc_en,
+                init_mic_muted,
+                init_gain_db,
             ) {
                 Ok(p) => {
                     let _ = init_tx.send(Ok(()));
@@ -1188,9 +1400,11 @@ fn build_main_pipeline(
             let rt_handle =
                 promote_current_thread_to_real_time(DFN_HOP_SIZE as u32, DFN_SAMPLE_RATE as u32)
                     .ok();
+            shared_worker
+                .rt_priority_active
+                .store(rt_handle.is_some(), Ordering::Relaxed);
 
             let mut in_chunk_scratch = vec![0.0f32; 4_096];
-            let silence_scratch = vec![0.0f32; 4_096];
             let mut frame_48k_in = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_raw = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_enh = [0.0f32; DFN_HOP_SIZE];
@@ -1214,6 +1428,9 @@ fn build_main_pipeline(
             while !stop_worker.load(Ordering::Relaxed) {
                 let needed_in = in_resampler.input_frames_next();
                 if in_cons.occupied_len() < needed_in {
+                    if !in_cons.write_is_held() {
+                        break;
+                    }
                     thread::park_timeout(Duration::from_millis(4));
                     continue;
                 }
@@ -1252,6 +1469,9 @@ fn build_main_pipeline(
                         .process(&in_chunk_scratch[..needed], &mut frame_48k_in)
                         .is_err()
                     {
+                        shared_worker
+                            .resampler_error_count
+                            .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
 
@@ -1261,6 +1481,11 @@ fn build_main_pipeline(
                         &mut frame_48k_enh,
                         &mut frame_48k_out,
                     );
+                    if res.dfn_error {
+                        shared_worker
+                            .dfn_error_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     shared_worker
                         .vad_speaking
                         .store(res.vad_speaking, Ordering::Relaxed);
@@ -1281,28 +1506,54 @@ fn build_main_pipeline(
 
                     let lsnr = res.lsnr_db;
 
+                    // Dynamically adapt output buffer target when OS audio host uses large callback blocks
+                    // (e.g., Bluetooth HFP or CoreAudio 1024/2048-frame periods) to avoid recurring underruns
+                    let obs_in = shared_worker.observed_in_block_frames.load(Ordering::Relaxed);
+                    let obs_out = shared_worker
+                        .observed_out_block_frames
+                        .load(Ordering::Relaxed);
+
                     // Push to Virtual Microphone Output with PI Clock Drift Compensation
                     if let Some(out_prod) = &mut out_prod_opt {
+                        let in_as_out =
+                            ((obs_in as u64 * sr_out as u64) / (sr_in.max(1) as u64)) as usize;
+                        let dynamic_floor = (in_as_out + obs_out as usize + (sr_out as usize / 200))
+                            .min((sr_out as usize * 120) / 1000);
+                        if dynamic_floor > target_out_frames {
+                            target_out_frames = dynamic_floor;
+                            drift_ctrl.set_target_samples(target_out_frames);
+                        }
+
                         let occ = out_prod.occupied_len();
                         let cap = out_prod.capacity().get();
 
-                        // Guard against extreme OS stall (e.g. PC sleep/wake): recenter buffer cleanly
+                        // Guard against extreme OS stall (e.g. PC sleep/wake) without injecting hard zeros
+                        // into active speech or erasing learned crystal drift on brief underruns
                         let rel_ratio = if occ > cap * 3 / 4 {
                             drift_ctrl.reset();
                             0.990 // Drain excess smoothly
                         } else if occ == 0 {
-                            let fill = (target_out_frames / 2).min(silence_scratch.len());
-                            let _ = out_prod.push_slice(&silence_scratch[..fill]);
-                            drift_ctrl.reset();
-                            1.0
+                            drift_ctrl.damp_transient();
+                            1.005 // Smoothly rebuild buffer occupancy while keeping learned drift lock
                         } else {
                             drift_ctrl.update(occ)
                         };
 
-                        if let Ok(resampled_out) =
-                            out_resampler.process(&frame_48k_out, rel_ratio)
-                        {
-                            let _ = out_prod.push_slice(resampled_out);
+                        match out_resampler.process(&frame_48k_out, rel_ratio) {
+                            Ok(resampled_out) => {
+                                let pushed = out_prod.push_slice(resampled_out);
+                                if pushed < resampled_out.len() {
+                                    shared_worker.output_drop_count.fetch_add(
+                                        (resampled_out.len() - pushed) as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                shared_worker
+                                    .resampler_error_count
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
 
                         store_f32(&shared_worker.drift_ppm_bits, drift_ctrl.drift_ppm());
@@ -1330,6 +1581,15 @@ fn build_main_pipeline(
                         monitor_volume_to_gain(load_f32(&shared_worker.monitor_volume_bits));
 
                     if let Some(sink) = &mut mon_sink_opt {
+                        let in_as_mon = ((obs_in as u64 * sink.sr_mon as u64)
+                            / (sr_in.max(1) as u64)) as usize;
+                        let mon_floor = (in_as_mon + (sink.sr_mon as usize / 50))
+                            .min((sink.sr_mon as usize * 120) / 1000);
+                        if mon_floor > sink.target_frames {
+                            sink.target_frames = mon_floor;
+                            sink.drift.set_target_samples(mon_floor);
+                        }
+
                         let mix_step = (target_mon_mix - mon_clean_mix) / (DFN_HOP_SIZE as f32);
                         let gain_step = (target_mon_gain - mon_gain) / (DFN_HOP_SIZE as f32);
                         for i in 0..DFN_HOP_SIZE {
@@ -1348,10 +1608,8 @@ fn build_main_pipeline(
                             sink.drift.reset();
                             0.990
                         } else if occ == 0 {
-                            let fill = (sink.target_frames / 2).min(silence_scratch.len());
-                            let _ = sink.prod.push_slice(&silence_scratch[..fill]);
-                            sink.drift.reset();
-                            1.0
+                            sink.drift.damp_transient();
+                            1.005
                         } else {
                             sink.drift.update(occ)
                         };
@@ -1388,11 +1646,21 @@ fn build_main_pipeline(
                 }
             }
 
+            shared_worker
+                .rt_priority_active
+                .store(false, Ordering::Relaxed);
             if let Some(h) = rt_handle {
                 let _ = demote_current_thread_from_real_time(h);
             }
         })
         .map_err(|e| PipelineStartError::Other(e.into()))?;
+
+    // Guard ensures the RT worker thread + DFN3 model (~50 MB) + MMCSS/Mach RT handle are
+    // always stopped and joined if any subsequent stream initialization step returns Err.
+    let mut worker_guard = WorkerInitGuard {
+        stop_flag: Arc::clone(&stop_flag),
+        worker_join: Some(worker_join),
+    };
 
     init_rx
         .recv()
@@ -1419,7 +1687,12 @@ fn build_main_pipeline(
         }
     }
 
-    let worker_thread_handle = worker_join.thread().clone();
+    let worker_thread_handle = worker_guard
+        .worker_join
+        .as_ref()
+        .expect("worker handle present before disarm")
+        .thread()
+        .clone();
     let in_err_notifier = StreamErrorNotifier::new(cmd_tx.clone(), generation, StreamKind::Input);
     let input_stream = build_input_stream_to_rb(
         &in_dev,
@@ -1455,7 +1728,7 @@ fn build_main_pipeline(
 
     Ok(RunningPipeline {
         stop_flag,
-        worker_join: Some(worker_join),
+        worker_join: worker_guard.disarm(),
         mon_tx,
         active_input_name: actual_in_name,
         _input_stream: input_stream,
@@ -1550,17 +1823,21 @@ impl StereoDownmixer {
 
     #[inline]
     fn process(&mut self, l: f32, r: f32) -> f32 {
+        let l = if l.is_finite() { l } else { 0.0 };
+        let r = if r.is_finite() { r } else { 0.0 };
         let a = l.abs();
         let b = r.abs();
         self.env0 = if a > self.env0 {
             0.9 * self.env0 + 0.1 * a
         } else {
-            self.env0 * 0.99995
+            let d = self.env0 * 0.99995;
+            if d < 1e-9 { 0.0 } else { d }
         };
         self.env1 = if b > self.env1 {
             0.9 * self.env1 + 0.1 * b
         } else {
-            self.env1 * 0.99995
+            let d = self.env1 * 0.99995;
+            if d < 1e-9 { 0.0 } else { d }
         };
 
         let hi = self.env0.max(self.env1);
@@ -1584,6 +1861,73 @@ impl StereoDownmixer {
     }
 }
 
+/// Zero-allocation stack-resident downmixer for multi-channel (>2 ch) audio interfaces
+/// (e.g. 4–16 ch MOTU / Scarlett / Behringer mixers) so a single plugged-in XLR mic is not
+/// attenuated by `-12` to `-24 dB` under naive `1 / channels` division.
+struct MultiChannelDownmixer {
+    channels: usize,
+    envs: [f32; Self::MAX_TRACKED_CH],
+    scale: f32,
+}
+
+impl MultiChannelDownmixer {
+    const MAX_TRACKED_CH: usize = 16;
+
+    fn new(channels: usize) -> Self {
+        let ch = channels.max(1);
+        Self {
+            channels: ch,
+            envs: [0.0; Self::MAX_TRACKED_CH],
+            scale: 1.0 / (ch as f32),
+        }
+    }
+
+    #[inline]
+    fn process_frame<T>(&mut self, frame: &[T]) -> f32
+    where
+        T: SizedSample,
+        f32: FromSample<T>,
+    {
+        let tracked = self.channels.min(Self::MAX_TRACKED_CH);
+        let mut sum = 0.0f32;
+        let mut hi = 0.0f32;
+
+        for (idx, &raw) in frame.iter().enumerate() {
+            let s = f32::from_sample(raw);
+            let s = if s.is_finite() { s } else { 0.0 };
+            sum += s;
+            if idx < tracked {
+                let a = s.abs();
+                let env = if a > self.envs[idx] {
+                    0.9 * self.envs[idx] + 0.1 * a
+                } else {
+                    let d = self.envs[idx] * 0.99995;
+                    if d < 1e-9 { 0.0 } else { d }
+                };
+                self.envs[idx] = env;
+                if env > hi {
+                    hi = env;
+                }
+            }
+        }
+
+        let target_scale = if hi > 1e-4 {
+            let mut active = 0usize;
+            for &env in &self.envs[..tracked] {
+                if env >= hi * 0.12 {
+                    active += 1;
+                }
+            }
+            1.0 / (active.max(1) as f32)
+        } else {
+            self.scale
+        };
+
+        self.scale += (target_scale - self.scale) * 0.002;
+        sum * self.scale
+    }
+}
+
 fn build_input_typed<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -1598,8 +1942,8 @@ where
     f32: FromSample<T>,
 {
     let ch = channels.max(1);
-    let inv_ch = 1.0f32 / (ch as f32);
     let mut stereo_dm = StereoDownmixer::new();
+    let mut multi_dm = MultiChannelDownmixer::new(ch);
 
     // Zero-allocation callback using a fixed stack buffer
     let stream = device.build_input_stream(
@@ -1613,7 +1957,8 @@ where
             match ch {
                 1 => {
                     for &s in data {
-                        mono_scratch[count] = f32::from_sample(s);
+                        let v = f32::from_sample(s);
+                        mono_scratch[count] = if v.is_finite() { v } else { 0.0 };
                         count += 1;
                         total_frames += 1;
                         if count == mono_scratch.len() {
@@ -1638,12 +1983,8 @@ where
                     }
                 }
                 _ => {
-                    for frame in data.chunks(ch) {
-                        let mut sum = 0.0f32;
-                        for &s in frame {
-                            sum += f32::from_sample(s);
-                        }
-                        mono_scratch[count] = sum * inv_ch;
+                    for frame in data.chunks_exact(ch) {
+                        mono_scratch[count] = multi_dm.process_frame(frame);
                         count += 1;
                         total_frames += 1;
                         if count == mono_scratch.len() {
@@ -1662,6 +2003,9 @@ where
                 shared
                     .input_callback_frames
                     .fetch_add(total_frames, Ordering::Relaxed);
+                shared
+                    .observed_in_block_frames
+                    .fetch_max(total_frames.min(u32::MAX as u64) as u32, Ordering::Relaxed);
             }
             if dropped_frames > 0 {
                 shared
@@ -1775,8 +2119,11 @@ where
                         last_sample = sample;
                         sample
                     } else {
-                        // Gentle exponential decay to zero on rare underrun to avoid sharp click
+                        // Gentle exponential decay to zero on rare underrun (flush denormals)
                         last_sample *= 0.95;
+                        if last_sample.abs() < 1e-6 {
+                            last_sample = 0.0;
+                        }
                         last_sample
                     };
                     let converted = T::from_sample(val);
@@ -1788,8 +2135,14 @@ where
                 }
                 written_frames += batch;
             }
-            if had_underrun {
-                if let Some(ref sh) = underrun_shared {
+            if let Some(ref sh) = underrun_shared {
+                if total_frames > 0 {
+                    sh.output_callback_frames
+                        .fetch_add(total_frames as u64, Ordering::Relaxed);
+                    sh.observed_out_block_frames
+                        .fetch_max(total_frames.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+                }
+                if had_underrun {
                     sh.output_underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1918,6 +2271,32 @@ mod tests {
             (peak_stereo - 0.6).abs() < 0.01,
             "Stereo input should average to ~0.6 without +6 dB boost, got {}",
             peak_stereo
+        );
+
+        // 3. Inf / NaN sample must not latch StereoDownmixer envelopes, and silence must flush to 0.0
+        let _ = dm_mono.process(f32::INFINITY, f32::NAN);
+        assert!(dm_mono.env0.is_finite() && dm_mono.env1.is_finite());
+        for _ in 0..480_000 {
+            let _ = dm_mono.process(0.0, 0.0);
+        }
+        assert_eq!(dm_mono.env0, 0.0);
+        assert_eq!(dm_mono.env1, 0.0);
+
+        // 4. Multi-channel (4ch) interface with single XLR mic on Ch0 keeps unity gain
+        let mut dm4 = MultiChannelDownmixer::new(4);
+        let mut peak_4ch = 0.0f32;
+        for i in 0..4_800 {
+            let sig = (2.0 * std::f32::consts::PI * 440.0 * (i as f32) / 48_000.0).sin() * 0.25;
+            let frame = [sig, 0.0, 0.0, 0.0];
+            let out = dm4.process_frame(&frame);
+            if i > 4_000 {
+                peak_4ch = peak_4ch.max(out.abs());
+            }
+        }
+        assert!(
+            (peak_4ch - 0.25).abs() < 0.01,
+            "Single active mic on 4-ch interface should keep unity gain (~0.25), got {}",
+            peak_4ch
         );
     }
 

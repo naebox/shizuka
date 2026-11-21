@@ -16,8 +16,12 @@
 #define kSampleRate             48000.0
 #define kChannelCount           2U
 #define kBytesPerFrame          (kChannelCount * sizeof(Float32))
-#define kRingBufferFrames       16384U // ~341ms ring capacity at 48kHz
+#define kRingBufferFrames       16384U // ~341ms ring capacity at 48kHz (must be power of 2)
+#define kRingBufferMask         (kRingBufferFrames - 1U)
 #define kZeroTimestampFrames    4096U
+
+_Static_assert((kRingBufferFrames & (kRingBufferFrames - 1U)) == 0U,
+               "kRingBufferFrames must be a power of two");
 
 enum {
     kObjectID_PlugIn        = kAudioObjectPlugInObject, // 1
@@ -29,19 +33,21 @@ enum {
 #define kDeviceUID   CFSTR("app.shizuka.virtualmic.device")
 #define kModelUID    CFSTR("app.shizuka.virtualmic.model")
 #define kDeviceName  CFSTR("Shizuka Virtual Mic")
-#define kMfgName     CFSTR("Shizuka")
+#define kMfgName     CFSTR("naebox")
 
 static pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
 static UInt32 gPlugIn_RefCount = 0;
 static AudioServerPlugInHostRef gPlugIn_Host = NULL;
 
 static _Atomic UInt32 gDevice_IOClientCount = 0;
-static uint64_t gClock_StartHostTime = 0;
+static _Atomic uint64_t gClock_Seq = 0;
+static _Atomic uint64_t gClock_StartHostTime = 0;
 static double gHostTicksPerFrame = 0.0;
-static uint64_t gClock_Seed = 1;
+static _Atomic uint64_t gClock_Seed = 1;
 
 // Lock-free loopback buffer & writer freshness tracking
 static Float32 gRingBuffer[kRingBufferFrames * kChannelCount];
+static _Atomic int64_t gValidSampleStart = 0;
 static _Atomic int64_t gLastWrittenSampleEnd = -1;
 
 static void InitHostTimeRatio(void) {
@@ -170,6 +176,8 @@ static OSStatus CV_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPl
     gPlugIn_Host = inHost;
     InitHostTimeRatio();
     memset(gRingBuffer, 0, sizeof(gRingBuffer));
+    atomic_store_explicit(&gValidSampleStart, 0, memory_order_release);
+    atomic_store_explicit(&gLastWrittenSampleEnd, -1, memory_order_release);
     return kAudioHardwareNoError;
 }
 
@@ -399,6 +407,7 @@ static OSStatus CV_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObj
                 case kAudioPlugInPropertyResourceBundle:
                     if (inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                     *((CFStringRef*)outData) = CFSTR("");
+                    CFRetain(*((CFStringRef*)outData));
                     *outDataSize = sizeof(CFStringRef);
                     return kAudioHardwareNoError;
             }
@@ -621,9 +630,14 @@ static OSStatus CV_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID in
     UInt32 prev = atomic_fetch_add(&gDevice_IOClientCount, 1);
     if (prev == 0) {
         memset(gRingBuffer, 0, sizeof(gRingBuffer));
-        atomic_store(&gLastWrittenSampleEnd, -1);
-        gClock_StartHostTime = mach_absolute_time();
-        ++gClock_Seed;
+        atomic_store_explicit(&gValidSampleStart, 0, memory_order_release);
+        atomic_store_explicit(&gLastWrittenSampleEnd, -1, memory_order_release);
+        uint64_t seq = atomic_load_explicit(&gClock_Seq, memory_order_relaxed);
+        atomic_store_explicit(&gClock_Seq, seq + 1U, memory_order_release);
+        atomic_store_explicit(&gClock_StartHostTime, mach_absolute_time(), memory_order_relaxed);
+        uint64_t nextSeed = atomic_load_explicit(&gClock_Seed, memory_order_relaxed) + 1U;
+        atomic_store_explicit(&gClock_Seed, nextSeed, memory_order_relaxed);
+        atomic_store_explicit(&gClock_Seq, seq + 2U, memory_order_release);
     }
     pthread_mutex_unlock(&gStateMutex);
     return kAudioHardwareNoError;
@@ -638,7 +652,8 @@ static OSStatus CV_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inD
     if (cur > 0) {
         if (atomic_fetch_sub(&gDevice_IOClientCount, 1) == 1) {
             memset(gRingBuffer, 0, sizeof(gRingBuffer));
-            atomic_store(&gLastWrittenSampleEnd, -1);
+            atomic_store_explicit(&gValidSampleStart, 0, memory_order_release);
+            atomic_store_explicit(&gLastWrittenSampleEnd, -1, memory_order_release);
         }
     }
     pthread_mutex_unlock(&gStateMutex);
@@ -649,14 +664,31 @@ static OSStatus CV_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioOb
     (void)inDriver; (void)inClientID;
     if (inDeviceObjectID != kObjectID_Device) return kAudioHardwareBadObjectError;
 
+    // Lock-free seqlock snapshot so real-time CoreAudio IO never races with CV_StartIO
+    uint64_t startHost = 0;
+    uint64_t seed = 1;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        uint64_t s1 = atomic_load_explicit(&gClock_Seq, memory_order_acquire);
+        if (s1 & 1U) {
+            continue;
+        }
+        startHost = atomic_load_explicit(&gClock_StartHostTime, memory_order_relaxed);
+        seed      = atomic_load_explicit(&gClock_Seed, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        uint64_t s2 = atomic_load_explicit(&gClock_Seq, memory_order_relaxed);
+        if (s1 == s2) {
+            break;
+        }
+    }
+
     uint64_t now = mach_absolute_time();
     double ticksPerRing = gHostTicksPerFrame * (double)kZeroTimestampFrames;
-    uint64_t elapsedTicks = now >= gClock_StartHostTime ? (now - gClock_StartHostTime) : 0;
+    uint64_t elapsedTicks = now >= startHost ? (now - startHost) : 0;
     uint64_t periods = (uint64_t)((double)elapsedTicks / ticksPerRing);
 
     *outSampleTime = (Float64)(periods * kZeroTimestampFrames);
-    *outHostTime   = gClock_StartHostTime + (uint64_t)((double)periods * ticksPerRing);
-    *outSeed       = gClock_Seed;
+    *outHostTime   = startHost + (uint64_t)((double)periods * ticksPerRing);
+    *outSeed       = seed;
     return kAudioHardwareNoError;
 }
 
@@ -684,8 +716,13 @@ static OSStatus CV_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjec
 
     if (inOperationID == kAudioServerPlugInIOOperationWriteMix && inStreamObjectID == kObjectID_Stream_Output) {
         int64_t startFrame = (int64_t)inIOCycleInfo->mOutputTime.mSampleTime;
+        int64_t prevEnd = atomic_load_explicit(&gLastWrittenSampleEnd, memory_order_relaxed);
+        if (prevEnd < 0 || startFrame > prevEnd) {
+            // Fresh writer start or resume after pause: invalidate any stale samples before startFrame
+            atomic_store_explicit(&gValidSampleStart, startFrame, memory_order_release);
+        }
         for (UInt32 f = 0; f < inIOBufferFrameSize; ++f) {
-            UInt32 idx = (UInt32)((uint64_t)(startFrame + f) % kRingBufferFrames) * kChannelCount;
+            UInt32 idx = (UInt32)(((uint64_t)(startFrame + (int64_t)f)) & kRingBufferMask) * kChannelCount;
             gRingBuffer[idx]     = buf[f * kChannelCount];
             gRingBuffer[idx + 1] = buf[f * kChannelCount + 1];
         }
@@ -693,15 +730,26 @@ static OSStatus CV_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjec
     } else if (inOperationID == kAudioServerPlugInIOOperationReadInput && inStreamObjectID == kObjectID_Stream_Input) {
         int64_t readStart = (int64_t)inIOCycleInfo->mInputTime.mSampleTime;
         int64_t lastWritten = atomic_load_explicit(&gLastWrittenSampleEnd, memory_order_acquire);
+        int64_t validStart = atomic_load_explicit(&gValidSampleStart, memory_order_acquire);
 
-        // If no active writer has written recent frames (e.g. Shizuka app stopped), output clean silence
-        if (lastWritten < 0 || readStart > lastWritten + (int64_t)(kRingBufferFrames / 4)) {
+        // Output exact silence whenever no active writer has written the requested sample positions
+        if (lastWritten < 0 || readStart >= lastWritten) {
             memset(buf, 0, inIOBufferFrameSize * kBytesPerFrame);
         } else {
+            int64_t earliestValid = lastWritten - (int64_t)kRingBufferFrames;
+            if (validStart > earliestValid) {
+                earliestValid = validStart;
+            }
             for (UInt32 f = 0; f < inIOBufferFrameSize; ++f) {
-                UInt32 idx = (UInt32)((uint64_t)(readStart + f) % kRingBufferFrames) * kChannelCount;
-                buf[f * kChannelCount]     = gRingBuffer[idx];
-                buf[f * kChannelCount + 1] = gRingBuffer[idx + 1];
+                int64_t pos = readStart + (int64_t)f;
+                if (pos < earliestValid || pos >= lastWritten) {
+                    buf[f * kChannelCount]     = 0.0f;
+                    buf[f * kChannelCount + 1] = 0.0f;
+                } else {
+                    UInt32 idx = (UInt32)(((uint64_t)pos) & kRingBufferMask) * kChannelCount;
+                    buf[f * kChannelCount]     = gRingBuffer[idx];
+                    buf[f * kChannelCount + 1] = gRingBuffer[idx + 1];
+                }
             }
         }
     }

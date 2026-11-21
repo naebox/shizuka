@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   AudioLines,
   Check,
@@ -31,6 +32,20 @@ import {
   Waves,
   X,
 } from "lucide-react";
+import {
+  AgcLiveBadge,
+  HeroLiveMeters,
+  MicTestLiveMeter,
+  SettingsDiagGrid,
+  TopBarStatPills,
+  VadLiveBadge,
+} from "./components/LiveTelemetryWidgets";
+import {
+  refreshTelemetryNow,
+  seedTelemetry,
+  setNativeWindowVisible,
+  useDiscreteTelemetry,
+} from "./telemetryStore";
 import type {
   AppConfig,
   AudioTelemetry,
@@ -247,7 +262,9 @@ function readStoredColorScheme(): "dark" | "light" | null {
   }
 }
 
-function applyColorSchemeMeta(content: "dark" | "light" | "light dark") {
+function applyColorSchemeMeta(
+  content: "dark" | "light" | "light dark"
+): Promise<void> {
   const meta = document.querySelector<HTMLMetaElement>(
     'meta[name="color-scheme"]'
   );
@@ -256,7 +273,9 @@ function applyColorSchemeMeta(content: "dark" | "light" | "light dark") {
   }
   const nativeTheme =
     content === "dark" || content === "light" ? content : null;
-  void invoke("set_window_theme", { theme: nativeTheme }).catch(() => {});
+  return invoke("set_window_theme", { theme: nativeTheme })
+    .then(() => undefined)
+    .catch(() => undefined);
 }
 
 function ShizukaMark({
@@ -305,11 +324,6 @@ function ShizukaMark({
   );
 }
 
-function dbToRatio(db: number): number {
-  const clamped = Math.max(-60, Math.min(0, db));
-  return (clamped + 60) / 60;
-}
-
 function sliderCssVars(
   value: number,
   min: number,
@@ -320,6 +334,14 @@ function sliderCssVars(
     "--attr-max": String(max),
     "--control-value": String(value),
   } as CSSProperties;
+}
+
+function formatIpcError(err: unknown): string {
+  return typeof err === "string"
+    ? err
+    : err instanceof Error
+    ? err.message
+    : String(err);
 }
 
 export function App() {
@@ -355,13 +377,25 @@ export function App() {
   const updateProgressId = `${uid}-update-progress`;
 
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
-  const lastReconnectCountRef = useRef<number>(0);
-  const lastConfigRevisionRef = useRef<number>(0);
+  const autostartInputRef = useRef<HTMLInputElement | null>(null);
+  const lastReconnectCountRef = useRef<number | null>(null);
+  const lastConfigRevisionRef = useRef<number | null>(null);
   const recordingActionRef = useRef<ShortcutAction | null>(null);
+  const shortcutSubmittingRef = useRef<boolean>(false);
+  const ncTogglePendingRef = useRef<boolean>(false);
+  const deviceSeqRef = useRef<number>(0);
+  const paramSeqRef = useRef<number>(0);
+  const configRef = useRef<AppConfig | null>(null);
+  const diagCopiedTimerRef = useRef<number | null>(null);
+  const updateInstallPollRef = useRef<number | null>(null);
 
+  const telemetry = useDiscreteTelemetry();
+
+  const [appVersion, setAppVersion] = useState<string>("");
   const [devices, setDevices] = useState<DeviceListResponse | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [telemetry, setTelemetry] = useState<AudioTelemetry | null>(null);
+  const [rescanning, setRescanning] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [monitorClean, setMonitorClean] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -370,6 +404,7 @@ export function App() {
     useState<ShortcutAction | null>(null);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   const [diagCopied, setDiagCopied] = useState(false);
+  const [diagError, setDiagError] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
@@ -387,8 +422,13 @@ export function App() {
   } | null>(null);
 
   recordingActionRef.current = recordingAction;
+  configRef.current = config;
 
-  const refreshDevicesAndConfig = useCallback(async () => {
+  const refreshDevicesAndConfig = useCallback(async (userInitiated = false) => {
+    if (userInitiated) {
+      setRescanning(true);
+      setActionError(null);
+    }
     try {
       const [devs, cfg, autostart] = await Promise.all([
         invoke<DeviceListResponse>("get_devices"),
@@ -399,31 +439,42 @@ export function App() {
       setConfig(cfg);
       setAutostartEnabled(autostart);
     } catch (err) {
-      console.error("Failed to load audio devices/config:", err);
+      setActionError(
+        `オーディオデバイスの読み込みに失敗しました: ${formatIpcError(err)}`
+      );
+    } finally {
+      if (userInitiated) {
+        setRescanning(false);
+      }
     }
   }, []);
 
   const stopShortcutRecording = useCallback(async () => {
     if (recordingActionRef.current === null) return;
     recordingActionRef.current = null;
+    shortcutSubmittingRef.current = false;
     setRecordingAction(null);
     await invoke("set_shortcuts_paused", { paused: false }).catch(() => {});
   }, []);
 
-  const startShortcutRecording = useCallback(async (action: ShortcutAction) => {
-    setShortcutError(null);
-    if (recordingActionRef.current === action) {
-      await stopShortcutRecording();
-      return;
-    }
-    try {
-      await invoke("set_shortcuts_paused", { paused: true });
-      recordingActionRef.current = action;
-      setRecordingAction(action);
-    } catch (err) {
-      setShortcutError(typeof err === "string" ? err : String(err));
-    }
-  }, [stopShortcutRecording]);
+  const startShortcutRecording = useCallback(
+    async (action: ShortcutAction) => {
+      setShortcutError(null);
+      if (recordingActionRef.current === action) {
+        await stopShortcutRecording();
+        return;
+      }
+      try {
+        await invoke("set_shortcuts_paused", { paused: true });
+        recordingActionRef.current = action;
+        shortcutSubmittingRef.current = false;
+        setRecordingAction(action);
+      } catch (err) {
+        setShortcutError(formatIpcError(err));
+      }
+    },
+    [stopShortcutRecording]
+  );
 
   const closeSettingsDialog = useCallback(async () => {
     await stopShortcutRecording();
@@ -453,6 +504,7 @@ export function App() {
     dialog.removeAttribute("data-closing");
     setAutostartError(null);
     setShortcutError(null);
+    setDiagError(null);
     setDiagCopied(false);
     void invoke<boolean>("get_autostart_enabled")
       .then(setAutostartEnabled)
@@ -463,6 +515,9 @@ export function App() {
       })
       .catch(() => {});
     dialog.showModal();
+    // React 18 consumes `autoFocus` on initial mount while `<dialog>` is closed, so move
+    // initial focus explicitly onto the primary control inside the modal after showModal().
+    autostartInputRef.current?.focus({ preventScroll: true });
   }, []);
 
   // Capture keyboard shortcut while recording inside Settings dialog
@@ -472,6 +527,10 @@ export function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
+
+      if (shortcutSubmittingRef.current) {
+        return;
+      }
 
       if (e.code === "Escape" || e.key === "Escape") {
         setShortcutError(null);
@@ -489,6 +548,7 @@ export function App() {
       }
 
       const targetAction = recordingAction;
+      shortcutSubmittingRef.current = true;
       void (async () => {
         try {
           // Backend validates OS registration, commits, and atomically unpauses shortcuts
@@ -501,12 +561,14 @@ export function App() {
           setRecordingAction(null);
           setShortcutError(null);
         } catch (err) {
-          setShortcutError(typeof err === "string" ? err : String(err));
+          setShortcutError(formatIpcError(err));
           recordingActionRef.current = null;
           setRecordingAction(null);
           await invoke("set_shortcuts_paused", { paused: false }).catch(
             () => {}
           );
+        } finally {
+          shortcutSubmittingRef.current = false;
         }
       })();
     };
@@ -517,6 +579,17 @@ export function App() {
     };
   }, [recordingAction, stopShortcutRecording]);
 
+  // Cancel shortcut recording if the window is hidden while recording
+  useEffect(() => {
+    const onVisChange = () => {
+      if (document.hidden && recordingActionRef.current !== null) {
+        void stopShortcutRecording();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisChange);
+    return () => document.removeEventListener("visibilitychange", onVisChange);
+  }, [stopShortcutRecording]);
+
   useEffect(() => {
     const dialog = settingsDialogRef.current;
     if (!dialog) return;
@@ -526,6 +599,7 @@ export function App() {
       dialog.returnValue = "";
       if (recordingActionRef.current !== null) {
         recordingActionRef.current = null;
+        shortcutSubmittingRef.current = false;
         setRecordingAction(null);
         void invoke("set_shortcuts_paused", { paused: false }).catch(() => {});
       }
@@ -593,58 +667,149 @@ export function App() {
     };
   }, [closeSettingsDialog, stopShortcutRecording]);
 
+  // Initial bootstrap: load theme, version, devices, config, and first telemetry BEFORE showing
+  // the main window so startup never flashes white or placeholder defaults.
   useEffect(() => {
-    const initialStored = readStoredColorScheme();
-    applyColorSchemeMeta(initialStored ?? "light dark");
+    let active = true;
+    const unlisteners: Array<() => void> = [];
 
     const onStorage = (e: StorageEvent) => {
       if (e.key === COLOR_SCHEME_STORAGE_KEY || e.key === null) {
         const next = readStoredColorScheme();
-        applyColorSchemeMeta(next ?? "light dark");
+        void applyColorSchemeMeta(next ?? "light dark");
       }
     };
     window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, []);
 
-  useEffect(() => {
-    void refreshDevicesAndConfig();
-    const timer = setInterval(async () => {
+    void (async () => {
+      const initialStored = readStoredColorScheme();
+      const [, ver, devs, cfg, autostart, initTelem] = await Promise.all([
+        applyColorSchemeMeta(initialStored ?? "light dark"),
+        invoke<string>("get_app_version").catch(() => ""),
+        invoke<DeviceListResponse>("get_devices").catch(() => null),
+        invoke<AppConfig>("get_config").catch(() => null),
+        invoke<boolean>("get_autostart_enabled").catch(() => false),
+        invoke<AudioTelemetry>("get_telemetry").catch(() => null),
+      ]);
+
+      if (!active) return;
+      if (ver) setAppVersion(ver);
+      if (devs) setDevices(devs);
+      if (cfg) setConfig(cfg);
+      setAutostartEnabled(autostart);
+      if (initTelem) {
+        lastReconnectCountRef.current = initTelem.status.reconnect_count;
+        lastConfigRevisionRef.current = initTelem.config_revision;
+        seedTelemetry(initTelem);
+      }
+
+      const isVisible = await invoke<boolean>("frontend_ready").catch(
+        () => true
+      );
+      if (!active) return;
+      setNativeWindowVisible(isVisible);
+
       try {
-        const snap = await invoke<AudioTelemetry>("get_telemetry");
-        setTelemetry(snap);
-        setConfig((prev) =>
-          prev && prev.nc_enabled !== snap.nc_enabled
-            ? { ...prev, nc_enabled: snap.nc_enabled }
-            : prev
-        );
-        if (snap.status.reconnect_count !== lastReconnectCountRef.current) {
-          lastReconnectCountRef.current = snap.status.reconnect_count;
-          void refreshDevicesAndConfig();
-        } else if (snap.config_revision !== lastConfigRevisionRef.current) {
-          lastConfigRevisionRef.current = snap.config_revision;
-          void invoke<AppConfig>("get_config")
-            .then(setConfig)
-            .catch(() => {});
+        const u1 = await listen<boolean>("shizuka-window-visibility", (ev) => {
+          const vis = Boolean(ev.payload);
+          setNativeWindowVisible(vis);
+          if (!vis && recordingActionRef.current !== null) {
+            void stopShortcutRecording();
+          }
+        });
+        const u2 = await listen("shizuka-state-changed", () => {
+          refreshTelemetryNow();
+        });
+        if (!active) {
+          u1();
+          u2();
+        } else {
+          unlisteners.push(u1, u2);
         }
       } catch {
-        // Ignore transient IPC error during shutdown
+        // Fallback: keep polling tied to document visibility if event listener is unavailable
       }
-    }, 50);
-    return () => clearInterval(timer);
-  }, [refreshDevicesAndConfig]);
+    })();
 
-  const ncEnabled = telemetry?.nc_enabled ?? config?.nc_enabled ?? true;
+    return () => {
+      active = false;
+      window.removeEventListener("storage", onStorage);
+      setNativeWindowVisible(false);
+      for (const u of unlisteners) {
+        u();
+      }
+      if (diagCopiedTimerRef.current !== null) {
+        window.clearTimeout(diagCopiedTimerRef.current);
+      }
+      if (updateInstallPollRef.current !== null) {
+        window.clearInterval(updateInstallPollRef.current);
+      }
+    };
+  }, [stopShortcutRecording]);
+
+  // React to discrete backend state transitions (tray/hotkey toggles, auto-reconnects, mic profile restore)
+  useEffect(() => {
+    if (!telemetry) return;
+
+    if (!ncTogglePendingRef.current) {
+      setConfig((prev) =>
+        prev && prev.nc_enabled !== telemetry.nc_enabled
+          ? { ...prev, nc_enabled: telemetry.nc_enabled }
+          : prev
+      );
+    }
+
+    if (
+      lastReconnectCountRef.current !== null &&
+      telemetry.reconnect_count !== lastReconnectCountRef.current
+    ) {
+      lastReconnectCountRef.current = telemetry.reconnect_count;
+      void refreshDevicesAndConfig(false);
+    } else if (
+      lastConfigRevisionRef.current !== null &&
+      telemetry.config_revision !== lastConfigRevisionRef.current
+    ) {
+      lastConfigRevisionRef.current = telemetry.config_revision;
+      const reqSeq = ++paramSeqRef.current;
+      void invoke<AppConfig>("get_config")
+        .then((fresh) => {
+          if (reqSeq === paramSeqRef.current) {
+            setConfig(fresh);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [telemetry, refreshDevicesAndConfig]);
+
+  const ncEnabled = ncTogglePendingRef.current
+    ? config?.nc_enabled ?? true
+    : telemetry?.nc_enabled ?? config?.nc_enabled ?? true;
   const micMuted = telemetry?.mic_muted ?? false;
 
   const handleToggleNc = async (next: boolean) => {
+    setActionError(null);
+    ncTogglePendingRef.current = true;
     setConfig((prev) => (prev ? { ...prev, nc_enabled: next } : prev));
-    await invoke("set_nc_enabled", { enabled: next });
+    try {
+      await invoke("set_nc_enabled", { enabled: next });
+      refreshTelemetryNow();
+    } catch (err) {
+      setConfig((prev) => (prev ? { ...prev, nc_enabled: !next } : prev));
+      setActionError(`ノイズ除去の切替に失敗しました: ${formatIpcError(err)}`);
+    } finally {
+      ncTogglePendingRef.current = false;
+    }
   };
 
   const handleToggleMute = async () => {
+    setActionError(null);
     const next = !micMuted;
-    await invoke("set_mic_muted", { muted: next });
+    try {
+      await invoke("set_mic_muted", { muted: next });
+      refreshTelemetryNow();
+    } catch (err) {
+      setActionError(`ミュート切替に失敗しました: ${formatIpcError(err)}`);
+    }
   };
 
   // Two-state color-scheme toggle: pins explicit opposite of rendered scheme,
@@ -661,14 +826,14 @@ export function App() {
       } catch {
         // Still apply to current session even if storage is unavailable
       }
-      applyColorSchemeMeta(target);
+      void applyColorSchemeMeta(target);
     } else {
       try {
         localStorage.removeItem(COLOR_SCHEME_STORAGE_KEY);
       } catch {
         // Ignore storage error
       }
-      applyColorSchemeMeta("light dark");
+      void applyColorSchemeMeta("light dark");
     }
   };
 
@@ -677,27 +842,56 @@ export function App() {
     nextOut: string | null,
     nextMon: string | null
   ) => {
-    if (!config) return;
-    const optimistic: AppConfig = {
-      ...config,
-      input_device: nextIn,
-      output_device: nextOut,
-      monitor_device: nextMon,
-    };
-    setConfig(optimistic);
-    const synced = await invoke<AppConfig>("select_devices", {
-      inputDevice: nextIn,
-      outputDevice: nextOut,
-      monitorDevice: nextMon,
-    });
-    setConfig(synced);
+    setActionError(null);
+    const seq = ++deviceSeqRef.current;
+    const prevSnapshot = configRef.current;
+    setConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            input_device: nextIn,
+            output_device: nextOut,
+            monitor_device: nextMon,
+          }
+        : prev
+    );
+    try {
+      const synced = await invoke<AppConfig>("select_devices", {
+        inputDevice: nextIn,
+        outputDevice: nextOut,
+        monitorDevice: nextMon,
+      });
+      if (seq === deviceSeqRef.current) {
+        setConfig(synced);
+      }
+    } catch (err) {
+      if (seq === deviceSeqRef.current && prevSnapshot) {
+        setConfig(prevSnapshot);
+      }
+      setActionError(
+        `デバイスの切替に失敗しました: ${formatIpcError(err)}`
+      );
+    }
   };
 
   const handleModelVariantChange = async (nextVariant: ModelVariant) => {
+    setActionError(null);
+    const prevVariant = configRef.current?.model_variant;
     setConfig((prev) =>
       prev ? { ...prev, model_variant: nextVariant } : prev
     );
-    await invoke("set_model_variant", { modelVariant: nextVariant });
+    try {
+      await invoke("set_model_variant", { modelVariant: nextVariant });
+    } catch (err) {
+      if (prevVariant) {
+        setConfig((prev) =>
+          prev ? { ...prev, model_variant: prevVariant } : prev
+        );
+      }
+      setActionError(
+        `AI モデルの切替に失敗しました: ${formatIpcError(err)}`
+      );
+    }
   };
 
   const handleParamChange = async (
@@ -709,28 +903,44 @@ export function App() {
     hpfEnabled: boolean,
     agcEnabled: boolean
   ) => {
-    if (!config) return;
-    const minThresh = config.min_db_thresh;
-    setConfig({
-      ...config,
-      atten_lim_db: attenLimDb,
-      post_filter_beta: postFilterBeta,
-      input_gain_db: inputGainDb,
-      vad_gate_enabled: vadGateEnabled,
-      vad_threshold_db: vadThresholdDb,
-      hpf_enabled: hpfEnabled,
-      agc_enabled: agcEnabled,
-    });
-    await invoke("update_dsp_params", {
-      attenLimDb,
-      postFilterBeta,
-      inputGainDb,
-      minDbThresh: minThresh,
-      vadGateEnabled,
-      vadThresholdDb,
-      hpfEnabled,
-      agcEnabled,
-    });
+    const cur = configRef.current;
+    if (!cur) return;
+    setActionError(null);
+    const seq = ++paramSeqRef.current;
+    const minThresh = cur.min_db_thresh;
+    setConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            atten_lim_db: attenLimDb,
+            post_filter_beta: postFilterBeta,
+            input_gain_db: inputGainDb,
+            vad_gate_enabled: vadGateEnabled,
+            vad_threshold_db: vadThresholdDb,
+            hpf_enabled: hpfEnabled,
+            agc_enabled: agcEnabled,
+          }
+        : prev
+    );
+    try {
+      await invoke("update_dsp_params", {
+        attenLimDb,
+        postFilterBeta,
+        inputGainDb,
+        minDbThresh: minThresh,
+        vadGateEnabled,
+        vadThresholdDb,
+        hpfEnabled,
+        agcEnabled,
+      });
+    } catch (err) {
+      if (seq === paramSeqRef.current) {
+        setActionError(`音質パラメータの反映に失敗しました: ${formatIpcError(err)}`);
+        void invoke<AppConfig>("get_config")
+          .then(setConfig)
+          .catch(() => {});
+      }
+    }
   };
 
   const handleClearShortcut = async (action: ShortcutAction) => {
@@ -743,36 +953,68 @@ export function App() {
       });
       setConfig(updated);
     } catch (err) {
-      setShortcutError(typeof err === "string" ? err : String(err));
+      setShortcutError(formatIpcError(err));
     }
   };
 
   const handleToggleShortcutSound = async (enabled: boolean) => {
+    setShortcutError(null);
     setConfig((prev) =>
       prev ? { ...prev, shortcut_sound_enabled: enabled } : prev
     );
-    await invoke("set_shortcut_sound_enabled", { enabled });
+    try {
+      await invoke("set_shortcut_sound_enabled", { enabled });
+    } catch (err) {
+      setConfig((prev) =>
+        prev ? { ...prev, shortcut_sound_enabled: !enabled } : prev
+      );
+      setShortcutError(formatIpcError(err));
+    }
   };
 
   const handleToggleLiveMonitor = async () => {
+    setActionError(null);
     const cur = telemetry?.live_monitor_enabled ?? false;
-    await invoke("set_live_monitor", { enabled: !cur });
+    try {
+      await invoke("set_live_monitor", { enabled: !cur });
+      refreshTelemetryNow();
+    } catch (err) {
+      setActionError(
+        `マイクテストの切替に失敗しました: ${formatIpcError(err)}`
+      );
+    }
   };
 
   const handleMonitorModeChange = async (clean: boolean) => {
+    setActionError(null);
     setMonitorClean(clean);
-    await invoke("set_monitor_mode", { clean });
+    try {
+      await invoke("set_monitor_mode", { clean });
+    } catch (err) {
+      setMonitorClean(!clean);
+      setActionError(
+        `モニターモードの切替に失敗しました: ${formatIpcError(err)}`
+      );
+    }
   };
 
   const handleMonitorVolumeChange = async (pct: number) => {
     const clampedPct = Math.max(0, Math.min(100, pct));
     const vol = clampedPct / 100;
     setConfig((prev) => (prev ? { ...prev, monitor_volume: vol } : prev));
-    await invoke("set_monitor_volume", { volume: vol });
+    try {
+      await invoke("set_monitor_volume", { volume: vol });
+    } catch (err) {
+      setActionError(`モニター音量の変更に失敗しました: ${formatIpcError(err)}`);
+    }
   };
 
   const handleQuit = async () => {
-    await invoke("quit_app");
+    try {
+      await invoke("quit_app");
+    } catch (err) {
+      setActionError(`終了処理に失敗しました: ${formatIpcError(err)}`);
+    }
   };
 
   const handleToggleAutostart = async (next: boolean) => {
@@ -784,20 +1026,29 @@ export function App() {
       });
       setAutostartEnabled(actual);
     } catch (err) {
-      setAutostartError(typeof err === "string" ? err : String(err));
+      setAutostartError(formatIpcError(err));
     } finally {
       setAutostartBusy(false);
     }
   };
 
   const handleCopyDiagnostics = async () => {
+    setDiagError(null);
     try {
       const text = await invoke<string>("get_diagnostics_text");
       await navigator.clipboard.writeText(text);
       setDiagCopied(true);
-      window.setTimeout(() => setDiagCopied(false), 2200);
+      if (diagCopiedTimerRef.current !== null) {
+        window.clearTimeout(diagCopiedTimerRef.current);
+      }
+      diagCopiedTimerRef.current = window.setTimeout(() => {
+        diagCopiedTimerRef.current = null;
+        setDiagCopied(false);
+      }, 2200);
     } catch (err) {
-      console.error("Failed to copy diagnostics:", err);
+      setDiagError(
+        `クリップボードへのコピーに失敗しました: ${formatIpcError(err)}`
+      );
     }
   };
 
@@ -811,7 +1062,7 @@ export function App() {
       setUpdateInfo(res);
     } catch (err) {
       if (!silent) {
-        setUpdateError(typeof err === "string" ? err : String(err));
+        setUpdateError(formatIpcError(err));
       }
     } finally {
       setUpdateChecking(false);
@@ -827,7 +1078,10 @@ export function App() {
       total_bytes: null,
       error: null,
     });
-    const poll = window.setInterval(async () => {
+    if (updateInstallPollRef.current !== null) {
+      window.clearInterval(updateInstallPollRef.current);
+    }
+    updateInstallPollRef.current = window.setInterval(async () => {
       try {
         const snap = await invoke<UpdateProgressSnapshot>(
           "get_update_progress"
@@ -840,11 +1094,14 @@ export function App() {
     try {
       await invoke("install_update");
     } catch (err) {
-      setUpdateError(typeof err === "string" ? err : String(err));
+      setUpdateError(formatIpcError(err));
       setUpdateProgress((prev) => ({ ...prev, phase: "error" }));
       setUpdateInstalling(false);
     } finally {
-      window.clearInterval(poll);
+      if (updateInstallPollRef.current !== null) {
+        window.clearInterval(updateInstallPollRef.current);
+        updateInstallPollRef.current = null;
+      }
     }
   };
 
@@ -853,7 +1110,7 @@ export function App() {
     try {
       await invoke("open_releases_page");
     } catch (err) {
-      setUpdateError(typeof err === "string" ? err : String(err));
+      setUpdateError(formatIpcError(err));
     }
   };
 
@@ -871,11 +1128,11 @@ export function App() {
     try {
       const res = await invoke<InstallDriverResult>("install_virtual_driver");
       setInstallMessage({ ok: res.success, text: res.message });
-      await refreshDevicesAndConfig();
+      await refreshDevicesAndConfig(false);
     } catch (err) {
       setInstallMessage({
         ok: false,
-        text: typeof err === "string" ? err : String(err),
+        text: formatIpcError(err),
       });
     } finally {
       setInstallingDriver(false);
@@ -892,27 +1149,14 @@ export function App() {
   const vadThreshDb = config?.vad_threshold_db ?? -5;
   const hpfEnabled = config?.hpf_enabled ?? telemetry?.hpf_enabled ?? true;
   const agcEnabled = config?.agc_enabled ?? telemetry?.agc_enabled ?? false;
-  const agcGainDb = telemetry?.agc_gain_db ?? 0;
-  const clippingActive = telemetry?.clipping_active ?? false;
-  const vadSpeaking = telemetry?.vad_speaking ?? false;
   const liveMonitorEnabled = telemetry?.live_monitor_enabled ?? false;
   const monVolPct = Math.round(
     (config?.monitor_volume ?? telemetry?.monitor_volume ?? 0.8) * 100
   );
-  const monLevelRatio = liveMonitorEnabled
-    ? dbToRatio(telemetry?.monitor_rms_db ?? -90)
-    : 0;
   const isMac = devices?.platform === "macos";
   const shortcutSoundEnabled = config?.shortcut_sound_enabled ?? true;
-  const connState = telemetry?.status.connection_state ?? "running";
-  const connStateLabel =
-    connState === "running"
-      ? "稼働中"
-      : connState === "waiting_device"
-      ? "再接続待ち"
-      : connState === "reconnecting"
-      ? "再接続中"
-      : "停止中";
+  const connState = telemetry?.connection_state ?? "running";
+  const displayVersion = updateInfo?.current_version ?? appVersion;
 
   const activePreset =
     attenDb <= 30 ? "natural" : attenDb >= 90 ? "max" : "balanced";
@@ -924,10 +1168,26 @@ export function App() {
     vadThreshDb > 0
       ? `+${vadThreshDb.toFixed(1)} dB`
       : `${vadThreshDb.toFixed(1)} dB`;
-  const agcLiveText =
-    agcGainDb >= 0
-      ? `+${agcGainDb.toFixed(1)} dB`
-      : `${agcGainDb.toFixed(1)} dB`;
+
+  // Detect configured devices that are temporarily unplugged so <select> never falsely displays
+  // "システム既定" while the backend is waiting to auto-reconnect the configured hardware.
+  const configuredInputMissing = Boolean(
+    config?.input_device &&
+      devices &&
+      !devices.inputs.some((d) => d.name === config.input_device)
+  );
+  const configuredOutputMissing = Boolean(
+    config?.output_device &&
+      devices &&
+      !devices.outputs.some((d) => d.name === config.output_device)
+  );
+  const physicalOutputs =
+    devices?.outputs.filter((d) => !d.is_virtual_cable) ?? [];
+  const configuredMonitorMissing = Boolean(
+    config?.monitor_device &&
+      devices &&
+      !physicalOutputs.some((d) => d.name === config.monitor_device)
+  );
 
   return (
     <div className="app-shell">
@@ -940,12 +1200,7 @@ export function App() {
           <h1 className="brand-title">Shizuka</h1>
         </div>
         <div className="badge-row">
-          <span className="stat-pill">
-            CPU {(telemetry?.cpu_load_pct ?? 0).toFixed(1)}%
-          </span>
-          <span className="stat-pill">
-            {(telemetry?.latency_ms ?? 10).toFixed(0)} ms
-          </span>
+          <TopBarStatPills />
           <button
             type="button"
             className="icon-btn"
@@ -962,8 +1217,9 @@ export function App() {
           </button>
           <button
             type="button"
-            className="icon-btn"
-            onClick={() => void refreshDevicesAndConfig()}
+            className={`icon-btn ${rescanning ? "is-busy" : ""}`}
+            disabled={rescanning}
+            onClick={() => void refreshDevicesAndConfig(true)}
             aria-label="オーディオデバイスを再スキャン"
           >
             <RefreshCw size={14} aria-hidden="true" />
@@ -992,8 +1248,8 @@ export function App() {
             <span className="status-banner-dot" aria-hidden="true" />
             <span>
               <strong>マイク再接続待ち：</strong>
-              {telemetry?.status.waiting_device_name
-                ? `「${telemetry.status.waiting_device_name}」が接続されると自動で再開します。`
+              {telemetry?.waiting_device_name
+                ? `「${telemetry.waiting_device_name}」が接続されると自動で再開します。`
                 : "マイクが接続されると自動で再開します。"}
             </span>
           </div>
@@ -1006,7 +1262,7 @@ export function App() {
           </div>
         )}
 
-        {telemetry?.status.last_error && (
+        {(actionError || telemetry?.last_error) && (
           <div className="error-banner" role="alert">
             <TriangleAlert
               size={13}
@@ -1016,7 +1272,7 @@ export function App() {
                 marginInlineEnd: "0.3rem",
               }}
             />
-            {telemetry.status.last_error}
+            {actionError ?? telemetry?.last_error}
           </div>
         )}
 
@@ -1087,65 +1343,12 @@ export function App() {
             </button>
           </div>
 
-          <div className="meters-box">
-            <div className="meter-row">
-              <div className="meter-label">
-                <label htmlFor={inputMeterId}>入力マイク (処理前)</label>
-                <span>{(telemetry?.input_rms_db ?? -90).toFixed(0)} dB</span>
-              </div>
-              <progress
-                id={inputMeterId}
-                className="audio-meter raw"
-                max={1}
-                value={dbToRatio(telemetry?.input_rms_db ?? -90)}
-              />
-            </div>
-
-            <div className="meter-row">
-              <div className="meter-label">
-                <span className="meter-label-left">
-                  <label htmlFor={outputMeterId}>
-                    {micMuted
-                      ? "ミュート中 (無音送信)"
-                      : ncEnabled
-                      ? "ノイズ除去後"
-                      : "スルー出力 (未処理)"}
-                  </label>
-                  {!micMuted &&
-                    ncEnabled &&
-                    (telemetry?.noise_reduced_db ?? 0) > 1.5 && (
-                      <span className="reduction-badge">
-                        -{(telemetry?.noise_reduced_db ?? 0).toFixed(0)} dB
-                      </span>
-                    )}
-                  {clippingActive && (
-                    <span
-                      className="clip-badge"
-                      role="status"
-                      title="入力または出力がリミッターに達しました。入力ゲインを下げてください。"
-                    >
-                      CLIP
-                    </span>
-                  )}
-                </span>
-                <span>
-                  {micMuted
-                    ? "-∞ dB"
-                    : `${(telemetry?.output_rms_db ?? -90).toFixed(0)} dB`}
-                </span>
-              </div>
-              <progress
-                id={outputMeterId}
-                className={`audio-meter ${
-                  micMuted ? "muted" : ncEnabled ? "" : "raw"
-                }`}
-                max={1}
-                value={
-                  micMuted ? 0 : dbToRatio(telemetry?.output_rms_db ?? -90)
-                }
-              />
-            </div>
-          </div>
+          <HeroLiveMeters
+            inputMeterId={inputMeterId}
+            outputMeterId={outputMeterId}
+            ncEnabled={ncEnabled}
+            micMuted={micMuted}
+          />
         </section>
 
         {/* Audio Device Routing */}
@@ -1187,6 +1390,11 @@ export function App() {
               }
             >
               <option value="">システム既定のマイク (自動選択)</option>
+              {configuredInputMissing && config?.input_device && (
+                <option value={config.input_device}>
+                  {config.input_device} (未接続)
+                </option>
+              )}
               {devices?.inputs.map((d) => (
                 <option key={d.name} value={d.name}>
                   {d.is_default ? "★ " : ""}
@@ -1213,7 +1421,12 @@ export function App() {
                 )
               }
             >
-              <option value="">出力しない (録音テストのみ)</option>
+              <option value="">出力しない (マイクテストのみ)</option>
+              {configuredOutputMissing && config?.output_device && (
+                <option value={config.output_device}>
+                  {config.output_device} (未接続)
+                </option>
+              )}
               {devices?.outputs.map((d) => (
                 <option key={d.name} value={d.name}>
                   {d.is_virtual_cable ? "★推奨 [仮想] " : ""}
@@ -1499,7 +1712,7 @@ export function App() {
               />
             </div>
 
-            {/* Voice Conditioning Toggles: HPF 80Hz & VAD-Gated AGC */}
+            {/* Voice Conditioning Toggles: HPF 65Hz & VAD-Gated AGC */}
             <div className="dsp-toggle-section">
               <div className="dsp-toggle-row">
                 <div className="dsp-toggle-copy">
@@ -1539,11 +1752,7 @@ export function App() {
                     <label htmlFor={agcSwitchId} className="vad-title">
                       オートゲイン (AGC)
                     </label>
-                    {agcEnabled && (
-                      <span className="agc-live-pill" aria-hidden="true">
-                        {agcLiveText}
-                      </span>
-                    )}
+                    {agcEnabled && <AgcLiveBadge />}
                   </div>
                   <span id={agcHintId} className="field-hint">
                     発話区間のみで声の音量を自動均一化（無音時のノイズ増幅を防止）
@@ -1579,25 +1788,10 @@ export function App() {
                   <label htmlFor={vadSwitchId} className="vad-title">
                     無音時ノイズゲート (VAD)
                   </label>
-                  <span
-                    className={`vad-live-pill ${
-                      vadGateEnabled && ncEnabled && vadSpeaking
-                        ? "speaking"
-                        : ""
-                    }`}
-                    aria-hidden="true"
-                  >
-                    <span className="vad-live-dot" />
-                    <span>
-                      {!vadGateEnabled
-                        ? "OFF"
-                        : !ncEnabled
-                        ? "待機"
-                        : vadSpeaking
-                        ? "発話中"
-                        : "無音遮断"}
-                    </span>
-                  </span>
+                  <VadLiveBadge
+                    vadGateEnabled={vadGateEnabled}
+                    ncEnabled={ncEnabled}
+                  />
                 </div>
                 <input
                   id={vadSwitchId}
@@ -1696,11 +1890,9 @@ export function App() {
               <label htmlFor={monMeterId} className="visually-hidden">
                 マイクテスト音量レベル
               </label>
-              <progress
-                id={monMeterId}
-                className="discord-meter"
-                max={1}
-                value={monLevelRatio}
+              <MicTestLiveMeter
+                monMeterId={monMeterId}
+                liveMonitorEnabled={liveMonitorEnabled}
               />
             </div>
 
@@ -1795,13 +1987,16 @@ export function App() {
                 }
               >
                 <option value="">既定のスピーカー / ヘッドホン</option>
-                {devices?.outputs
-                  .filter((d) => !d.is_virtual_cable)
-                  .map((d) => (
-                    <option key={d.name} value={d.name}>
-                      {d.name}
-                    </option>
-                  ))}
+                {configuredMonitorMissing && config?.monitor_device && (
+                  <option value={config.monitor_device}>
+                    {config.monitor_device} (未接続)
+                  </option>
+                )}
+                {physicalOutputs.map((d) => (
+                  <option key={d.name} value={d.name}>
+                    {d.name}
+                  </option>
+                ))}
               </select>
             </div>
           </div>
@@ -1857,10 +2052,10 @@ export function App() {
                   </label>
                 </div>
                 <input
+                  ref={autostartInputRef}
                   id={autostartSwitchId}
                   name="autostart_enabled"
                   type="checkbox"
-                  autoFocus
                   role={supportsNativeSwitch ? undefined : "switch"}
                   className="nc-toggle compact"
                   checked={autostartEnabled}
@@ -2004,47 +2199,7 @@ export function App() {
 
             <div className="settings-group">
               <span className="settings-group-label">自動復旧・診断情報</span>
-              <div className="diag-grid">
-                <div className="diag-item">
-                  <span className="diag-key">パイプライン状態</span>
-                  <span className="diag-val">{connStateLabel}</span>
-                </div>
-                <div className="diag-item">
-                  <span className="diag-key">クロック同期補正</span>
-                  <span className="diag-val">
-                    {(telemetry?.drift_ppm ?? 0) >= 0 ? "+" : ""}
-                    {(telemetry?.drift_ppm ?? 0).toFixed(0)} ppm
-                  </span>
-                </div>
-                <div className="diag-item">
-                  <span className="diag-key">自動復旧回数</span>
-                  <span className="diag-val">
-                    {telemetry?.status.reconnect_count ?? 0} 回
-                  </span>
-                </div>
-                <div className="diag-item">
-                  <span className="diag-key">サンプルレート</span>
-                  <span className="diag-val">
-                    {telemetry?.status.input_sample_rate
-                      ? `${Math.round(
-                          telemetry.status.input_sample_rate / 1000
-                        )} kHz`
-                      : "—"}
-                  </span>
-                </div>
-                <div className="diag-item">
-                  <span className="diag-key">入力ドロップ</span>
-                  <span className="diag-val">
-                    {telemetry?.status.input_drop_count ?? 0}
-                  </span>
-                </div>
-                <div className="diag-item">
-                  <span className="diag-key">出力アンダーラン</span>
-                  <span className="diag-val">
-                    {telemetry?.status.output_underrun_count ?? 0}
-                  </span>
-                </div>
-              </div>
+              <SettingsDiagGrid connState={connState} />
               <button
                 type="button"
                 className="btn"
@@ -2059,6 +2214,11 @@ export function App() {
                   {diagCopied ? "診断情報をコピーしました" : "診断情報をコピー"}
                 </span>
               </button>
+              {diagError && (
+                <div className="error-banner" role="alert">
+                  {diagError}
+                </div>
+              )}
             </div>
 
             <div className="settings-group">
@@ -2067,7 +2227,7 @@ export function App() {
                 <div className="update-card-top">
                   <div className="update-copy">
                     <span className="update-title">
-                      Shizuka v{updateInfo?.current_version ?? "0.4.0"}
+                      {displayVersion ? `Shizuka v${displayVersion}` : "Shizuka"}
                     </span>
                     <span className="field-hint" role="status">
                       {updateChecking
@@ -2188,7 +2348,9 @@ export function App() {
           </div>
 
           <div className="settings-dialog-footer">
-            <span>Shizuka v{updateInfo?.current_version ?? "0.4.0"}</span>
+            <span>
+              {displayVersion ? `Shizuka v${displayVersion}` : "Shizuka"}
+            </span>
           </div>
         </div>
       </dialog>

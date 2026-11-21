@@ -24,12 +24,20 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "naebox",
+    "homepage": "https://github.com/naebox/shizuka",
+    "copyright": "Copyright (c) 2026 naebox",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "category": "Utility",
+    "shortDescription": "Local Real-Time AI Microphone Noise Cancellation",
+    "longDescription": "Shizuka is a local real-time AI microphone noise cancellation app powered by DeepFilterNet3 and Neural VAD Gate.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,11 +48,13 @@
     "windows": {
       "nsis": {
         "languages": ["Japanese", "English"],
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installMode": "currentUser"
       }
     },
     "macOS": {
-      "minimumSystemVersion": "14.0"
+      "minimumSystemVersion": "14.0",
+      "entitlements": "Entitlements.plist"
     }
   },
   "plugins": {

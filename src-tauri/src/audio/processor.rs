@@ -20,6 +20,7 @@ pub struct FrameProcessResult {
     pub vad_speaking: bool,
     pub agc_gain_db: f32,
     pub clipped: bool,
+    pub dfn_error: bool,
 }
 
 /// Zero-allocation 2nd-order Butterworth High-Pass Filter (~65 Hz @ 48 kHz).
@@ -214,12 +215,13 @@ impl VadGate {
 
         for s in enh_480.iter_mut() {
             self.envelope_gain += alpha * (target_gain - self.envelope_gain);
-            let g = if self.envelope_gain < 1e-4 && target_gain == 0.0 {
-                0.0
-            } else {
-                self.envelope_gain
-            };
-            *s *= g;
+            if target_gain == 0.0 && self.envelope_gain < 1e-4 {
+                // Snap state directly to 0.0 to avoid x86_64 denormal float stalls in sustained silence
+                self.envelope_gain = 0.0;
+            } else if (self.envelope_gain - target_gain).abs() < 1e-5 {
+                self.envelope_gain = target_gain;
+            }
+            *s *= self.envelope_gain;
         }
     }
 }
@@ -309,7 +311,8 @@ pub struct NoiseProcessor {
     wet_mix: f32,
     mic_muted: bool,
     mute_gain: f32,
-    input_gain_linear: f32,
+    input_gain_target: f32,
+    input_gain_smoothed: f32,
     atten_lim_db: f32,
     pf_beta: f32,
     vad_gate: VadGate,
@@ -326,11 +329,20 @@ impl NoiseProcessor {
         vad_thresh_db: f32,
         hpf_enabled: bool,
         agc_enabled: bool,
+        nc_enabled: bool,
+        mic_muted: bool,
+        input_gain_db: f32,
     ) -> Result<Self> {
         let df_params = match variant {
             ModelVariant::Standard => DfParams::from_bytes(DFN3_STANDARD_BYTES)?,
             ModelVariant::LowLatency => DfParams::default(),
         };
+
+        let atten_lim_db = atten_lim_db.clamp(6.0, 100.0);
+        let pf_beta = pf_beta.clamp(0.0, 0.06);
+        let min_db_thresh = min_db_thresh.clamp(-20.0, 20.0);
+        let vad_thresh_db = vad_thresh_db.clamp(-18.0, 12.0);
+        let input_gain_linear = 10.0_f32.powf(input_gain_db.clamp(-24.0, 24.0) / 20.0);
 
         let mut rp = RuntimeParams::default_with_ch(1);
         rp.atten_lim_db = atten_lim_db;
@@ -359,11 +371,12 @@ impl NoiseProcessor {
             hpf_scratch: [0.0f32; DFN_HOP_SIZE],
             hpf: HighPassFilter::new(DFN_SAMPLE_RATE as f64, HPF_CUTOFF_HZ, hpf_enabled),
             agc: VadAgc::new(agc_enabled),
-            nc_enabled: true,
-            wet_mix: 1.0,
-            mic_muted: false,
-            mute_gain: 1.0,
-            input_gain_linear: 1.0,
+            nc_enabled,
+            wet_mix: if nc_enabled { 1.0 } else { 0.0 },
+            mic_muted,
+            mute_gain: if mic_muted { 0.0 } else { 1.0 },
+            input_gain_target: input_gain_linear,
+            input_gain_smoothed: input_gain_linear,
             atten_lim_db,
             pf_beta,
             vad_gate: VadGate::new(vad_enabled, vad_thresh_db),
@@ -402,7 +415,7 @@ impl NoiseProcessor {
     #[inline]
     pub fn set_input_gain_db(&mut self, gain_db: f32) {
         let clamped = gain_db.clamp(-24.0, 24.0);
-        self.input_gain_linear = 10.0_f32.powf(clamped / 20.0);
+        self.input_gain_target = 10.0_f32.powf(clamped / 20.0);
     }
 
     pub fn set_attenuation_limit(&mut self, db: f32) {
@@ -446,18 +459,33 @@ impl NoiseProcessor {
         debug_assert_eq!(enh_out_480.len(), DFN_HOP_SIZE);
         debug_assert_eq!(final_out_480.len(), DFN_HOP_SIZE);
 
-        let gain = self.input_gain_linear;
         let mut clipped = false;
 
-        // 1. Pre-AI 80Hz Butterworth High-Pass Filter (state continuously ticked for clickless toggle)
+        // 1. Pre-AI 65Hz Butterworth High-Pass Filter (state continuously ticked for clickless toggle)
         self.hpf.process_frame(input_480, &mut self.hpf_scratch);
 
-        // 2. Apply manual input gain & detect pre-limiter clipping
+        // 2. Apply per-sample smoothed manual input gain & detect pre-limiter clipping
         {
+            let target_gain = self.input_gain_target;
+            let start_gain = self.input_gain_smoothed;
+            let gain_step = (target_gain - start_gain) / (DFN_HOP_SIZE as f32);
+            let ramp_gain = (target_gain - start_gain).abs() > 1e-4;
+            let mut g = start_gain;
+
             let mut in_slice = self.in_frame.row_mut(0);
             for i in 0..DFN_HOP_SIZE {
-                let raw_scaled = input_480[i] * gain;
-                let hpf_scaled = self.hpf_scratch[i] * gain;
+                if ramp_gain {
+                    g += gain_step;
+                } else {
+                    g = target_gain;
+                }
+                let dry_in = if input_480[i].is_finite() {
+                    input_480[i]
+                } else {
+                    0.0
+                };
+                let raw_scaled = dry_in * g;
+                let hpf_scaled = self.hpf_scratch[i] * g;
                 if !self.mic_muted {
                     let active_in = if self.nc_enabled {
                         hpf_scaled
@@ -471,13 +499,22 @@ impl NoiseProcessor {
                 raw_out_480[i] = soft_limit(raw_scaled);
                 in_slice[i] = soft_limit(hpf_scaled);
             }
+            self.input_gain_smoothed = target_gain;
         }
 
         // 3. DeepFilterNet3 neural inference
-        let lsnr = self
+        let (lsnr, dfn_error) = match self
             .model
             .process(self.in_frame.view(), self.out_frame.view_mut())
-            .unwrap_or(-15.0);
+        {
+            Ok(v) if v.is_finite() => (v, false),
+            Ok(_) => (-15.0, false),
+            Err(_) => {
+                // Clear stale frame so repeated inference failures never buzz old audio
+                self.out_frame.fill(0.0);
+                (-15.0, true)
+            }
+        };
 
         let mut sum_sq = 0.0f32;
         {
@@ -558,6 +595,7 @@ impl NoiseProcessor {
             vad_speaking,
             agc_gain_db,
             clipped,
+            dfn_error,
         }
     }
 }
@@ -706,6 +744,9 @@ mod tests {
             -5.0,
             true,
             false,
+            true,
+            false,
+            0.0,
         )
         .expect("Failed to load Standard DeepFilterNet3");
 
@@ -762,6 +803,9 @@ mod tests {
             -5.0,
             true,
             false,
+            true,
+            false,
+            0.0,
         )
         .expect("Failed to load LowLatency DeepFilterNet3_ll");
 
@@ -789,5 +833,67 @@ mod tests {
         assert!(!res_muted.clipped, "Muted state should not emit clipping alerts");
         let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
         assert_eq!(max_abs, 0.0, "Muted output must be completely silent");
+    }
+
+    #[test]
+    fn test_muted_startup_and_nan_inf_safety() {
+        let mut proc = NoiseProcessor::new(
+            ModelVariant::LowLatency,
+            65.0,
+            0.0,
+            -16.0,
+            true,
+            -5.0,
+            true,
+            false,
+            true,
+            true, // Start muted!
+            6.0,
+        )
+        .expect("Failed to load LowLatency DeepFilterNet3_ll");
+
+        let mut raw_out = [0.0f32; DFN_HOP_SIZE];
+        let mut enh_out = [0.0f32; DFN_HOP_SIZE];
+        let mut final_out = [0.0f32; DFN_HOP_SIZE];
+
+        // Frame 1 with loud sine while muted must leak ZERO samples
+        let mut loud = [0.0f32; DFN_HOP_SIZE];
+        for (i, s) in loud.iter_mut().enumerate() {
+            let t = i as f32 / DFN_SAMPLE_RATE as f32;
+            *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.6;
+        }
+        let res1 = proc.process_frame_48k(&loud, &mut raw_out, &mut enh_out, &mut final_out);
+        assert!(!res1.clipped);
+        let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+        assert_eq!(
+            max_abs, 0.0,
+            "Muted processor startup must not leak any audio on frame 1"
+        );
+
+        // Unmute and inject NaN / +-Inf samples: output must remain finite and bounded
+        proc.set_mic_muted(false);
+        let mut bad = [0.0f32; DFN_HOP_SIZE];
+        bad[0] = f32::NAN;
+        bad[1] = f32::INFINITY;
+        bad[2] = f32::NEG_INFINITY;
+        let _ = proc.process_frame_48k(&bad, &mut raw_out, &mut enh_out, &mut final_out);
+        for &s in &final_out {
+            assert!(s.is_finite() && s.abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_vad_gate_flushes_denormals_and_gain_smooths() {
+        let mut gate = VadGate::new(true, -5.0);
+        gate.envelope_gain = 1.0;
+        gate.is_open = false;
+        let mut buf = [0.5f32; DFN_HOP_SIZE];
+        for _ in 0..800 {
+            gate.apply_envelope(&mut buf, 65.0);
+        }
+        assert_eq!(
+            gate.envelope_gain, 0.0,
+            "VadGate envelope must snap cleanly to 0.0 instead of decaying into denormals"
+        );
     }
 }

@@ -3,6 +3,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::diagnostics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,12 +212,50 @@ impl AppConfig {
         changed
     }
 
+    pub fn clamp_dsp_values(&mut self) {
+        let clamp_vals = |atten: &mut f32,
+                          pf: &mut f32,
+                          gain: &mut f32,
+                          min_db: &mut f32,
+                          vad: &mut f32| {
+            *atten = if atten.is_finite() { atten.clamp(6.0, 100.0) } else { 65.0 };
+            *pf = if pf.is_finite() { pf.clamp(0.0, 0.06) } else { 0.0 };
+            *gain = if gain.is_finite() { gain.clamp(-24.0, 24.0) } else { 0.0 };
+            *min_db = if min_db.is_finite() { min_db.clamp(-20.0, 20.0) } else { -16.0 };
+            *vad = if vad.is_finite() { vad.clamp(-18.0, 12.0) } else { -5.0 };
+        };
+        clamp_vals(
+            &mut self.atten_lim_db,
+            &mut self.post_filter_beta,
+            &mut self.input_gain_db,
+            &mut self.min_db_thresh,
+            &mut self.vad_threshold_db,
+        );
+        self.monitor_volume = if self.monitor_volume.is_finite() {
+            self.monitor_volume.clamp(0.0, 1.0)
+        } else {
+            0.8
+        };
+        for prof in self.mic_profiles.values_mut() {
+            clamp_vals(
+                &mut prof.atten_lim_db,
+                &mut prof.post_filter_beta,
+                &mut prof.input_gain_db,
+                &mut prof.min_db_thresh,
+                &mut prof.vad_threshold_db,
+            );
+        }
+    }
+
     pub fn load() -> Self {
         let path = Self::config_path();
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(mut cfg) = serde_json::from_str::<Self>(&raw) {
+                cfg.clamp_dsp_values();
                 if cfg.migrate_dsp_defaults() {
-                    let _ = cfg.save();
+                    if let Err(e) = cfg.save() {
+                        diagnostics::error(format!("Migrated config save failed: {:#}", e));
+                    }
                 }
                 return cfg;
             }
@@ -221,8 +264,11 @@ impl AppConfig {
         let legacy = Self::legacy_config_path();
         if let Ok(raw) = fs::read_to_string(&legacy) {
             if let Ok(mut cfg) = serde_json::from_str::<Self>(&raw) {
+                cfg.clamp_dsp_values();
                 let _ = cfg.migrate_dsp_defaults();
-                let _ = cfg.save();
+                if let Err(e) = cfg.save() {
+                    diagnostics::error(format!("Legacy config migration save failed: {:#}", e));
+                }
                 return cfg;
             }
         }
@@ -257,6 +303,111 @@ impl AppConfig {
             return Err(err.into());
         }
         Ok(())
+    }
+}
+
+enum SaverCmd {
+    /// Coalesce rapid updates (e.g. slider drags) and persist after debounce window.
+    Schedule(AppConfig),
+    /// Persist promptly on the background thread (discrete user settings changes).
+    FlushAsync(AppConfig),
+    /// Persist synchronously and acknowledge once written (clean shutdown / updater).
+    FlushSync(AppConfig, mpsc::SyncSender<()>),
+}
+
+/// Non-blocking, debounced background writer for `settings.json` so high-frequency slider drags
+/// and global shortcut presses never block the UI/event-loop thread on synchronous `fsync`.
+#[derive(Clone)]
+pub struct ConfigSaver {
+    tx: mpsc::Sender<SaverCmd>,
+    _guard: Arc<Mutex<()>>,
+}
+
+impl ConfigSaver {
+    const DEBOUNCE: Duration = Duration::from_millis(350);
+
+    pub fn spawn() -> Self {
+        let (tx, rx) = mpsc::channel::<SaverCmd>();
+        thread::Builder::new()
+            .name("shizuka-cfg-saver".into())
+            .spawn(move || {
+                let mut pending: Option<AppConfig> = None;
+                let mut deadline: Option<Instant> = None;
+
+                let write_cfg = |cfg: &AppConfig| {
+                    if let Err(e) = cfg.save() {
+                        diagnostics::error(format!("Failed to save settings.json: {:#}", e));
+                    }
+                };
+
+                loop {
+                    let cmd = if let Some(dl) = deadline {
+                        let wait = dl.saturating_duration_since(Instant::now());
+                        match rx.recv_timeout(wait) {
+                            Ok(c) => Some(c),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if let Some(cfg) = pending.take() {
+                                    write_cfg(&cfg);
+                                }
+                                deadline = None;
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                if let Some(cfg) = pending.take() {
+                                    write_cfg(&cfg);
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(c) => Some(c),
+                            Err(_) => break,
+                        }
+                    };
+
+                    if let Some(c) = cmd {
+                        match c {
+                            SaverCmd::Schedule(cfg) => {
+                                pending = Some(cfg);
+                                deadline = Some(Instant::now() + Self::DEBOUNCE);
+                            }
+                            SaverCmd::FlushAsync(cfg) => {
+                                pending = None;
+                                deadline = None;
+                                write_cfg(&cfg);
+                            }
+                            SaverCmd::FlushSync(cfg, ack) => {
+                                pending = None;
+                                deadline = None;
+                                write_cfg(&cfg);
+                                let _ = ack.send(());
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn config saver thread");
+
+        Self {
+            tx,
+            _guard: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn schedule(&self, cfg: AppConfig) {
+        let _ = self.tx.send(SaverCmd::Schedule(cfg));
+    }
+
+    pub fn flush_async(&self, cfg: AppConfig) {
+        let _ = self.tx.send(SaverCmd::FlushAsync(cfg));
+    }
+
+    pub fn flush_sync(&self, cfg: AppConfig, timeout: Duration) {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+        if self.tx.send(SaverCmd::FlushSync(cfg, ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(timeout);
+        }
     }
 }
 

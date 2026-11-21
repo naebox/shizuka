@@ -1,16 +1,19 @@
 pub mod audio;
 pub mod config;
+pub mod diagnostics;
 pub mod installer;
 pub mod shortcuts;
 pub mod updater;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tauri_plugin_global_shortcut::ShortcutState;
@@ -18,7 +21,7 @@ use tauri_plugin_global_shortcut::ShortcutState;
 use audio::cue::{CueKind, CuePlayer};
 use audio::devices::{default_physical_input_name, list_audio_devices, DeviceListResponse};
 use audio::engine::{AudioEngineHandle, AudioTelemetry, DspParams};
-use config::{AppConfig, ModelVariant};
+use config::{AppConfig, ConfigSaver, ModelVariant};
 use installer::{install_virtual_audio_driver, InstallDriverResult};
 use shortcuts::{ShortcutAction, ShortcutRegistry};
 use updater::{
@@ -27,38 +30,70 @@ use updater::{
 };
 
 const TRAY_ID: &str = "shizuka-tray";
+const TOOLTIP_ON: &str = "Shizuka — AIノイズ除去: ON";
+const TOOLTIP_OFF: &str = "Shizuka — AIノイズ除去: OFF (バイパス中)";
+const TOOLTIP_MUTE: &str = "Shizuka — マイクミュート中";
+
+struct TrayUiHandles {
+    icon_on: Image<'static>,
+    icon_off: Image<'static>,
+    icon_mute: Image<'static>,
+    nc_item: CheckMenuItem<tauri::Wry>,
+    mute_item: CheckMenuItem<tauri::Wry>,
+}
 
 pub struct AppState {
     pub engine: AudioEngineHandle,
     pub config: Arc<Mutex<AppConfig>>,
+    pub config_saver: ConfigSaver,
     pub cue: CuePlayer,
     pub shortcuts: Mutex<ShortcutRegistry>,
     pub update_progress: Arc<Mutex<UpdateProgressSnapshot>>,
+    tray_handles: Mutex<Option<TrayUiHandles>>,
+    start_minimized: bool,
+    window_shown_once: AtomicBool,
+    shutting_down: AtomicBool,
 }
 
-fn update_tray_icon(app: &AppHandle, nc_enabled: bool, mic_muted: bool) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let (icon_bytes, tooltip): (&[u8], &str) = if mic_muted {
-            (
-                include_bytes!("../icons/tray-mute.png"),
-                "Shizuka — マイクミュート中",
-            )
-        } else if nc_enabled {
-            (
-                include_bytes!("../icons/tray-on.png"),
-                "Shizuka — AIノイズ除去: ON",
-            )
-        } else {
-            (
-                include_bytes!("../icons/tray-off.png"),
-                "Shizuka — AIノイズ除去: OFF (バイパス中)",
-            )
-        };
-        if let Ok(img) = Image::from_bytes(icon_bytes) {
-            let _ = tray.set_icon(Some(img));
+fn update_tray_ui(app: &AppHandle, nc_enabled: bool, mic_muted: bool) {
+    let st = app.state::<AppState>();
+    let tooltip = if mic_muted {
+        TOOLTIP_MUTE
+    } else if nc_enabled {
+        TOOLTIP_ON
+    } else {
+        TOOLTIP_OFF
+    };
+
+    if let Ok(guard) = st.tray_handles.lock() {
+        if let Some(ref handles) = *guard {
+            let _ = handles.nc_item.set_checked(nc_enabled);
+            let _ = handles.mute_item.set_checked(mic_muted);
+            if let Some(tray) = app.tray_by_id(TRAY_ID) {
+                let img = if mic_muted {
+                    handles.icon_mute.clone()
+                } else if nc_enabled {
+                    handles.icon_on.clone()
+                } else {
+                    handles.icon_off.clone()
+                };
+                let _ = tray.set_icon(Some(img));
+                let _ = tray.set_tooltip(Some(tooltip));
+            }
+            return;
         }
+    }
+
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_tooltip(Some(tooltip));
     }
+}
+
+fn unpause_shortcuts(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    if let Ok(mut reg) = st.shortcuts.lock() {
+        let _ = reg.set_paused(app, false);
+    };
 }
 
 fn resolve_active_mic_name(state: &AppState, cfg: &AppConfig) -> Option<String> {
@@ -78,15 +113,22 @@ fn resolve_active_mic_name(state: &AppState, cfg: &AppConfig) -> Option<String> 
 fn apply_nc_enabled(app: &AppHandle, enabled: bool, play_cue: bool) {
     let st = app.state::<AppState>();
     st.engine.set_nc_enabled(enabled);
-    let (sound_enabled, mon_dev) = if let Ok(mut cfg) = st.config.lock() {
+    let (sound_enabled, mon_dev, snapshot_cfg) = if let Ok(mut cfg) = st.config.lock() {
         cfg.nc_enabled = enabled;
-        let _ = cfg.save();
-        (cfg.shortcut_sound_enabled, cfg.monitor_device.clone())
+        (
+            cfg.shortcut_sound_enabled,
+            cfg.monitor_device.clone(),
+            Some(cfg.clone()),
+        )
     } else {
-        (false, None)
+        (false, None, None)
     };
+    if let Some(cfg) = snapshot_cfg {
+        st.config_saver.flush_async(cfg);
+    }
     let mic_muted = st.engine.shared.mic_muted.load(Ordering::Relaxed);
-    update_tray_icon(app, enabled, mic_muted);
+    update_tray_ui(app, enabled, mic_muted);
+    let _ = app.emit("shizuka-state-changed", ());
     if play_cue && sound_enabled {
         st.cue.play(
             if enabled {
@@ -108,7 +150,8 @@ fn apply_mic_muted(app: &AppHandle, muted: bool, play_cue: bool) {
         (false, None)
     };
     let nc_enabled = st.engine.shared.nc_enabled.load(Ordering::Relaxed);
-    update_tray_icon(app, nc_enabled, muted);
+    update_tray_ui(app, nc_enabled, muted);
+    let _ = app.emit("shizuka-state-changed", ());
     if play_cue && sound_enabled {
         st.cue.play(
             if muted {
@@ -118,6 +161,38 @@ fn apply_mic_muted(app: &AppHandle, muted: bool, play_cue: bool) {
             },
             mon_dev,
         );
+    }
+}
+
+fn shutdown_cleanly(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    if st.shutting_down.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    diagnostics::info("Shutting down Shizuka cleanly");
+    if let Ok(cfg) = st.config.lock() {
+        st.config_saver.flush_sync(cfg.clone(), Duration::from_secs(2));
+    }
+    let stopped = st.engine.stop_and_wait(Duration::from_secs(3));
+    if !stopped {
+        diagnostics::warn("Audio engine stop timed out after 3s during shutdown");
+    }
+}
+
+#[tauri::command]
+fn get_app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+fn frontend_ready(app: AppHandle, state: State<'_, AppState>) -> bool {
+    if !state.start_minimized {
+        if !state.window_shown_once.swap(true, Ordering::AcqRel) {
+            show_main_window(&app);
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -173,6 +248,33 @@ fn update_dsp_params(
     hpf_enabled: bool,
     agc_enabled: bool,
 ) -> Result<(), String> {
+    let atten_lim_db = if atten_lim_db.is_finite() {
+        atten_lim_db.clamp(6.0, 100.0)
+    } else {
+        65.0
+    };
+    let post_filter_beta = if post_filter_beta.is_finite() {
+        post_filter_beta.clamp(0.0, 0.06)
+    } else {
+        0.0
+    };
+    let input_gain_db = if input_gain_db.is_finite() {
+        input_gain_db.clamp(-24.0, 24.0)
+    } else {
+        0.0
+    };
+    let min_db_thresh = if min_db_thresh.is_finite() {
+        min_db_thresh.clamp(-20.0, 20.0)
+    } else {
+        -16.0
+    };
+    let vad_threshold_db = if vad_threshold_db.is_finite() {
+        vad_threshold_db.clamp(-18.0, 12.0)
+    } else {
+        -5.0
+    };
+
+    // Update real-time DSP atomics immediately (zero lock / zero disk I/O)
     state.engine.set_params(DspParams {
         atten_lim_db,
         post_filter_beta,
@@ -183,7 +285,9 @@ fn update_dsp_params(
         hpf_enabled,
         agc_enabled,
     });
-    if let Ok(mut cfg) = state.config.lock() {
+
+    // Debounce disk persistence on background thread so slider drags never trigger fsync storms
+    let snapshot_cfg = if let Ok(mut cfg) = state.config.lock() {
         cfg.atten_lim_db = atten_lim_db;
         cfg.post_filter_beta = post_filter_beta;
         cfg.input_gain_db = input_gain_db;
@@ -195,16 +299,26 @@ fn update_dsp_params(
         if let Some(mic_name) = resolve_active_mic_name(&state, &cfg) {
             cfg.save_profile_for_mic(&mic_name);
         }
-        let _ = cfg.save();
+        Some(cfg.clone())
+    } else {
+        None
+    };
+    if let Some(cfg) = snapshot_cfg {
+        state.config_saver.schedule(cfg);
     }
     Ok(())
 }
 
 #[tauri::command]
 fn set_model_variant(state: State<'_, AppState>, model_variant: ModelVariant) -> Result<(), String> {
-    if let Ok(mut cfg) = state.config.lock() {
+    let snapshot_cfg = if let Ok(mut cfg) = state.config.lock() {
         cfg.model_variant = model_variant;
-        let _ = cfg.save();
+        Some(cfg.clone())
+    } else {
+        None
+    };
+    if let Some(cfg) = snapshot_cfg {
+        state.config_saver.flush_async(cfg);
     }
     state.engine.set_model_variant(model_variant);
     Ok(())
@@ -229,37 +343,48 @@ fn select_devices(
         .ok()
         .and_then(|s| s.active_input_name.clone());
 
-    let (should_run, main_devices_changed, monitor_changed, profile_applied, updated_cfg) =
-        if let Ok(mut cfg) = state.config.lock() {
-            let input_changed = cfg.input_device != clean_in;
-            let main_changed = input_changed || cfg.output_device != clean_out;
-            let mon_changed = cfg.monitor_device != clean_mon;
+    let (
+        should_run,
+        main_devices_changed,
+        monitor_changed,
+        profile_applied,
+        synced_profile_mic,
+        updated_cfg,
+    ) = if let Ok(mut cfg) = state.config.lock() {
+        let input_changed = cfg.input_device != clean_in;
+        let main_changed = input_changed || cfg.output_device != clean_out;
+        let mon_changed = cfg.monitor_device != clean_mon;
 
-            let mut applied_now = false;
-            if input_changed {
-                let prev_mic = prev_active_mic.or_else(|| cfg.input_device.clone());
-                let next_mic = clean_in.clone().or_else(default_physical_input_name);
-                if let Some(ref target_mic) = next_mic {
-                    let _ = cfg.switch_to_mic_profile(prev_mic.as_deref(), target_mic);
-                    state.engine.shared.apply_config_dsp(&cfg);
-                    applied_now = true;
-                }
+        let mut applied_now = false;
+        let mut target_profile_mic = None;
+        if input_changed {
+            let prev_mic = prev_active_mic.or_else(|| cfg.input_device.clone());
+            let next_mic = clean_in.clone().or_else(default_physical_input_name);
+            if let Some(ref target_mic) = next_mic {
+                let _ = cfg.switch_to_mic_profile(prev_mic.as_deref(), target_mic);
+                state.engine.shared.apply_config_dsp(&cfg);
+                applied_now = true;
+                target_profile_mic = Some(target_mic.clone());
             }
+        }
 
-            cfg.input_device = clean_in.clone();
-            cfg.output_device = clean_out.clone();
-            cfg.monitor_device = clean_mon.clone();
-            let _ = cfg.save();
-            (
-                cfg.stream_active,
-                main_changed,
-                mon_changed,
-                applied_now,
-                cfg.clone(),
-            )
-        } else {
-            (true, true, true, false, AppConfig::default())
-        };
+        cfg.input_device = clean_in.clone();
+        cfg.output_device = clean_out.clone();
+        cfg.monitor_device = clean_mon.clone();
+        let cloned = cfg.clone();
+        (
+            cfg.stream_active,
+            main_changed,
+            mon_changed,
+            applied_now,
+            target_profile_mic,
+            cloned,
+        )
+    } else {
+        (true, true, true, false, None, AppConfig::default())
+    };
+
+    state.config_saver.flush_async(updated_cfg.clone());
 
     let mon_active = state
         .engine
@@ -271,25 +396,35 @@ fn select_devices(
         state
             .engine
             .start_or_restart(clean_in, clean_out, clean_mon, profile_applied);
-    } else if monitor_changed && mon_active {
-        state.engine.set_live_monitor(true, clean_mon);
+    } else {
+        // Keep audio controller's `last_profile_mic` in sync when switching mics while stopped
+        // so resuming later never overwrites the previous mic's saved profile.
+        if profile_applied {
+            state.engine.sync_last_profile_mic(synced_profile_mic);
+        }
+        if monitor_changed && mon_active {
+            state.engine.set_live_monitor(true, clean_mon);
+        }
     }
     Ok(updated_cfg)
 }
 
 #[tauri::command]
 fn set_stream_active(state: State<'_, AppState>, active: bool) -> Result<(), String> {
-    let (in_dev, out_dev, mon_dev) = if let Ok(mut cfg) = state.config.lock() {
+    let (in_dev, out_dev, mon_dev, snapshot_cfg) = if let Ok(mut cfg) = state.config.lock() {
         cfg.stream_active = active;
-        let _ = cfg.save();
         (
             cfg.input_device.clone(),
             cfg.output_device.clone(),
             cfg.monitor_device.clone(),
+            Some(cfg.clone()),
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
+    if let Some(cfg) = snapshot_cfg {
+        state.config_saver.flush_async(cfg);
+    }
 
     if active {
         state
@@ -320,11 +455,20 @@ fn set_monitor_mode(state: State<'_, AppState>, clean: bool) -> Result<(), Strin
 
 #[tauri::command]
 fn set_monitor_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
-    let clamped = volume.clamp(0.0, 1.0);
+    let clamped = if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        0.8
+    };
     state.engine.set_monitor_volume(clamped);
-    if let Ok(mut cfg) = state.config.lock() {
+    let snapshot_cfg = if let Ok(mut cfg) = state.config.lock() {
         cfg.monitor_volume = clamped;
-        let _ = cfg.save();
+        Some(cfg.clone())
+    } else {
+        None
+    };
+    if let Some(cfg) = snapshot_cfg {
+        state.config_saver.schedule(cfg);
     }
     Ok(())
 }
@@ -344,16 +488,19 @@ fn set_shortcut(
         reg.update_binding(&app, action, accelerator.as_deref())?
     };
 
-    let mut cfg = state
-        .config
-        .lock()
-        .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
-    match action {
-        ShortcutAction::ToggleNc => cfg.shortcut_toggle_nc = normalized,
-        ShortcutAction::ToggleMute => cfg.shortcut_toggle_mute = normalized,
-    }
-    let _ = cfg.save();
-    Ok(cfg.clone())
+    let cloned = {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+        match action {
+            ShortcutAction::ToggleNc => cfg.shortcut_toggle_nc = normalized,
+            ShortcutAction::ToggleMute => cfg.shortcut_toggle_mute = normalized,
+        }
+        cfg.clone()
+    };
+    state.config_saver.flush_async(cloned.clone());
+    Ok(cloned)
 }
 
 #[tauri::command]
@@ -371,9 +518,14 @@ fn set_shortcuts_paused(
 
 #[tauri::command]
 fn set_shortcut_sound_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    if let Ok(mut cfg) = state.config.lock() {
+    let snapshot_cfg = if let Ok(mut cfg) = state.config.lock() {
         cfg.shortcut_sound_enabled = enabled;
-        let _ = cfg.save();
+        Some(cfg.clone())
+    } else {
+        None
+    };
+    if let Some(cfg) = snapshot_cfg {
+        state.config_saver.flush_async(cfg);
     }
     Ok(())
 }
@@ -402,17 +554,21 @@ async fn install_virtual_driver(
 
     if result.device_detected_now {
         if let Some(ref virt_out) = result.detected_device_name {
-            let (in_dev, mon_dev, should_run) = if let Ok(mut cfg) = state.config.lock() {
-                cfg.output_device = Some(virt_out.clone());
-                let _ = cfg.save();
-                (
-                    cfg.input_device.clone(),
-                    cfg.monitor_device.clone(),
-                    cfg.stream_active,
-                )
-            } else {
-                (None, None, true)
-            };
+            let (in_dev, mon_dev, should_run, snapshot_cfg) =
+                if let Ok(mut cfg) = state.config.lock() {
+                    cfg.output_device = Some(virt_out.clone());
+                    (
+                        cfg.input_device.clone(),
+                        cfg.monitor_device.clone(),
+                        cfg.stream_active,
+                        Some(cfg.clone()),
+                    )
+                } else {
+                    (None, None, true, None)
+                };
+            if let Some(cfg) = snapshot_cfg {
+                state.config_saver.flush_async(cfg);
+            }
 
             if should_run {
                 state
@@ -433,10 +589,34 @@ async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
 #[tauri::command]
 async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let progress = Arc::clone(&state.update_progress);
-    let engine = state.engine.clone();
-    install_update_impl(&app, progress, move || {
-        engine.stop();
-    })
+    let engine_stop = state.engine.clone();
+    let engine_resume = state.engine.clone();
+    let cfg_stop = Arc::clone(&state.config);
+    let cfg_resume = Arc::clone(&state.config);
+    let saver_stop = state.config_saver.clone();
+
+    install_update_impl(
+        &app,
+        progress,
+        move || {
+            if let Ok(cfg) = cfg_stop.lock() {
+                saver_stop.flush_sync(cfg.clone(), Duration::from_secs(2));
+            }
+            let _ = engine_stop.stop_and_wait(Duration::from_secs(3));
+        },
+        move || {
+            if let Ok(cfg) = cfg_resume.lock() {
+                if cfg.stream_active {
+                    engine_resume.start_or_restart(
+                        cfg.input_device.clone(),
+                        cfg.output_device.clone(),
+                        cfg.monitor_device.clone(),
+                        true,
+                    );
+                }
+            }
+        },
+    )
     .await
 }
 
@@ -490,6 +670,16 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
     let version = app.package_info().version.to_string();
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
     let telem = state.engine.shared.snapshot();
+    let shared = &state.engine.shared;
+    let rt_active = shared.rt_priority_active.load(Ordering::Relaxed);
+    let in_frames = shared.input_callback_frames.load(Ordering::Relaxed);
+    let out_frames = shared.output_callback_frames.load(Ordering::Relaxed);
+    let out_drops = shared.output_drop_count.load(Ordering::Relaxed);
+    let dfn_errs = shared.dfn_error_count.load(Ordering::Relaxed);
+    let rs_errs = shared.resampler_error_count.load(Ordering::Relaxed);
+    let obs_in_blk = shared.observed_in_block_frames.load(Ordering::Relaxed);
+    let obs_out_blk = shared.observed_out_block_frames.load(Ordering::Relaxed);
+
     let cfg = state.config.lock().map(|g| g.clone()).unwrap_or_default();
     let devs = list_audio_devices();
 
@@ -507,20 +697,21 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
     ));
     out.push_str(&format!("Autostart: {}\n", autostart));
     out.push_str(&format!(
-        "Connection State: {:?} (running={}, virtual_out={}, monitor={}, muted={})\n",
+        "Connection State: {:?} (running={}, virtual_out={}, monitor={}, muted={}, rt_priority={})\n",
         telem.status.connection_state,
         telem.stream_running,
         telem.virtual_out_connected,
         telem.live_monitor_enabled,
-        telem.mic_muted
+        telem.mic_muted,
+        rt_active
     ));
     out.push_str(&format!(
-        "Active Input: {:?} ({} Hz)\n",
-        telem.status.active_input_name, telem.status.input_sample_rate
+        "Active Input: {:?} ({} Hz, max_block={} frames, total_frames={})\n",
+        telem.status.active_input_name, telem.status.input_sample_rate, obs_in_blk, in_frames
     ));
     out.push_str(&format!(
-        "Active Virtual Output: {:?} ({} Hz)\n",
-        telem.status.active_output_name, telem.status.output_sample_rate
+        "Active Virtual Output: {:?} ({} Hz, max_block={} frames, total_frames={})\n",
+        telem.status.active_output_name, telem.status.output_sample_rate, obs_out_blk, out_frames
     ));
     out.push_str(&format!(
         "Active Monitor: {:?}\n",
@@ -553,18 +744,23 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
         cfg.shortcut_toggle_nc, cfg.shortcut_toggle_mute, cfg.shortcut_sound_enabled
     ));
     out.push_str(&format!(
-        "Metrics: cpu={:.1}%, latency={:.1} ms, drift={:+.1} ppm, clips={}, reconnects={}, drops={}, underruns={}\n",
+        "Metrics: cpu={:.1}%, latency={:.1} ms, drift={:+.1} ppm, clips={}, reconnects={}, in_drops={}, out_drops={}, underruns={}, dfn_errs={}, rs_errs={}\n",
         telem.cpu_load_pct,
         telem.latency_ms,
         telem.drift_ppm,
         telem.clip_count,
         telem.status.reconnect_count,
         telem.status.input_drop_count,
-        telem.status.output_underrun_count
+        out_drops,
+        telem.status.output_underrun_count,
+        dfn_errs,
+        rs_errs
     ));
     if let Some(ref err) = telem.status.last_error {
         out.push_str(&format!("Last Error: {}\n", err));
     }
+    out.push_str("Recent Events:\n");
+    out.push_str(&diagnostics::format_recent_events());
     out.push_str("Detected Inputs:\n");
     for d in &devs.inputs {
         out.push_str(&format!(
@@ -591,8 +787,8 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
-fn quit_app(app: AppHandle, state: State<'_, AppState>) {
-    state.engine.stop();
+fn quit_app(app: AppHandle) {
+    shutdown_cleanly(&app);
     app.exit(0);
 }
 
@@ -601,17 +797,27 @@ fn show_main_window(app: &AppHandle) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        let _ = app.emit("shizuka-window-visibility", true);
+    }
+}
+
+fn hide_main_window(app: &AppHandle) {
+    unpause_shortcuts(app);
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.hide();
+        let _ = app.emit("shizuka-window-visibility", false);
     }
 }
 
 fn toggle_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) {
-            let _ = win.hide();
+        let visible = win.is_visible().unwrap_or(false);
+        let minimized = win.is_minimized().unwrap_or(false);
+        let focused = win.is_focused().unwrap_or(false);
+        if visible && !minimized && focused {
+            hide_main_window(app);
         } else {
-            let _ = win.show();
-            let _ = win.unminimize();
-            let _ = win.set_focus();
+            show_main_window(app);
         }
     }
 }
@@ -619,7 +825,7 @@ fn toggle_main_window(app: &AppHandle) {
 pub fn run() {
     let _ = env_logger::try_init();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Register single-instance FIRST so duplicate launches focus the running window and exit
         // before spawning any audio engine or loading DeepFilterNet3.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -630,21 +836,34 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .setup(move |app| {
+            let start_minimized = std::env::args().any(|arg| arg == "--minimized");
+            diagnostics::info(format!(
+                "Shizuka v{} starting (minimized={})",
+                app.package_info().version,
+                start_minimized
+            ));
+
             let initial_cfg = AppConfig::load();
             let init_nc = initial_cfg.nc_enabled;
             let init_sc_nc = initial_cfg.shortcut_toggle_nc.clone();
             let init_sc_mute = initial_cfg.shortcut_toggle_mute.clone();
 
             let shared_cfg = Arc::new(Mutex::new(initial_cfg));
+            let config_saver = ConfigSaver::spawn();
             let engine = AudioEngineHandle::spawn(Arc::clone(&shared_cfg));
             let cue = CuePlayer::spawn();
 
             app.manage(AppState {
                 engine,
                 config: shared_cfg,
+                config_saver,
                 cue,
                 shortcuts: Mutex::new(ShortcutRegistry::default()),
                 update_progress: Arc::new(Mutex::new(UpdateProgressSnapshot::default())),
+                tray_handles: Mutex::new(None),
+                start_minimized,
+                window_shown_once: AtomicBool::new(false),
+                shutting_down: AtomicBool::new(false),
             });
 
             // Initialize in-app auto-updater plugin (Ed25519 signature verified via tauri.conf.json pubkey)
@@ -695,18 +914,20 @@ pub fn run() {
 
             let show_item =
                 MenuItem::with_id(app, "show", "Shizuka を開く", true, None::<&str>)?;
-            let toggle_item = MenuItem::with_id(
+            let toggle_item = CheckMenuItem::with_id(
                 app,
                 "toggle_nc",
-                "ノイズキャンセリング ON / OFF 切替",
+                "AI ノイズ除去",
                 true,
+                init_nc,
                 None::<&str>,
             )?;
-            let mute_item = MenuItem::with_id(
+            let mute_item = CheckMenuItem::with_id(
                 app,
                 "toggle_mute",
-                "マイクミュート ON / OFF 切替",
+                "マイクミュート",
                 true,
+                false,
                 None::<&str>,
             )?;
             let sep = PredefinedMenuItem::separator(app)?;
@@ -717,20 +938,32 @@ pub fn run() {
                 &[&show_item, &toggle_item, &mute_item, &sep, &quit_item],
             )?;
 
-            let icon_bytes: &[u8] = if init_nc {
-                include_bytes!("../icons/tray-on.png")
+            // Pre-decode tray icons once to avoid repeated PNG decoding on shortcut/tray toggles
+            let icon_on = Image::from_bytes(include_bytes!("../icons/tray-on.png"))?.to_owned();
+            let icon_off = Image::from_bytes(include_bytes!("../icons/tray-off.png"))?.to_owned();
+            let icon_mute = Image::from_bytes(include_bytes!("../icons/tray-mute.png"))?.to_owned();
+            let init_icon = if init_nc {
+                icon_on.clone()
             } else {
-                include_bytes!("../icons/tray-off.png")
+                icon_off.clone()
             };
-            let tray_img = Image::from_bytes(icon_bytes)?;
+
+            {
+                let st = app.state::<AppState>();
+                if let Ok(mut guard) = st.tray_handles.lock() {
+                    *guard = Some(TrayUiHandles {
+                        icon_on,
+                        icon_off,
+                        icon_mute,
+                        nc_item: toggle_item,
+                        mute_item,
+                    });
+                };
+            }
 
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(tray_img)
-                .tooltip(if init_nc {
-                    "Shizuka — AIノイズ除去: ON"
-                } else {
-                    "Shizuka — AIノイズ除去: OFF"
-                })
+                .icon(init_icon)
+                .tooltip(if init_nc { TOOLTIP_ON } else { TOOLTIP_OFF })
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app_handle, event| match event.id.as_ref() {
@@ -748,8 +981,7 @@ pub fn run() {
                         apply_mic_muted(app_handle, !cur, true);
                     }
                     "quit" => {
-                        let st = app_handle.state::<AppState>();
-                        st.engine.stop();
+                        shutdown_cleanly(app_handle);
                         app_handle.exit(0);
                     }
                     _ => {}
@@ -766,21 +998,31 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            let start_minimized = std::env::args().any(|arg| arg == "--minimized");
+            // Safety fallback: keep window hidden until `frontend_ready` prevents white/default flash,
+            // but guarantee visibility within 1.5s if WebView initialization is delayed.
             if !start_minimized {
-                show_main_window(app.handle());
+                let handle = app.handle().clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(1500));
+                    let st = handle.state::<AppState>();
+                    if !st.window_shown_once.swap(true, Ordering::AcqRel) {
+                        show_main_window(&handle);
+                    }
+                });
             }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Keep running in system tray when window close [X] button is clicked
+            // Keep running in system tray / menu bar when window close [X] button is clicked
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                hide_main_window(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_app_version,
+            frontend_ready,
             get_devices,
             get_config,
             get_telemetry,
@@ -808,6 +1050,22 @@ pub fn run() {
             get_diagnostics_text,
             quit_app,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Shizuka tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building Shizuka tauri application");
+
+    app.run(|app_handle, event| match event {
+        RunEvent::Exit => {
+            shutdown_cleanly(app_handle);
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } => {
+            if !has_visible_windows {
+                show_main_window(app_handle);
+            }
+        }
+        _ => {}
+    });
 }

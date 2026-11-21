@@ -1,7 +1,20 @@
 use anyhow::Result;
-use rubato::{FastFixedIn, FastFixedOut, PolynomialDegree, Resampler};
+use rubato::{
+    FastFixedIn, PolynomialDegree, Resampler, SincFixedIn, SincFixedOut,
+    SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 use crate::audio::processor::{DFN_HOP_SIZE, DFN_SAMPLE_RATE};
+
+fn low_latency_sinc_params() -> SincInterpolationParameters {
+    SincInterpolationParameters {
+        sinc_len: 64, // 32-sample group delay (< 0.7ms @ 48kHz) with strong ultrasonic anti-aliasing
+        f_cutoff: 0.92,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 128,
+        window: WindowFunction::BlackmanHarris2,
+    }
+}
 
 /// Proportional-Integral (PI) clock drift controller.
 /// Tracks output ring buffer fill level relative to target latency and computes
@@ -49,6 +62,18 @@ impl DriftController {
         rel_ratio
     }
 
+    /// Raises or updates the target buffer level dynamically (e.g., when the OS audio host uses
+    /// larger callback block sizes) without discarding the learned clock-drift `integral_error`.
+    pub fn set_target_samples(&mut self, target_samples: usize) {
+        self.target_samples = target_samples as f64;
+    }
+
+    /// Damps transient error spikes (e.g., brief underrun) while keeping the learned oscillator
+    /// drift `integral_error` intact so long-call clock lock does not have to reconverge from zero.
+    pub fn damp_transient(&mut self) {
+        self.smoothed_error *= 0.25;
+    }
+
     pub fn reset(&mut self) {
         self.smoothed_error = 0.0;
         self.integral_error = 0.0;
@@ -62,8 +87,10 @@ impl DriftController {
 }
 
 /// Zero-allocation input resampler converting arbitrary microphone sample rate -> 48kHz 480-sample chunks.
+/// Uses an anti-aliased windowed Sinc resampler whenever `input_sr != 48_000` so 96/192 kHz interfaces
+/// do not alias ultrasonic content and 16 kHz Bluetooth HFP does not emit imaging artifacts.
 pub struct InputResampler48k {
-    resampler: Option<FastFixedOut<f32>>,
+    resampler: Option<SincFixedOut<f32>>,
     in_buf: Vec<Vec<f32>>,
     out_buf: Vec<Vec<f32>>,
 }
@@ -78,10 +105,10 @@ impl InputResampler48k {
             })
         } else {
             let ratio = DFN_SAMPLE_RATE as f64 / input_sr as f64;
-            let resampler = FastFixedOut::<f32>::new(
+            let resampler = SincFixedOut::<f32>::new(
                 ratio,
                 1.02,
-                PolynomialDegree::Cubic,
+                low_latency_sinc_params(),
                 DFN_HOP_SIZE,
                 1,
             )?;
@@ -123,10 +150,15 @@ impl InputResampler48k {
     }
 }
 
+enum OutputResamplerKind {
+    Fast(FastFixedIn<f32>),
+    Sinc(SincFixedIn<f32>),
+}
+
 /// Zero-allocation adaptive output resampler converting 48kHz 480-sample chunks -> output device sample rate
 /// while continuously applying small relative ratio changes for clock drift compensation.
 pub struct AdaptiveOutputResampler {
-    resampler: FastFixedIn<f32>,
+    resampler: OutputResamplerKind,
     in_buf: Vec<Vec<f32>>,
     out_buf: Vec<Vec<f32>>,
 }
@@ -134,32 +166,58 @@ pub struct AdaptiveOutputResampler {
 impl AdaptiveOutputResampler {
     pub fn new(output_sr: u32) -> Result<Self> {
         let nominal_ratio = output_sr as f64 / DFN_SAMPLE_RATE as f64;
-        // Always instantiate FastFixedIn even when output_sr == 48_000 so adaptive clock-drift
-        // compensation works seamlessly between two independent 48kHz hardware/virtual clocks!
-        let resampler = FastFixedIn::<f32>::new(
-            nominal_ratio,
-            1.02, // Allows up to ±2% dynamic adjustment without reallocating
-            PolynomialDegree::Cubic,
-            DFN_HOP_SIZE,
-            1,
-        )?;
-        let in_buf = resampler.input_buffer_allocate(true);
-        let out_buf = resampler.output_buffer_allocate(true);
-        Ok(Self {
-            resampler,
-            in_buf,
-            out_buf,
-        })
+        if output_sr as usize == DFN_SAMPLE_RATE {
+            // FastFixedIn cubic interpolation has zero filter group delay and is transparent for
+            // small +-0.05% adaptive clock-drift compensation between two 48 kHz clocks.
+            let resampler = FastFixedIn::<f32>::new(
+                nominal_ratio,
+                1.02, // Allows up to ±2% dynamic adjustment without reallocating
+                PolynomialDegree::Cubic,
+                DFN_HOP_SIZE,
+                1,
+            )?;
+            let in_buf = resampler.input_buffer_allocate(true);
+            let out_buf = resampler.output_buffer_allocate(true);
+            Ok(Self {
+                resampler: OutputResamplerKind::Fast(resampler),
+                in_buf,
+                out_buf,
+            })
+        } else {
+            // Anti-aliased adaptive Sinc resampling for non-48 kHz outputs (e.g., 44.1 kHz / 96 kHz).
+            let resampler = SincFixedIn::<f32>::new(
+                nominal_ratio,
+                1.02,
+                low_latency_sinc_params(),
+                DFN_HOP_SIZE,
+                1,
+            )?;
+            let in_buf = resampler.input_buffer_allocate(true);
+            let out_buf = resampler.output_buffer_allocate(true);
+            Ok(Self {
+                resampler: OutputResamplerKind::Sinc(resampler),
+                in_buf,
+                out_buf,
+            })
+        }
     }
 
     /// Processes 480 samples @ 48kHz with smooth ratio ramping (`ramp = true`) and returns a slice of output samples.
     pub fn process(&mut self, in_480: &[f32], relative_ratio: f64) -> Result<&[f32]> {
         let clamped_rel = relative_ratio.clamp(0.99, 1.01);
-        self.resampler.set_resample_ratio_relative(clamped_rel, true)?;
         self.in_buf[0][..DFN_HOP_SIZE].copy_from_slice(in_480);
-        let (_nbr_in, nbr_out) =
-            self.resampler
-                .process_into_buffer(&self.in_buf, &mut self.out_buf, None)?;
+        let nbr_out = match &mut self.resampler {
+            OutputResamplerKind::Fast(r) => {
+                r.set_resample_ratio_relative(clamped_rel, true)?;
+                let (_nbr_in, n) = r.process_into_buffer(&self.in_buf, &mut self.out_buf, None)?;
+                n
+            }
+            OutputResamplerKind::Sinc(r) => {
+                r.set_resample_ratio_relative(clamped_rel, true)?;
+                let (_nbr_in, n) = r.process_into_buffer(&self.in_buf, &mut self.out_buf, None)?;
+                n
+            }
+        };
         Ok(&self.out_buf[0][..nbr_out])
     }
 }
@@ -200,5 +258,41 @@ mod tests {
             "Expected negative ppm compensation for faster mic, got {:.1} ppm",
             ctrl.drift_ppm()
         );
+    }
+
+    #[test]
+    fn test_negative_drift_and_multi_sample_rates() {
+        // Negative clock drift (-120 ppm: slower mic than output)
+        let sr_out = 48_000u32;
+        let target = 1440usize;
+        let mut ctrl = DriftController::new(target, sr_out);
+        let mut out_rs = AdaptiveOutputResampler::new(sr_out).unwrap();
+        let mut level = target as f64;
+        let frame = [0.05f32; DFN_HOP_SIZE];
+        for _ in 0..3_000 {
+            let rel = ctrl.update(level.round().max(0.0) as usize);
+            let out = out_rs.process(&frame, rel).unwrap();
+            level += out.len() as f64;
+            level -= 480.0 * (1.0 + 0.00012);
+        }
+        assert!((level - target as f64).abs() < 80.0);
+        assert!(ctrl.drift_ppm() > 50.0);
+
+        // Input & output resamplers across common hardware/Bluetooth sample rates
+        for sr in [16_000u32, 44_100, 48_000, 96_000, 192_000] {
+            let mut in_rs = InputResampler48k::new(sr).unwrap();
+            let mut out_480 = [0.0f32; DFN_HOP_SIZE];
+            for _ in 0..5 {
+                let needed = in_rs.input_frames_next();
+                let in_chunk = vec![0.1f32; needed];
+                in_rs.process(&in_chunk, &mut out_480).unwrap();
+                assert!(out_480.iter().all(|s| s.is_finite()));
+            }
+
+            let mut out_rs = AdaptiveOutputResampler::new(sr).unwrap();
+            let res = out_rs.process(&out_480, 1.0005).unwrap();
+            assert!(!res.is_empty());
+            assert!(res.iter().all(|s| s.is_finite()));
+        }
     }
 }

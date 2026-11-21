@@ -75,7 +75,8 @@ pub struct ShortcutRegistry {
     toggle_nc: Option<Shortcut>,
     toggle_mute: Option<Shortcut>,
     paused: bool,
-    last_triggered_at: Option<Instant>,
+    last_triggered_nc: Option<Instant>,
+    last_triggered_mute: Option<Instant>,
     startup_warning: Option<String>,
 }
 
@@ -263,24 +264,21 @@ impl ShortcutRegistry {
             return None;
         }
         let now = Instant::now();
-        if let Some(last) = self.last_triggered_at {
+        let (action, last_slot) = if self.toggle_nc == Some(*shortcut) {
+            (ShortcutAction::ToggleNc, &mut self.last_triggered_nc)
+        } else if self.toggle_mute == Some(*shortcut) {
+            (ShortcutAction::ToggleMute, &mut self.last_triggered_mute)
+        } else {
+            return None;
+        };
+
+        if let Some(last) = *last_slot {
             if now.duration_since(last) < TRIGGER_DEBOUNCE {
                 return None;
             }
         }
-
-        let action = if self.toggle_nc == Some(*shortcut) {
-            Some(ShortcutAction::ToggleNc)
-        } else if self.toggle_mute == Some(*shortcut) {
-            Some(ShortcutAction::ToggleMute)
-        } else {
-            None
-        };
-
-        if action.is_some() {
-            self.last_triggered_at = Some(now);
-        }
-        action
+        *last_slot = Some(now);
+        Some(action)
     }
 }
 
@@ -302,5 +300,30 @@ mod tests {
         assert!(validate_and_parse_shortcut("Space").is_err());
         assert!(validate_and_parse_shortcut("").is_err());
         assert!(validate_and_parse_shortcut("NotARealKey").is_err());
+    }
+
+    #[test]
+    fn test_shortcut_match_triggered_independent_debounce_and_pause() {
+        let nc = validate_and_parse_shortcut("Control+Shift+KeyN").unwrap();
+        let mute = validate_and_parse_shortcut("Control+Shift+KeyM").unwrap();
+
+        let mut reg = ShortcutRegistry {
+            toggle_nc: Some(nc),
+            toggle_mute: Some(mute),
+            ..Default::default()
+        };
+
+        // First press of NC triggers; immediate duplicate NC is debounced
+        assert_eq!(reg.match_triggered(&nc), Some(ShortcutAction::ToggleNc));
+        assert_eq!(reg.match_triggered(&nc), None);
+
+        // Pressing Mute immediately after NC must STILL trigger (independent debounce slots)
+        assert_eq!(reg.match_triggered(&mute), Some(ShortcutAction::ToggleMute));
+        assert_eq!(reg.match_triggered(&mute), None);
+
+        // When paused (recording a new key), all triggers are suppressed
+        reg.paused = true;
+        reg.last_triggered_nc = None;
+        assert_eq!(reg.match_triggered(&nc), None);
     }
 }
