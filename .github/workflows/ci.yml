@@ -37,7 +37,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.label }})
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -45,9 +45,13 @@ jobs:
           - label: "Windows x64"
             platform: windows-latest
             os_kind: windows
+            rustflags: "-C linker=rust-lld.exe -C linker-flavor=lld-link"
           - label: "macOS"
             platform: macos-latest
             os_kind: macos
+            rustflags: ""
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - name: Disable Windows Defender real-time scanning (faster MSVC builds)
         if: matrix.os_kind == 'windows'
@@ -70,7 +74,26 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: ci-${{ matrix.label }}
+          key: ci-${{ matrix.label }}-fast
+
+      - name: Configure fast CI Cargo profile overrides (without modifying Cargo.toml)
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP}/ci-cargo.toml" <<'EOF'
+          [profile.dev]
+          debug = 0
+          [profile.dev.build-override]
+          opt-level = 0
+          [profile.dev.package."*"]
+          opt-level = 1
+
+          [profile.test]
+          debug = 0
+          [profile.test.build-override]
+          opt-level = 0
+          [profile.test.package."*"]
+          opt-level = 1
+          EOF
 
       - name: Ensure frontend dist placeholder for Tauri compile-time macro
         shell: bash
@@ -84,7 +107,9 @@ jobs:
         run: bash drivers/macos-hal/build_driver.sh /tmp/ShizukaAudio.driver
 
       - name: Run cargo clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        shell: bash
+        run: cargo --config "${RUNNER_TEMP}/ci-cargo.toml" clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust unit tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+        shell: bash
+        run: cargo --config "${RUNNER_TEMP}/ci-cargo.toml" test --manifest-path src-tauri/Cargo.toml --lib
