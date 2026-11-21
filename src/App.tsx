@@ -1212,13 +1212,13 @@ export function App() {
       </main>
 
       <footer className="footer-bar">
-        <span>閉じる[×]でトレイ常駐</span>
+        <span>[×] でバックグラウンド動作</span>
         <button
           type="button"
           className="quit-btn"
           onClick={() => void handleQuit()}
         >
-          完全終了
+          アプリを終了
         </button>
       </footer>
 
@@ -1247,17 +1247,17 @@ export function App() {
 
           <div className="settings-dialog-body">
             <div className="settings-group">
-              <span className="settings-group-label">起動と常駐</span>
+              <span className="settings-group-label">起動設定</span>
               <div className="settings-toggle-row">
                 <div className="settings-toggle-copy">
                   <label
                     htmlFor={autostartSwitchId}
                     className="settings-toggle-title"
                   >
-                    OS 起動時にトレイへ常駐起動
+                    OS 起動時にバックグラウンドで自動起動
                   </label>
                   <span id={autostartHintId} className="field-hint">
-                    ウィンドウを出さず{isMac ? "メニューバー" : "タスクトレイ"}で静かに待機します
+                    ウィンドウを出さず{isMac ? "メニューバー" : "通知領域"}で静かに待機します
                   </span>
                 </div>
                 <input
