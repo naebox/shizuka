@@ -66,16 +66,19 @@ flowchart LR
 
 ---
 
-## Phase 3: `v0.4.0` — macOS ドライバ事前同梱＆ワンクリック自動アップデート
+## Phase 3: `v0.4.0` — macOS ドライバ事前同梱＆ワンクリック自動アップデート（リリース済み）
 
 配布・導入・最新化の摩擦をゼロにし、Windows / macOS 両方でワンクリック完結する体験を完成させます。
 
-- [ ] **macOS `ShizukaAudio.driver` の事前ビルド同梱（Xcode CLT 不要化）** ([release.yml](./.github/workflows/release.yml), [installer.rs](./src-tauri/src/installer.rs))
-  - GitHub Actions の macOS ビルド時に Universal（`arm64` + `x86_64`）ドライバを事前コンパイルして Tauri リソース同梱。
-- [ ] **アプリ内ワンクリック自動アップデート (`tauri-plugin-updater`)** ([lib.rs](./src-tauri/src/lib.rs), [release.yml](./.github/workflows/release.yml))
-  - Ed25519 署名鍵＋`latest.json` 自動生成により、アプリ内からワンクリック更新（ポータブル版は Releases ページ誘導にフォールバック）。
-- [ ] **CI / リリース品質基盤の整備** ([release.yml](./.github/workflows/release.yml))
-  - `push` / PR 用の軽量検証 CI（`tsc`, `cargo clippy -- -D warnings`, `cargo test --lib`）、Node 20 非推奨警告の解消、`SHA256SUMS.txt` 自動添付。
+- [x] **macOS `ShizukaAudio.driver` の事前ビルド同梱（Xcode CLT 不要化）** ([build_driver.sh](./drivers/macos-hal/build_driver.sh), [release.yml](./.github/workflows/release.yml), [installer.rs](./src-tauri/src/installer.rs))
+  - GitHub Actions の macOS ビルド時に Universal（`arm64` + `x86_64`）ドライバを事前コンパイルして Tauri リソース同梱（開発環境では `clang` フォールバックを維持）。
+- [x] **アプリ内ワンクリック自動アップデート (`tauri-plugin-updater`)** ([updater.rs](./src-tauri/src/updater.rs), [lib.rs](./src-tauri/src/lib.rs), [release.yml](./.github/workflows/release.yml))
+  - Ed25519 署名鍵＋`latest.json` 自動生成により、アプリ内からワンクリック更新（NSIS / MSI / macOS 対応、ポータブル版は Releases ページ誘導にフォールバック）。
+- [x] **CI / リリース品質基盤の整備** ([ci.yml](./.github/workflows/ci.yml), [release.yml](./.github/workflows/release.yml))
+  - `push` / PR 用の軽量検証 CI（`tsc`, `vite build`, Windows/macOS `cargo clippy --all-targets -- -D warnings`, `cargo test --lib`, macOS HAL ドライバビルド検証）、Node 24 アクション統一、`SHA256SUMS.txt` 自動添付。
+- [x] **ステレオ和音操作音（「和の余白」A-5）＆設定 UI ブラッシュアップ** ([cue.rs](./src-tauri/src/audio/cue.rs), [App.tsx](./src/App.tsx))
+  - 48 kHz ステレオ和音ブルーム＋極短リバーブによる上質なショートカット操作音へ刷新。
+- [x] `v0.4.0` リリース公開（macOS 実機フル検証は Phase 4 で最終確認）
 
 ---
 

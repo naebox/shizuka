@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/ShizukaAudio.driver/": "ShizukaAudio.driver/"
+    }
+  }
+}

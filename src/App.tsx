@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   ClipboardCopy,
   Download,
+  ExternalLink,
   Headphones,
   Keyboard,
   Mic,
@@ -37,6 +38,8 @@ import type {
   InstallDriverResult,
   ModelVariant,
   ShortcutAction,
+  UpdateCheckResult,
+  UpdateProgressSnapshot,
 } from "./types";
 
 const supportsNativeSwitch =
@@ -332,9 +335,9 @@ export function App() {
   const monVolSliderId = `${uid}-mon-vol-slider`;
   const settingsTitleId = `${uid}-settings-title`;
   const autostartSwitchId = `${uid}-autostart-switch`;
-  const autostartHintId = `${uid}-autostart-hint`;
   const cueSoundSwitchId = `${uid}-cue-sound-switch`;
   const cueSoundHintId = `${uid}-cue-sound-hint`;
+  const updateProgressId = `${uid}-update-progress`;
 
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
   const lastReconnectCountRef = useRef<number>(0);
@@ -352,6 +355,16 @@ export function App() {
     useState<ShortcutAction | null>(null);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   const [diagCopied, setDiagCopied] = useState(false);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressSnapshot>({
+    phase: "idle",
+    downloaded_bytes: 0,
+    total_bytes: null,
+    error: null,
+  });
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const [installingDriver, setInstallingDriver] = useState(false);
   const [installMessage, setInstallMessage] = useState<{
     ok: boolean;
@@ -773,6 +786,70 @@ export function App() {
     }
   };
 
+  const handleCheckForUpdate = useCallback(async (silent = false) => {
+    setUpdateChecking(true);
+    if (!silent) {
+      setUpdateError(null);
+    }
+    try {
+      const res = await invoke<UpdateCheckResult>("check_for_update");
+      setUpdateInfo(res);
+    } catch (err) {
+      if (!silent) {
+        setUpdateError(typeof err === "string" ? err : String(err));
+      }
+    } finally {
+      setUpdateChecking(false);
+    }
+  }, []);
+
+  const handleInstallUpdate = async () => {
+    setUpdateInstalling(true);
+    setUpdateError(null);
+    setUpdateProgress({
+      phase: "downloading",
+      downloaded_bytes: 0,
+      total_bytes: null,
+      error: null,
+    });
+    const poll = window.setInterval(async () => {
+      try {
+        const snap = await invoke<UpdateProgressSnapshot>(
+          "get_update_progress"
+        );
+        setUpdateProgress(snap);
+      } catch {
+        // Ignore transient IPC error while restarting
+      }
+    }, 200);
+    try {
+      await invoke("install_update");
+    } catch (err) {
+      setUpdateError(typeof err === "string" ? err : String(err));
+      setUpdateProgress((prev) => ({ ...prev, phase: "error" }));
+      setUpdateInstalling(false);
+    } finally {
+      window.clearInterval(poll);
+    }
+  };
+
+  const handleOpenReleasesPage = async () => {
+    setUpdateError(null);
+    try {
+      await invoke("open_releases_page");
+    } catch (err) {
+      setUpdateError(typeof err === "string" ? err : String(err));
+    }
+  };
+
+  // Quiet one-shot startup update check (5s after mount so audio startup is unaffected)
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void handleCheckForUpdate(true);
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [handleCheckForUpdate]);
+
   const handleInstallVirtualDriver = async () => {
     setInstallingDriver(true);
     setInstallMessage(null);
@@ -878,11 +955,18 @@ export function App() {
           </button>
           <button
             type="button"
-            className="icon-btn"
+            className="icon-btn settings-icon-btn"
             onClick={openSettingsDialog}
-            aria-label="アプリ設定を開く"
+            aria-label={
+              updateInfo?.available
+                ? "アプリ設定を開く（新しいアップデートがあります）"
+                : "アプリ設定を開く"
+            }
           >
             <Settings size={14} aria-hidden="true" />
+            {updateInfo?.available && (
+              <span className="update-badge-dot" aria-hidden="true" />
+            )}
           </button>
         </div>
       </header>
@@ -1756,10 +1840,6 @@ export function App() {
                   >
                     OS 起動時にバックグラウンドで自動起動
                   </label>
-                  <span id={autostartHintId} className="field-hint">
-                    ウィンドウを出さず{isMac ? "メニューバー" : "通知領域"}
-                    で静かに待機します
-                  </span>
                 </div>
                 <input
                   id={autostartSwitchId}
@@ -1770,7 +1850,6 @@ export function App() {
                   className="nc-toggle compact"
                   checked={autostartEnabled}
                   disabled={autostartBusy}
-                  aria-describedby={autostartHintId}
                   onChange={(e) =>
                     void handleToggleAutostart(e.currentTarget.checked)
                   }
@@ -1882,7 +1961,8 @@ export function App() {
                     ショートカット操作音
                   </label>
                   <span id={cueSoundHintId} className="field-hint">
-                    ホットキーやトレイ切替時に控えめな確認音を鳴らします
+                    ホットキーや{isMac ? "メニューバー" : "通知領域"}
+                    からの切替時に控えめな確認音を鳴らします
                   </span>
                 </div>
                 <input
@@ -1965,11 +2045,135 @@ export function App() {
                 </span>
               </button>
             </div>
+
+            <div className="settings-group">
+              <span className="settings-group-label">アップデート</span>
+              <div className="update-card">
+                <div className="update-card-top">
+                  <div className="update-copy">
+                    <span className="update-title">
+                      Shizuka v{updateInfo?.current_version ?? "0.4.0"}
+                    </span>
+                    <span className="field-hint" role="status">
+                      {updateChecking
+                        ? "最新バージョンを確認しています..."
+                        : updateInfo?.available
+                        ? `v${updateInfo.latest_version} が利用可能です${
+                            updateInfo.is_portable ? "（ポータブル版）" : ""
+                          }`
+                        : updateInfo
+                        ? "最新バージョンです"
+                        : "最新版をオンラインで確認できます"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="shortcut-record-btn"
+                    disabled={updateChecking || updateInstalling}
+                    onClick={() => void handleCheckForUpdate(false)}
+                  >
+                    {updateChecking ? (
+                      <progress
+                        className="loading-spinner"
+                        aria-label="アップデートを確認中"
+                      />
+                    ) : (
+                      <RefreshCw size={12} aria-hidden="true" />
+                    )}
+                    <span>更新を確認</span>
+                  </button>
+                </div>
+
+                {updateInfo?.available && (
+                  <div className="update-action-box">
+                    {updateInstalling && (
+                      <div className="update-progress-wrap">
+                        <div className="slider-top">
+                          <label htmlFor={updateProgressId}>
+                            {updateProgress.phase === "installing"
+                              ? "インストールを適用しています..."
+                              : "アップデートをダウンロード中..."}
+                          </label>
+                          {updateProgress.total_bytes &&
+                            updateProgress.total_bytes > 0 && (
+                              <span className="slider-val">
+                                {Math.min(
+                                  100,
+                                  Math.round(
+                                    (updateProgress.downloaded_bytes /
+                                      updateProgress.total_bytes) *
+                                      100
+                                  )
+                                )}
+                                %
+                              </span>
+                            )}
+                        </div>
+                        <progress
+                          id={updateProgressId}
+                          className="update-progress"
+                          max={
+                            updateProgress.phase === "downloading" &&
+                            updateProgress.total_bytes &&
+                            updateProgress.total_bytes > 0
+                              ? updateProgress.total_bytes
+                              : undefined
+                          }
+                          value={
+                            updateProgress.phase === "downloading" &&
+                            updateProgress.total_bytes &&
+                            updateProgress.total_bytes > 0
+                              ? updateProgress.downloaded_bytes
+                              : undefined
+                          }
+                        />
+                      </div>
+                    )}
+
+                    {updateInfo.is_portable ? (
+                      <>
+                        <span className="field-hint">
+                          ポータブル版は自動上書きに対応していないため、GitHub
+                          Releases から最新版を取得してください。
+                        </span>
+                        <button
+                          type="button"
+                          className="btn primary"
+                          onClick={() => void handleOpenReleasesPage()}
+                        >
+                          <ExternalLink size={14} aria-hidden="true" />
+                          <span>Releases ページを開く</span>
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn primary"
+                        disabled={updateInstalling}
+                        onClick={() => void handleInstallUpdate()}
+                      >
+                        <Download size={14} aria-hidden="true" />
+                        <span>
+                          {updateInstalling
+                            ? "アップデートを適用中..."
+                            : `v${updateInfo.latest_version} へ今すぐアップデート`}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {updateError && (
+                  <div className="error-banner" role="alert">
+                    {updateError}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
           <div className="settings-dialog-footer">
-            <span>Shizuka v0.3.0</span>
-            <span>ESC または外側クリックで閉じる</span>
+            <span>Shizuka v{updateInfo?.current_version ?? "0.4.0"}</span>
           </div>
         </div>
       </dialog>

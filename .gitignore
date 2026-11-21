@@ -6,7 +6,10 @@ dist/
 # Rust / Tauri build artifacts
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/resources/ShizukaAudio.driver/
 *.prev.exe
+*.key
+*.sig
 
 # OS & Editor files
 .DS_Store

@@ -19,11 +19,14 @@
 
 | OS | ファイル | 説明 |
 | --- | --- | --- |
-| **Windows (x64)** | `Shizuka_*_x64-setup.exe` | 推奨インストーラ（NSIS・日本語対応） |
-| **Windows (x64)** | `Shizuka_*_windows_x64_portable.zip` | インストール不要のポータブル版 |
-| **Windows (x64)** | `Shizuka_*_x64_en-US.msi` | MSI パッケージ |
-| **macOS (Apple Silicon)** | `Shizuka_*_aarch64.dmg` | M1 以降搭載 Mac 向け |
-| **macOS (Intel)** | `Shizuka_*_x64.dmg` | Intel Mac 向け |
+| **Windows (x64)** | `Shizuka_*_x64-setup.exe` | 推奨インストーラ（NSIS・日本語対応・自動更新対応） |
+| **Windows (x64)** | `Shizuka_*_windows_x64_portable.zip` | インストール不要のポータブル版（更新通知→Releases 案内） |
+| **Windows (x64)** | `Shizuka_*_x64_en-US.msi` | MSI パッケージ（自動更新対応） |
+| **macOS (Apple Silicon)** | `Shizuka_*_aarch64.dmg` | M1 以降搭載 Mac 向け（自動更新対応） |
+| **macOS (Intel)** | `Shizuka_*_x64.dmg` | Intel Mac 向け（自動更新対応） |
+
+> [!TIP]
+> 各リリースには全配布ファイルのハッシュ値をまとめた `SHA256SUMS.txt` が自動添付されます。また、`v0.4.0` 以降は Ed25519 署名検証付きのアプリ内ワンクリック自動アップデートに対応しています。
 
 > [!NOTE]
 > 個人ビルド（未署名）のため、初回起動時に OS の警告が表示される場合があります。
@@ -48,7 +51,9 @@
   - 仮想マイク未導入でも、`▶` ワンクリック＋縦スリット音量バー・出力音量ゲージ・**「ノイズ除去 / 生音声」即時切替**で自分の声と除去効果を確認可能
 - **ライセンスクリーンなワンクリック仮想マイク導入**
   - **Windows**: アプリ内に他社ドライバをバンドルせず、ボタン 1 つで公式 WHQL 署名済み VB-CABLE (Donationware by VB-Audio: https://vb-audio.com) を一時取得・UAC 昇格サイレント導入
-  - **macOS**: スクラッチ実装の **MIT ライセンス CoreAudio HAL ループバックドライバ（`Shizuka Virtual Mic`）** を同梱しており、アプリ内ボタン（または `drivers/macos-hal/install_macos.sh`）から再起動不要で導入可能
+  - **macOS**: スクラッチ実装の **MIT ライセンス CoreAudio HAL ループバックドライバ（`Shizuka Virtual Mic`）** を Universal（`arm64` + `x86_64`）事前ビルド済みでアプリ内に同梱しており、**Xcode Command Line Tools 不要**でアプリ内ボタンから再起動なしに即時導入可能
+- **アプリ内ワンクリック自動アップデート（Ed25519 署名検証）**
+  - 起動時にバックグラウンドで GitHub Releases の最新版を静かにチェックし、新バージョンがあれば設定画面からワンクリックでダウンロード・検証・適用・自動再起動を実行（Windows ポータブル版では Releases ページへの案内ボタンに自動切替）
 
 ---
 
@@ -60,7 +65,7 @@
 3. 会議アプリのマイク入力設定で **`CABLE Output (VB-Audio Virtual Cable)`** を選択します。
 
 ### macOS の場合
-1. **Shizuka** を起動し、案内バナーの **「Shizuka Virtual Mic (MIT) を導入」** をクリックします（管理者パスワード入力後、`coreaudiod` が自動リロードされ即時認識されます。既存の `BlackHole 2ch` がある場合も自動対応します）。
+1. **Shizuka** を起動し、案内バナーの **「Shizuka Virtual Mic (MIT) を導入」** をクリックします（事前ビルド済み Universal ドライバを同梱しているため **Xcode Command Line Tools 不要**、管理者パスワード入力後に `coreaudiod` が自動リロードされ即時認識されます。既存の `BlackHole 2ch` がある場合も自動対応します）。
 2. 会議アプリのマイク入力設定で **`Shizuka Virtual Mic`** を選択します。
 3. 初回起動時は「システム設定 → プライバシーとセキュリティ → マイク」で Shizuka にマイク権限を許可してください。
 

@@ -327,6 +327,28 @@
     }
   }
 
+  .settings-icon-btn {
+    position: relative;
+  }
+
+  .update-badge-dot {
+    position: absolute;
+    inset-block-start: 0.22rem;
+    inset-inline-end: 0.22rem;
+    inline-size: 0.42rem;
+    block-size: 0.42rem;
+    border-radius: 50%;
+    background: var(--color-led-green);
+    box-shadow: 0 0 0 1.5px var(--bg-card), var(--led-glow);
+    pointer-events: none;
+
+    @media (forced-colors: active) {
+      forced-color-adjust: none;
+      background: Highlight;
+      box-shadow: none;
+    }
+  }
+
   /* Monochrome Cards */
   .card {
     background: var(--bg-card);
@@ -1867,6 +1889,99 @@
     color: var(--text-primary);
   }
 
+  /* In-App Updater Card & Styled <progress> Bar */
+  .update-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    padding: 0.55rem 0.65rem;
+    border-radius: 0.55rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .update-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+  }
+
+  .update-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0.12rem;
+    min-inline-size: 0;
+    flex: 1;
+  }
+
+  .update-title {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .update-action-box {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    padding-block-start: 0.45rem;
+    border-block-start: 1px solid var(--border-subtle);
+  }
+
+  .update-progress-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  progress.update-progress {
+    container-type: inline-size;
+    --progress-bar-radius: 999px;
+    --progress-bar-track: var(--color-track);
+    --progress-bar-fill: var(--color-accent);
+    --progress-bar-indeterminate-size: 32%;
+    --progress-bar-indeterminate-animation-duration: 1.4s;
+
+    appearance: none;
+    border: 0 solid;
+    overflow: clip;
+    inline-size: 100%;
+    block-size: 0.4rem;
+    border-radius: var(--progress-bar-radius);
+    background: var(--progress-bar-track);
+    display: block;
+
+    @media (prefers-reduced-motion: reduce) {
+      --progress-bar-indeterminate-animation-duration: 10s;
+    }
+
+    &:dir(rtl) {
+      --progress-bar-indeterminate-animation: progress-bar-indeterminate
+        var(--progress-bar-indeterminate-animation-duration) infinite linear
+        reverse;
+    }
+
+    &:indeterminate {
+      --progress-bar-animation: var(
+        --progress-bar-indeterminate-animation,
+        progress-bar-indeterminate
+          var(--progress-bar-indeterminate-animation-duration) infinite linear
+      );
+    }
+  }
+
+  progress.update-progress::-webkit-progress-bar {
+    background: transparent;
+  }
+
+  progress.update-progress::-webkit-progress-value {
+    background: var(--progress-bar-fill);
+    border-radius: var(--progress-bar-radius);
+    transition: inline-size 180ms ease-out;
+    animation: var(--progress-bar-animation, revert-rule);
+  }
+
   .settings-dialog-footer {
     display: flex;
     align-items: center;
@@ -1905,6 +2020,20 @@
       color: var(--text-primary);
       text-decoration-thickness: 2px;
     }
+  }
+}
+
+@keyframes progress-bar-indeterminate {
+  from,
+  to {
+    inline-size: var(--progress-bar-indeterminate-size);
+    margin-right: auto;
+  }
+  from {
+    translate: -100%;
+  }
+  to {
+    translate: 100cqi;
   }
 }
 

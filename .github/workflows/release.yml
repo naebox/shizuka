@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.2.0). Leave empty to use v<version> from package.json"
+        description: "Release tag (e.g. v0.4.0). Leave empty to use v<version> from package.json"
         required: false
         default: ""
 
@@ -55,6 +55,7 @@ jobs:
           - **Windows（MSI パッケージ）**: `Shizuka_*_x64_en-US.msi`
           - **macOS（Apple Silicon / M1 以降）**: `Shizuka_*_aarch64.dmg`
           - **macOS（Intel）**: `Shizuka_*_x64.dmg`
+          - **チェックサム**: `SHA256SUMS.txt`
 
           > [!NOTE]
           > 個人ビルド（未署名）のため、初回起動時に OS の警告が表示される場合があります。
@@ -84,14 +85,20 @@ jobs:
             platform: windows-latest
             target: ""
             os_kind: windows
+            updater_target: windows-x86_64
+            arch_label: x64
           - label: "macOS Apple Silicon"
             platform: macos-latest
             target: aarch64-apple-darwin
             os_kind: macos
+            updater_target: darwin-aarch64
+            arch_label: aarch64
           - label: "macOS Intel"
             platform: macos-latest
             target: x86_64-apple-darwin
             os_kind: macos
+            updater_target: darwin-x86_64
+            arch_label: x64
 
     steps:
       - name: Disable Windows Defender real-time scanning (faster MSVC builds)
@@ -126,15 +133,25 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Prebuild Universal macOS HAL driver (ShizukaAudio.driver)
+        if: matrix.os_kind == 'macos'
+        shell: bash
+        run: bash drivers/macos-hal/build_driver.sh src-tauri/resources/ShizukaAudio.driver
+
       - name: Build Tauri application (Windows)
         if: matrix.os_kind == 'windows'
         env:
           RUSTFLAGS: "-C linker=rust-lld.exe -C linker-flavor=lld-link"
-        run: npm run tauri build
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --config src-tauri/tauri.updater.conf.json
 
       - name: Build Tauri application (macOS)
         if: matrix.os_kind == 'macos'
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target ${{ matrix.target }} --config src-tauri/tauri.macos.release.conf.json
 
       - name: Package and upload Windows artifacts
         if: matrix.os_kind == 'windows'
@@ -143,10 +160,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
           VERSION: ${{ needs.prepare-release.outputs.version }}
+          UPDATER_TARGET: ${{ matrix.updater_target }}
         run: |
+          $nsisExe = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $nsisSig = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msiFile = Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msiSig = Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+
           $assets = @()
-          $assets += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-          $assets += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          if ($nsisExe) { $assets += $nsisExe.FullName }
+          if ($msiFile) { $assets += $msiFile.FullName }
 
           $portableDir = "portable_stage"
           New-Item -ItemType Directory -Force $portableDir | Out-Null
@@ -164,24 +187,158 @@ jobs:
           $assets | ForEach-Object { Write-Host "  $_" }
           gh release upload "$env:TAG" $assets --clobber
 
+          if (-not $nsisExe -or -not $nsisSig) {
+            throw "Expected NSIS updater installer (.exe) and signature (.exe.sig) were not generated!"
+          }
+          New-Item -ItemType Directory -Force "updater_meta" | Out-Null
+          $nsisSigContent = (Get-Content -Raw $nsisSig.FullName).Trim()
+          foreach ($t in @($env:UPDATER_TARGET, "$($env:UPDATER_TARGET)-nsis")) {
+            @{
+              target    = $t
+              file      = $nsisExe.Name
+              signature = $nsisSigContent
+            } | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 "updater_meta/${t}.json"
+          }
+          if ($msiFile -and $msiSig) {
+            $msiTarget = "$($env:UPDATER_TARGET)-msi"
+            @{
+              target    = $msiTarget
+              file      = $msiFile.Name
+              signature = (Get-Content -Raw $msiSig.FullName).Trim()
+            } | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 "updater_meta/${msiTarget}.json"
+          }
+
           # Prune large installer bundles before Post Rust cache archives target/
           Remove-Item -Recurse -Force "src-tauri/target/release/bundle", "src-tauri/target/release/wix", "src-tauri/target/release/nsis", "src-tauri/target/release/shizuka.exe", "$portableDir", "$zipPath" -ErrorAction SilentlyContinue
 
-      - name: Upload macOS artifacts
+      - name: Package and upload macOS artifacts
         if: matrix.os_kind == 'macos'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
           TARGET: ${{ matrix.target }}
+          UPDATER_TARGET: ${{ matrix.updater_target }}
+          ARCH_LABEL: ${{ matrix.arch_label }}
         run: |
           shopt -s nullglob
-          ASSETS=(src-tauri/target/${TARGET}/release/bundle/dmg/*.dmg)
-          if [ ${#ASSETS[@]} -eq 0 ]; then
+          DMGS=(src-tauri/target/${TARGET}/release/bundle/dmg/*.dmg)
+          TARBALLS=(src-tauri/target/${TARGET}/release/bundle/macos/*.app.tar.gz)
+          SIGS=(src-tauri/target/${TARGET}/release/bundle/macos/*.app.tar.gz.sig)
+
+          if [ ${#DMGS[@]} -eq 0 ]; then
             echo "No macOS DMG artifacts found in src-tauri/target/${TARGET}/release/bundle/dmg/"
             exit 1
           fi
+          if [ ${#TARBALLS[@]} -eq 0 ] || [ ${#SIGS[@]} -eq 0 ]; then
+            echo "No macOS updater artifacts (.app.tar.gz / .sig) found!"
+            exit 1
+          fi
+
+          # Rename architecture-specific updater tarball so arm64 & x64 do not collide on GitHub Release
+          UPDATER_TAR_NAME="Shizuka_${VERSION}_${ARCH_LABEL}.app.tar.gz"
+          cp "${TARBALLS[0]}" "${UPDATER_TAR_NAME}"
+
           echo "Uploading macOS assets:"
-          printf '  %s\n' "${ASSETS[@]}"
-          gh release upload "$TAG" "${ASSETS[@]}" --clobber
-          rm -rf "src-tauri/target/${TARGET}/release/bundle"
+          printf '  %s\n' "${DMGS[@]}" "${UPDATER_TAR_NAME}"
+          gh release upload "$TAG" "${DMGS[@]}" "${UPDATER_TAR_NAME}" --clobber
+
+          mkdir -p updater_meta
+          SIG_CONTENT=$(tr -d '\r\n' < "${SIGS[0]}")
+          UPDATER_TAR_NAME="${UPDATER_TAR_NAME}" SIG_CONTENT="${SIG_CONTENT}" node -e '
+            const fs = require("fs");
+            const meta = {
+              target: process.env.UPDATER_TARGET,
+              file: process.env.UPDATER_TAR_NAME,
+              signature: process.env.SIG_CONTENT,
+            };
+            fs.writeFileSync(`updater_meta/${process.env.UPDATER_TARGET}.json`, JSON.stringify(meta, null, 2));
+          '
+
+          rm -rf "src-tauri/target/${TARGET}/release/bundle" "src-tauri/resources/ShizukaAudio.driver" "${UPDATER_TAR_NAME}"
+
+      - name: Upload updater signature metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: updater-meta-${{ matrix.updater_target }}
+          path: updater_meta/*.json
+          if-no-files-found: error
+
+  finalize-release:
+    name: Finalize Release (latest.json & SHA256SUMS.txt)
+    needs: [prepare-release, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download updater signature metadata
+        uses: actions/download-artifact@v8
+        with:
+          pattern: updater-meta-*
+          path: updater_meta
+          merge-multiple: true
+
+      - name: Generate latest.json & SHA256SUMS.txt and upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+
+          const tag = process.env.TAG;
+          const version = process.env.VERSION;
+          const repo = process.env.REPO;
+          const metaDir = "updater_meta";
+          const platforms = {};
+
+          for (const entry of fs.readdirSync(metaDir)) {
+            if (!entry.endsWith(".json")) continue;
+            const item = JSON.parse(fs.readFileSync(path.join(metaDir, entry), "utf8"));
+            platforms[item.target] = {
+              signature: item.signature,
+              url: `https://github.com/${repo}/releases/download/${tag}/${item.file}`,
+            };
+          }
+
+          for (const reqTarget of ["windows-x86_64", "darwin-aarch64", "darwin-x86_64"]) {
+            if (!platforms[reqTarget]) {
+              throw new Error(`Missing updater metadata for target: ${reqTarget}`);
+            }
+          }
+
+          const latest = {
+            version,
+            notes: `Shizuka ${tag} が利用可能です。詳細は GitHub Releases をご覧ください。`,
+            pub_date: new Date().toISOString(),
+            platforms,
+          };
+
+          fs.writeFileSync("latest.json", JSON.stringify(latest, null, 2) + "\n");
+          console.log("Generated latest.json:");
+          console.log(fs.readFileSync("latest.json", "utf8"));
+          EOF
+
+          mkdir -p release_assets
+          gh release download "$TAG" \
+            --dir release_assets \
+            --pattern "*.exe" \
+            --pattern "*.msi" \
+            --pattern "*.zip" \
+            --pattern "*.dmg" \
+            --pattern "*.app.tar.gz"
+
+          (
+            cd release_assets
+            LC_ALL=C sha256sum * > ../SHA256SUMS.txt
+          )
+          echo "Generated SHA256SUMS.txt:"
+          cat SHA256SUMS.txt
+
+          gh release upload "$TAG" latest.json SHA256SUMS.txt --clobber

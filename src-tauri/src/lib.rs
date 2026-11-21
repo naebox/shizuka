@@ -2,6 +2,7 @@ pub mod audio;
 pub mod config;
 pub mod installer;
 pub mod shortcuts;
+pub mod updater;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,10 @@ use audio::engine::{AudioEngineHandle, AudioTelemetry, DspParams};
 use config::{AppConfig, ModelVariant};
 use installer::{install_virtual_audio_driver, InstallDriverResult};
 use shortcuts::{ShortcutAction, ShortcutRegistry};
+use updater::{
+    check_for_update_impl, install_update_impl, is_current_build_portable,
+    open_releases_page_in_browser, UpdateCheckResult, UpdateProgressSnapshot,
+};
 
 const TRAY_ID: &str = "shizuka-tray";
 
@@ -28,6 +33,7 @@ pub struct AppState {
     pub config: Arc<Mutex<AppConfig>>,
     pub cue: CuePlayer,
     pub shortcuts: Mutex<ShortcutRegistry>,
+    pub update_progress: Arc<Mutex<UpdateProgressSnapshot>>,
 }
 
 fn update_tray_icon(app: &AppHandle, nc_enabled: bool, mic_muted: bool) {
@@ -382,11 +388,17 @@ fn get_shortcut_warning(state: State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-async fn install_virtual_driver(state: State<'_, AppState>) -> Result<InstallDriverResult, String> {
-    let result = tauri::async_runtime::spawn_blocking(install_virtual_audio_driver)
-        .await
-        .map_err(|e| format!("セットアップタスク実行エラー: {}", e))?
-        .map_err(|e| format!("{:#}", e))?;
+async fn install_virtual_driver(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<InstallDriverResult, String> {
+    let resource_dir = app.path().resource_dir().ok();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        install_virtual_audio_driver(resource_dir)
+    })
+    .await
+    .map_err(|e| format!("セットアップタスク実行エラー: {}", e))?
+    .map_err(|e| format!("{:#}", e))?;
 
     if result.device_detected_now {
         if let Some(ref virt_out) = result.detected_device_name {
@@ -411,6 +423,35 @@ async fn install_virtual_driver(state: State<'_, AppState>) -> Result<InstallDri
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
+    check_for_update_impl(&app).await
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let progress = Arc::clone(&state.update_progress);
+    let engine = state.engine.clone();
+    install_update_impl(&app, progress, move || {
+        engine.stop();
+    })
+    .await
+}
+
+#[tauri::command]
+fn get_update_progress(state: State<'_, AppState>) -> UpdateProgressSnapshot {
+    state
+        .update_progress
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn open_releases_page() -> Result<(), String> {
+    open_releases_page_in_browser()
 }
 
 #[tauri::command]
@@ -455,9 +496,14 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
     let mut out = String::new();
     out.push_str(&format!("Shizuka Diagnostics (v{})\n", version));
     out.push_str(&format!(
-        "Platform: {} / {}\n",
+        "Platform: {} / {} (install_mode={})\n",
         std::env::consts::OS,
-        std::env::consts::ARCH
+        std::env::consts::ARCH,
+        if is_current_build_portable() {
+            "portable"
+        } else {
+            "installed"
+        }
     ));
     out.push_str(&format!("Autostart: {}\n", autostart));
     out.push_str(&format!(
@@ -598,7 +644,12 @@ pub fn run() {
                 config: shared_cfg,
                 cue,
                 shortcuts: Mutex::new(ShortcutRegistry::default()),
+                update_progress: Arc::new(Mutex::new(UpdateProgressSnapshot::default())),
             });
+
+            // Initialize in-app auto-updater plugin (Ed25519 signature verified via tauri.conf.json pubkey)
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
 
             // Initialize global shortcuts plugin & register user-configured bindings (default: none)
             app.handle().plugin(
@@ -747,6 +798,10 @@ pub fn run() {
             set_shortcut_sound_enabled,
             get_shortcut_warning,
             install_virtual_driver,
+            check_for_update,
+            install_update,
+            get_update_progress,
+            open_releases_page,
             set_window_theme,
             get_autostart_enabled,
             set_autostart_enabled,

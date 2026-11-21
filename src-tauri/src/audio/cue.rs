@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
+use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -16,8 +17,9 @@ pub enum CueKind {
 }
 
 /// Non-blocking synthesized audio feedback player for global shortcut & tray actions.
-/// Plays subtle two-tone chimes to the user's physical speaker/headphones (never the virtual mic)
-/// on a dedicated background thread and releases the audio stream immediately after playback.
+/// Plays subtle stereo "Shizuka" quartal/quintal harmonic blooms ("和の余白", A-5) to the user's
+/// physical speaker/headphones (never the virtual mic) on a dedicated background thread and
+/// releases the audio stream immediately after playback.
 #[derive(Clone)]
 pub struct CuePlayer {
     tx: mpsc::SyncSender<(CueKind, Option<String>)>,
@@ -46,124 +48,387 @@ fn cue_worker_loop(rx: mpsc::Receiver<(CueKind, Option<String>)>) {
         }
         let (kind, monitor_device) = pending;
         if let Err(err) = play_cue_blocking(kind, monitor_device.as_deref()) {
-            log::debug!("Cue audio playback skipped: {}", err);
+            log::warn!("Cue audio playback skipped: {}", err);
         }
     }
 }
 
-struct ToneSegment {
-    freq_hz: f32,
+#[derive(Clone, Copy)]
+struct PartialSpec {
+    ratio: f32,
+    amp: f32,
+    decay: f32,
+}
+
+const VELVET_PARTIALS: &[PartialSpec] = &[
+    PartialSpec {
+        ratio: 1.0,
+        amp: 1.0,
+        decay: 0.0,
+    },
+    PartialSpec {
+        ratio: 2.0,
+        amp: 0.07,
+        decay: 5.0,
+    },
+];
+
+const PURE_PARTIALS: &[PartialSpec] = &[PartialSpec {
+    ratio: 1.0,
+    amp: 1.0,
+    decay: 0.0,
+}];
+
+struct VoiceSpec<'a> {
+    start_ms: f32,
+    f_start: f32,
+    f_end: f32,
+    glide_rate: f32,
     duration_ms: f32,
-    peak_gain: f32,
+    gain: f32,
+    decay: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    pan: f32, // -1.0 (left) .. +1.0 (right)
+    partials: &'a [PartialSpec],
 }
 
-fn cue_segments(kind: CueKind) -> [ToneSegment; 2] {
-    match kind {
-        // Gentle rising C5 -> E5 chime (NC enabled)
-        CueKind::NcOn => [
-            ToneSegment {
-                freq_hz: 523.25,
-                duration_ms: 52.0,
-                peak_gain: 0.12,
-            },
-            ToneSegment {
-                freq_hz: 659.25,
-                duration_ms: 88.0,
-                peak_gain: 0.13,
-            },
-        ],
-        // Gentle falling C5 -> G4 chime (NC bypassed)
-        CueKind::NcOff => [
-            ToneSegment {
-                freq_hz: 523.25,
-                duration_ms: 52.0,
-                peak_gain: 0.12,
-            },
-            ToneSegment {
-                freq_hz: 392.00,
-                duration_ms: 88.0,
-                peak_gain: 0.12,
-            },
-        ],
-        // Soft closing A4 -> E4 tone (Mic muted)
-        CueKind::MuteOn => [
-            ToneSegment {
-                freq_hz: 440.00,
-                duration_ms: 48.0,
-                peak_gain: 0.13,
-            },
-            ToneSegment {
-                freq_hz: 329.63,
-                duration_ms: 85.0,
-                peak_gain: 0.13,
-            },
-        ],
-        // Crisp opening A4 -> D5 tone (Mic unmuted)
-        CueKind::MuteOff => [
-            ToneSegment {
-                freq_hz: 440.00,
-                duration_ms: 48.0,
-                peak_gain: 0.12,
-            },
-            ToneSegment {
-                freq_hz: 587.33,
-                duration_ms: 88.0,
-                peak_gain: 0.13,
-            },
-        ],
+#[inline]
+fn cos_attack(i: usize, attack: usize) -> f32 {
+    if i < attack {
+        0.5 - 0.5 * (PI * i as f32 / attack as f32).cos()
+    } else {
+        1.0
     }
 }
 
-/// Synthesizes a subtle, click-free mono sine-chime waveform at `sample_rate`.
-pub fn synthesize_cue_samples(kind: CueKind, sample_rate: u32) -> Vec<f32> {
+#[inline]
+fn cos_release(i: usize, n: usize, release: usize) -> f32 {
+    if i + release >= n {
+        let rem = (n - 1 - i) as f32 / release as f32;
+        0.5 - 0.5 * (PI * rem).cos()
+    } else {
+        1.0
+    }
+}
+
+fn add_voice(left: &mut [f32], right: &mut [f32], sr: f32, spec: &VoiceSpec<'_>) {
+    let offset = ((sr * spec.start_ms) / 1000.0).round() as usize;
+    let n = (((sr * spec.duration_ms) / 1000.0).round() as usize).max(1);
+    let attack = (((sr * spec.attack_ms) / 1000.0).round() as usize)
+        .max(1)
+        .min((n / 2).max(1));
+    let release = (((sr * spec.release_ms) / 1000.0).round() as usize)
+        .max(1)
+        .min((n / 2).max(1));
+
+    let pan_angle = (spec.pan.clamp(-1.0, 1.0) + 1.0) * (PI / 4.0);
+    let gain_l = pan_angle.cos();
+    let gain_r = pan_angle.sin();
+
+    let mut phases = [0.0f32; 4];
+    let p_count = spec.partials.len().min(phases.len());
+
+    for i in 0..n {
+        let idx = offset + i;
+        if idx >= left.len() {
+            break;
+        }
+        let u = i as f32 / n as f32;
+        let freq = if (spec.f_end - spec.f_start).abs() > 1e-4 {
+            spec.f_start + (spec.f_end - spec.f_start) * (1.0 - (-spec.glide_rate * u).exp())
+        } else {
+            spec.f_start
+        };
+
+        let mut sample = 0.0f32;
+        for (p_idx, partial) in spec.partials.iter().take(p_count).enumerate() {
+            phases[p_idx] += (2.0 * PI * freq * partial.ratio) / sr;
+            let p_env = if partial.decay > 0.0 {
+                (-partial.decay * u).exp()
+            } else {
+                1.0
+            };
+            sample += partial.amp * p_env * phases[p_idx].sin();
+        }
+
+        let env = cos_attack(i, attack) * (-spec.decay * u).exp() * cos_release(i, n, release);
+        let out = sample * spec.gain * env;
+        left[idx] += out * gain_l;
+        right[idx] += out * gain_r;
+    }
+}
+
+/// Applies subtle stereo early-reflection micro-reverb (velvet low-passed intimate room, ~95ms).
+fn apply_micro_reverb(left: &[f32], right: &[f32], sr: f32, wet: f32) -> Vec<[f32; 2]> {
+    const TAPS_L: [(f32, f32, usize); 6] = [
+        (11.3, 0.34, 0),
+        (19.7, 0.24, 1),
+        (31.1, 0.17, 0),
+        (47.3, 0.11, 1),
+        (67.9, 0.07, 0),
+        (89.1, 0.04, 1),
+    ];
+    const TAPS_R: [(f32, f32, usize); 6] = [
+        (13.7, 0.32, 1),
+        (23.1, 0.23, 0),
+        (35.9, 0.16, 1),
+        (52.7, 0.11, 0),
+        (73.3, 0.06, 1),
+        (94.7, 0.04, 0),
+    ];
+
+    let n = left.len();
+    let mut out = vec![[0.0f32; 2]; n];
+
+    let delays_l: [(usize, f32, usize); 6] = TAPS_L
+        .map(|(ms, g, ch)| (((sr * ms) / 1000.0).round() as usize, g, ch));
+    let delays_r: [(usize, f32, usize); 6] = TAPS_R
+        .map(|(ms, g, ch)| (((sr * ms) / 1000.0).round() as usize, g, ch));
+
+    // Sample-rate-invariant ~3.5 kHz 1-pole low-pass on wet reflections (~0.367 at 48 kHz)
+    let lp = 1.0 - (-2.0 * PI * 3500.0 / sr).exp();
+    let mut filt_l = 0.0f32;
+    let mut filt_r = 0.0f32;
+
+    for i in 0..n {
+        let mut w_l = 0.0f32;
+        for &(d, g, src_ch) in &delays_l {
+            if i >= d {
+                let s = if src_ch == 0 { left[i - d] } else { right[i - d] };
+                w_l += s * g;
+            }
+        }
+        let mut w_r = 0.0f32;
+        for &(d, g, src_ch) in &delays_r {
+            if i >= d {
+                let s = if src_ch == 0 { left[i - d] } else { right[i - d] };
+                w_r += s * g;
+            }
+        }
+
+        filt_l += lp * (w_l - filt_l);
+        filt_r += lp * (w_r - filt_r);
+        out[i] = [
+            (left[i] + filt_l * wet).clamp(-0.95, 0.95),
+            (right[i] + filt_r * wet).clamp(-0.95, 0.95),
+        ];
+    }
+
+    // Smooth 22 ms tail fade-out to exact zero
+    let tail_fade = (((sr * 22.0) / 1000.0).round() as usize).max(1).min(n);
+    let fade_start = n - tail_fade;
+    for (offset, frame) in out[fade_start..].iter_mut().enumerate() {
+        let k = (tail_fade - 1 - offset) as f32 / tail_fade as f32;
+        frame[0] *= k;
+        frame[1] *= k;
+    }
+
+    out
+}
+
+/// Synthesizes a subtle, click-free stereo harmonic bloom waveform ("和の余白", A-5) at `sample_rate`.
+pub fn synthesize_cue_stereo(kind: CueKind, sample_rate: u32) -> Vec<[f32; 2]> {
     let sr = sample_rate.max(8_000) as f32;
-    let segments = cue_segments(kind);
-    let gap_samples = ((sr * 0.012).round() as usize).max(1);
-    let tail_silence = ((sr * 0.040).round() as usize).max(1);
+    let body_len = (((sr * 370.0) / 1000.0).round() as usize).max(1);
+    let mut left = vec![0.0f32; body_len];
+    let mut right = vec![0.0f32; body_len];
 
-    let total_est = segments
-        .iter()
-        .map(|s| (sr * s.duration_ms / 1000.0).ceil() as usize)
-        .sum::<usize>()
-        + gap_samples
-        + tail_silence;
-    let mut samples = Vec::with_capacity(total_est);
-
-    for (seg_idx, seg) in segments.iter().enumerate() {
-        if seg_idx > 0 {
-            samples.resize(samples.len() + gap_samples, 0.0);
+    match kind {
+        // Pure open quartal/quintal Zen stillness: D4 -> A4 + E5
+        CueKind::NcOn => {
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 0.0,
+                    f_start: 293.66,
+                    f_end: 293.66,
+                    glide_rate: 5.0,
+                    duration_ms: 175.0,
+                    gain: 0.14,
+                    decay: 2.5,
+                    attack_ms: 15.0,
+                    release_ms: 24.0,
+                    pan: -0.22,
+                    partials: VELVET_PARTIALS,
+                },
+            );
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 58.0,
+                    f_start: 440.0,
+                    f_end: 440.0,
+                    glide_rate: 5.0,
+                    duration_ms: 235.0,
+                    gain: 0.15,
+                    decay: 2.7,
+                    attack_ms: 16.0,
+                    release_ms: 24.0,
+                    pan: 0.16,
+                    partials: VELVET_PARTIALS,
+                },
+            );
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 72.0,
+                    f_start: 659.25,
+                    f_end: 659.25,
+                    glide_rate: 5.0,
+                    duration_ms: 215.0,
+                    gain: 0.085,
+                    decay: 3.0,
+                    attack_ms: 20.0,
+                    release_ms: 24.0,
+                    pan: 0.26,
+                    partials: PURE_PARTIALS,
+                },
+            );
         }
-        let n = ((sr * seg.duration_ms / 1000.0).round() as usize).max(1);
-        let attack = ((sr * 0.004).round() as usize).max(1).min(n / 3);
-        let release = ((sr * 0.012).round() as usize).max(1).min(n / 2);
-
-        for i in 0..n {
-            let t = i as f32 / sr;
-            let phase = 2.0 * std::f32::consts::PI * seg.freq_hz * t;
-            // Warm fundamental + tiny 2nd harmonic for gentle acoustic presence on laptop speakers
-            let wave = phase.sin() + 0.10 * (2.0 * phase).sin();
-
-            // Smooth raised-cosine attack + exponential body decay + zero-ending release
-            let attack_env = if i < attack {
-                0.5 - 0.5 * (std::f32::consts::PI * i as f32 / attack as f32).cos()
-            } else {
-                1.0
-            };
-            let decay_env = (-3.2 * (i as f32 / n as f32)).exp();
-            let release_env = if i + release >= n {
-                let rem = (n - 1 - i) as f32 / release as f32;
-                0.5 - 0.5 * (std::f32::consts::PI * rem).cos()
-            } else {
-                1.0
-            };
-
-            samples.push(wave * seg.peak_gain * attack_env * decay_env * release_env);
+        // Calm downward release: A4 -> E4
+        CueKind::NcOff => {
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 0.0,
+                    f_start: 440.0,
+                    f_end: 440.0,
+                    glide_rate: 5.0,
+                    duration_ms: 145.0,
+                    gain: 0.14,
+                    decay: 2.8,
+                    attack_ms: 13.0,
+                    release_ms: 24.0,
+                    pan: 0.18,
+                    partials: VELVET_PARTIALS,
+                },
+            );
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 58.0,
+                    f_start: 329.63,
+                    f_end: 329.63,
+                    glide_rate: 5.0,
+                    duration_ms: 210.0,
+                    gain: 0.14,
+                    decay: 2.9,
+                    attack_ms: 15.0,
+                    release_ms: 24.0,
+                    pan: -0.18,
+                    partials: VELVET_PARTIALS,
+                },
+            );
+        }
+        // Single quiet descending 4th glide (unmistakable from 2-step NC)
+        CueKind::MuteOn => {
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 0.0,
+                    f_start: 349.23,
+                    f_end: 261.63,
+                    glide_rate: 6.0,
+                    duration_ms: 155.0,
+                    gain: 0.17,
+                    decay: 3.4,
+                    attack_ms: 8.0,
+                    release_ms: 24.0,
+                    pan: 0.0,
+                    partials: PURE_PARTIALS,
+                },
+            );
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 12.0,
+                    f_start: 261.63,
+                    f_end: 261.63,
+                    glide_rate: 5.0,
+                    duration_ms: 165.0,
+                    gain: 0.08,
+                    decay: 3.6,
+                    attack_ms: 14.0,
+                    release_ms: 24.0,
+                    pan: 0.0,
+                    partials: PURE_PARTIALS,
+                },
+            );
+        }
+        // Calm ascending 5th glide — effortless lift
+        CueKind::MuteOff => {
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 0.0,
+                    f_start: 329.63,
+                    f_end: 493.88,
+                    glide_rate: 6.5,
+                    duration_ms: 175.0,
+                    gain: 0.16,
+                    decay: 3.0,
+                    attack_ms: 8.0,
+                    release_ms: 24.0,
+                    pan: 0.0,
+                    partials: VELVET_PARTIALS,
+                },
+            );
+            add_voice(
+                &mut left,
+                &mut right,
+                sr,
+                &VoiceSpec {
+                    start_ms: 18.0,
+                    f_start: 493.88,
+                    f_end: 493.88,
+                    glide_rate: 5.0,
+                    duration_ms: 190.0,
+                    gain: 0.09,
+                    decay: 3.1,
+                    attack_ms: 16.0,
+                    release_ms: 24.0,
+                    pan: 0.12,
+                    partials: PURE_PARTIALS,
+                },
+            );
         }
     }
 
-    // Trailing silence ensures the OS mixer flushes the last frame cleanly before stream drop
-    samples.resize(samples.len() + tail_silence, 0.0);
-    samples
+    let wet_body = apply_micro_reverb(&left, &right, sr, 0.30);
+
+    // Brief leading & trailing silence so WASAPI/CoreAudio buffers open & drain without clipping
+    let lead_silence = ((sr * 0.016).round() as usize).max(1);
+    let tail_silence = ((sr * 0.080).round() as usize).max(1);
+    let mut frames = Vec::with_capacity(lead_silence + wet_body.len() + tail_silence);
+    frames.resize(lead_silence, [0.0, 0.0]);
+    frames.extend_from_slice(&wet_body);
+    frames.resize(frames.len() + tail_silence, [0.0, 0.0]);
+    frames
+}
+
+/// Mono downmix helper for diagnostics & unit testing.
+pub fn synthesize_cue_samples(kind: CueKind, sample_rate: u32) -> Vec<f32> {
+    synthesize_cue_stereo(kind, sample_rate)
+        .into_iter()
+        .map(|[l, r]| 0.5 * (l + r))
+        .collect()
 }
 
 fn play_cue_blocking(kind: CueKind, monitor_device: Option<&str>) -> anyhow::Result<()> {
@@ -176,8 +441,8 @@ fn play_cue_blocking(kind: CueKind, monitor_device: Option<&str>) -> anyhow::Res
     let sr = cfg.sample_rate.0;
     let ch = cfg.channels as usize;
 
-    let samples = Arc::new(synthesize_cue_samples(kind, sr));
-    let expected_ms = ((samples.len() as u64) * 1000 / (sr.max(8_000) as u64)).max(120);
+    let frames = Arc::new(synthesize_cue_stereo(kind, sr));
+    let expected_ms = ((frames.len() as u64) * 1000 / (sr.max(8_000) as u64)).max(250);
     let cursor = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
 
@@ -186,18 +451,18 @@ fn play_cue_blocking(kind: CueKind, monitor_device: Option<&str>) -> anyhow::Res
         &cfg,
         fmt,
         ch,
-        Arc::clone(&samples),
+        Arc::clone(&frames),
         Arc::clone(&cursor),
         Arc::clone(&done),
     )?;
     stream.play()?;
 
-    let deadline = Instant::now() + Duration::from_millis(expected_ms + 140);
+    let deadline = Instant::now() + Duration::from_millis(expected_ms + 220);
     while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(12));
     }
-    // Brief drain wait so the final hardware buffer plays out cleanly
-    thread::sleep(Duration::from_millis(25));
+    // Drain wait so WASAPI / USB / wireless output buffers finish playing the reverb tail cleanly
+    thread::sleep(Duration::from_millis(80));
     drop(stream);
     Ok(())
 }
@@ -207,17 +472,29 @@ fn build_cue_stream(
     config: &StreamConfig,
     format: SampleFormat,
     channels: usize,
-    samples: Arc<Vec<f32>>,
+    frames_buf: Arc<Vec<[f32; 2]>>,
     cursor: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
 ) -> anyhow::Result<Stream> {
     match format {
-        SampleFormat::F32 => build_cue_typed::<f32>(device, config, channels, samples, cursor, done),
-        SampleFormat::F64 => build_cue_typed::<f64>(device, config, channels, samples, cursor, done),
-        SampleFormat::I16 => build_cue_typed::<i16>(device, config, channels, samples, cursor, done),
-        SampleFormat::U16 => build_cue_typed::<u16>(device, config, channels, samples, cursor, done),
-        SampleFormat::I32 => build_cue_typed::<i32>(device, config, channels, samples, cursor, done),
-        SampleFormat::U32 => build_cue_typed::<u32>(device, config, channels, samples, cursor, done),
+        SampleFormat::F32 => {
+            build_cue_typed::<f32>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::F64 => {
+            build_cue_typed::<f64>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::I16 => {
+            build_cue_typed::<i16>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::U16 => {
+            build_cue_typed::<u16>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::I32 => {
+            build_cue_typed::<i32>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::U32 => {
+            build_cue_typed::<u32>(device, config, channels, frames_buf, cursor, done)
+        }
         other => Err(anyhow::anyhow!("Unsupported cue output format: {:?}", other)),
     }
 }
@@ -226,7 +503,7 @@ fn build_cue_typed<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     channels: usize,
-    samples: Arc<Vec<f32>>,
+    frames_buf: Arc<Vec<[f32; 2]>>,
     cursor: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
 ) -> anyhow::Result<Stream>
@@ -238,22 +515,27 @@ where
         config,
         move |data: &mut [T], _| {
             let zero = T::from_sample(0.0);
-            let frames = data.len() / ch;
-            let len = samples.len();
+            let out_frames = data.len() / ch;
+            let len = frames_buf.len();
             let mut idx = cursor.load(Ordering::Relaxed);
 
-            for f in 0..frames {
-                let val = if idx < len {
-                    let s = samples[idx];
+            for f in 0..out_frames {
+                let [l, r] = if idx < len {
+                    let s = frames_buf[idx];
                     idx += 1;
                     s
                 } else {
-                    0.0
+                    [0.0, 0.0]
                 };
-                let converted = T::from_sample(val);
                 let base = f * ch;
-                for c in 0..ch {
-                    data[base + c] = if c < 2 { converted } else { zero };
+                if ch == 1 {
+                    data[base] = T::from_sample(0.5 * (l + r));
+                } else {
+                    data[base] = T::from_sample(l);
+                    data[base + 1] = T::from_sample(r);
+                    for c in 2..ch {
+                        data[base + c] = zero;
+                    }
                 }
             }
 
@@ -280,30 +562,41 @@ mod tests {
             CueKind::MuteOn,
             CueKind::MuteOff,
         ] {
-            let buf = synthesize_cue_samples(kind, 48_000);
+            let stereo = synthesize_cue_stereo(kind, 48_000);
             assert!(
-                buf.len() > 6_000 && buf.len() < 16_000,
-                "Cue {:?} duration out of expected subtle range: {} samples",
+                stereo.len() > 18_000 && stereo.len() < 26_000,
+                "Cue {:?} duration out of expected range: {} frames",
                 kind,
-                buf.len()
+                stereo.len()
             );
             let mut peak = 0.0f32;
-            for &s in &buf {
-                assert!(s.is_finite(), "Cue sample must be finite");
-                peak = peak.max(s.abs());
+            let mut stereo_diff = 0.0f32;
+            for &[l, r] in &stereo {
+                assert!(l.is_finite() && r.is_finite(), "Cue sample must be finite");
+                peak = peak.max(l.abs()).max(r.abs());
+                stereo_diff = stereo_diff.max((l - r).abs());
             }
             assert!(
-                peak > 0.05 && peak < 0.20,
-                "Cue {:?} peak should be audible yet subtle (0.05..0.20), got {}",
+                peak > 0.08 && peak < 0.35,
+                "Cue {:?} peak should be audible yet subtle (0.08..0.35), got {}",
                 kind,
                 peak
             );
-            assert_eq!(buf[0], 0.0, "Cue should start cleanly at zero");
+            assert!(
+                stereo_diff > 0.005,
+                "Cue {:?} should exhibit subtle stereo spatialization, max |L-R|={}",
+                kind,
+                stereo_diff
+            );
+            assert_eq!(stereo[0], [0.0, 0.0], "Cue should start cleanly at zero");
             assert_eq!(
-                *buf.last().unwrap(),
-                0.0,
+                *stereo.last().unwrap(),
+                [0.0, 0.0],
                 "Cue should end with trailing silence"
             );
+
+            let mono = synthesize_cue_samples(kind, 48_000);
+            assert_eq!(mono.len(), stereo.len());
         }
     }
 }

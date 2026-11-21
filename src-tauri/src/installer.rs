@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-#[cfg(target_os = "windows")]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -24,17 +23,36 @@ pub struct InstallDriverResult {
     pub message: String,
 }
 
-pub fn install_virtual_audio_driver() -> Result<InstallDriverResult> {
+/// Checks whether a prebuilt Universal `ShizukaAudio.driver` bundle is present inside `resource_dir`.
+pub fn find_bundled_macos_driver(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    let base = resource_dir?;
+    let candidates = [
+        base.join("ShizukaAudio.driver"),
+        base.join("resources").join("ShizukaAudio.driver"),
+    ];
+    for candidate in candidates {
+        let bin = candidate.join("Contents").join("MacOS").join("ShizukaAudio");
+        let plist = candidate.join("Contents").join("Info.plist");
+        if bin.is_file() && plist.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn install_virtual_audio_driver(resource_dir: Option<PathBuf>) -> Result<InstallDriverResult> {
     #[cfg(target_os = "windows")]
     {
+        let _ = resource_dir;
         install_windows_vbcable_from_official()
     }
     #[cfg(target_os = "macos")]
     {
-        install_macos_mit_hal_driver()
+        install_macos_mit_hal_driver(resource_dir.as_deref())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
+        let _ = resource_dir;
         Err(anyhow!(
             "自動セットアップは Windows および macOS のみ対応しています。"
         ))
@@ -250,62 +268,82 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_macos_mit_hal_driver() -> Result<InstallDriverResult> {
-    const DRIVER_C_SRC: &str = include_str!("../../drivers/macos-hal/ShizukaAudio.c");
-    const DRIVER_PLIST: &str = include_str!("../../drivers/macos-hal/Info.plist");
-
-    let work_dir = std::env::temp_dir().join("shizuka-hal-build");
+fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDriverResult> {
+    let work_dir = std::env::temp_dir().join("shizuka-hal-install");
     let _ = fs::remove_dir_all(&work_dir);
+    fs::create_dir_all(&work_dir).context("一時作業フォルダの作成に失敗しました")?;
     let bundle_dir = work_dir.join("ShizukaAudio.driver");
-    let macos_bin_dir = bundle_dir.join("Contents").join("MacOS");
-    fs::create_dir_all(&macos_bin_dir)?;
 
-    let c_path = work_dir.join("ShizukaAudio.c");
-    let plist_path = bundle_dir.join("Contents").join("Info.plist");
-    let bin_path = macos_bin_dir.join("ShizukaAudio");
+    if let Some(prebuilt) = find_bundled_macos_driver(resource_dir) {
+        // Preferred path: use prebuilt Universal (arm64 + x86_64) driver bundled in .app Resources (no Xcode CLT required)
+        let copy_out = Command::new("cp")
+            .args([
+                "-R",
+                prebuilt.to_str().unwrap_or_default(),
+                bundle_dir.to_str().unwrap_or_default(),
+            ])
+            .output()
+            .context("同梱ドライバの一時コピーに失敗しました")?;
+        if !copy_out.status.success() {
+            let stderr = String::from_utf8_lossy(&copy_out.stderr);
+            let _ = fs::remove_dir_all(&work_dir);
+            return Err(anyhow!("同梱ドライバの展開に失敗しました: {}", stderr));
+        }
+    } else {
+        // Fallback path for local `tauri dev` without prebuilt driver resource: compile from bundled MIT source
+        const DRIVER_C_SRC: &str = include_str!("../../drivers/macos-hal/ShizukaAudio.c");
+        const DRIVER_PLIST: &str = include_str!("../../drivers/macos-hal/Info.plist");
 
-    fs::write(&c_path, DRIVER_C_SRC)?;
-    fs::write(&plist_path, DRIVER_PLIST)?;
+        let macos_bin_dir = bundle_dir.join("Contents").join("MacOS");
+        fs::create_dir_all(&macos_bin_dir)?;
 
-    let compile = Command::new("clang")
-        .args([
-            "-O3",
-            "-bundle",
-            "-arch",
-            "arm64",
-            "-arch",
-            "x86_64",
-            "-mmacosx-version-min=12.0",
-            "-framework",
-            "CoreAudio",
-            "-framework",
-            "CoreFoundation",
-            c_path.to_str().unwrap_or_default(),
-            "-o",
-            bin_path.to_str().unwrap_or_default(),
-        ])
-        .output()
-        .context("clang の起動に失敗しました（Xcode Command Line Tools が必要です: xcode-select --install）")?;
+        let c_path = work_dir.join("ShizukaAudio.c");
+        let plist_path = bundle_dir.join("Contents").join("Info.plist");
+        let bin_path = macos_bin_dir.join("ShizukaAudio");
 
-    if !compile.status.success() {
-        let stderr = String::from_utf8_lossy(&compile.stderr);
-        let _ = fs::remove_dir_all(&work_dir);
-        return Err(anyhow!("MIT 仮想オーディオドライバのビルドに失敗しました: {}", stderr));
+        fs::write(&c_path, DRIVER_C_SRC)?;
+        fs::write(&plist_path, DRIVER_PLIST)?;
+
+        let compile = Command::new("clang")
+            .args([
+                "-O3",
+                "-bundle",
+                "-arch",
+                "arm64",
+                "-arch",
+                "x86_64",
+                "-mmacosx-version-min=12.0",
+                "-framework",
+                "CoreAudio",
+                "-framework",
+                "CoreFoundation",
+                c_path.to_str().unwrap_or_default(),
+                "-o",
+                bin_path.to_str().unwrap_or_default(),
+            ])
+            .output()
+            .context("clang の起動に失敗しました（Xcode Command Line Tools が必要です: xcode-select --install）")?;
+
+        if !compile.status.success() {
+            let stderr = String::from_utf8_lossy(&compile.stderr);
+            let _ = fs::remove_dir_all(&work_dir);
+            return Err(anyhow!("MIT 仮想オーディオドライバのビルドに失敗しました: {}", stderr));
+        }
+
+        let _ = Command::new("codesign")
+            .args([
+                "--force",
+                "--deep",
+                "--sign",
+                "-",
+                bundle_dir.to_str().unwrap_or_default(),
+            ])
+            .output();
     }
-
-    let _ = Command::new("codesign")
-        .args([
-            "--force",
-            "--deep",
-            "--sign",
-            "-",
-            bundle_dir.to_str().unwrap_or_default(),
-        ])
-        .output();
 
     let bundle_escaped = bundle_dir.to_string_lossy().replace('\'', "'\\''");
     let osa_cmd = format!(
-        "do shell script \"rm -rf '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && cp -R '{}' '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && launchctl kickstart -kp system/com.apple.audio.coreaudiod\" with administrator privileges",
+        "do shell script \"rm -rf '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && cp -R '{}' '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && (xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' 2>/dev/null || true) && chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && launchctl kickstart -kp system/com.apple.audio.coreaudiod\" with administrator privileges",
         bundle_escaped
     );
 
@@ -341,4 +379,34 @@ fn install_macos_mit_hal_driver() -> Result<InstallDriverResult> {
         reboot_recommended: false,
         message: "Shizuka Virtual Mic をインストールしました。右上の更新ボタンを押してデバイスを再読み込みしてください。".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_bundled_macos_driver() {
+        let dir = std::env::temp_dir().join(format!("shizuka-hal-res-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(find_bundled_macos_driver(None).is_none());
+        assert!(find_bundled_macos_driver(Some(&dir)).is_none());
+
+        let drv = dir.join("ShizukaAudio.driver");
+        fs::create_dir_all(drv.join("Contents").join("MacOS")).unwrap();
+        fs::write(drv.join("Contents").join("Info.plist"), "<plist/>").unwrap();
+        // Missing executable binary should still return None
+        assert!(find_bundled_macos_driver(Some(&dir)).is_none());
+
+        fs::write(
+            drv.join("Contents").join("MacOS").join("ShizukaAudio"),
+            b"stub-macho",
+        )
+        .unwrap();
+        assert_eq!(find_bundled_macos_driver(Some(&dir)), Some(drv));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

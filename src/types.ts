@@ -94,3 +94,20 @@ export interface InstallDriverResult {
   reboot_recommended: boolean;
   message: string;
 }
+
+export interface UpdateCheckResult {
+  current_version: string;
+  available: boolean;
+  latest_version: string | null;
+  date: string | null;
+  notes: string | null;
+  is_portable: boolean;
+  releases_url: string;
+}
+
+export interface UpdateProgressSnapshot {
+  phase: "idle" | "downloading" | "installing" | "error";
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  error: string | null;
+}
