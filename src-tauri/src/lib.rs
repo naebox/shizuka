@@ -9,6 +9,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, State, WindowEvent,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 
 use audio::devices::{list_audio_devices, DeviceListResponse};
 use audio::engine::{AudioEngineHandle, AudioTelemetry};
@@ -254,19 +255,134 @@ fn set_window_theme(window: tauri::WebviewWindow, theme: Option<String>) -> Resu
 }
 
 #[tauri::command]
+fn get_autostart_enabled(app: AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch
+            .enable()
+            .map_err(|e| format!("自動起動の有効化に失敗しました: {}", e))?;
+    } else {
+        autolaunch
+            .disable()
+            .map_err(|e| format!("自動起動の無効化に失敗しました: {}", e))?;
+    }
+    Ok(autolaunch.is_enabled().unwrap_or(enabled))
+}
+
+#[tauri::command]
+fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
+    let version = app.package_info().version.to_string();
+    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+    let telem = state.engine.shared.snapshot();
+    let cfg = state.config.lock().map(|g| g.clone()).unwrap_or_default();
+    let devs = list_audio_devices();
+
+    let mut out = String::new();
+    out.push_str(&format!("Shizuka Diagnostics (v{})\n", version));
+    out.push_str(&format!(
+        "Platform: {} / {}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    out.push_str(&format!("Autostart: {}\n", autostart));
+    out.push_str(&format!(
+        "Connection State: {:?} (running={}, virtual_out={}, monitor={})\n",
+        telem.status.connection_state,
+        telem.stream_running,
+        telem.virtual_out_connected,
+        telem.live_monitor_enabled
+    ));
+    out.push_str(&format!(
+        "Active Input: {:?} ({} Hz)\n",
+        telem.status.active_input_name, telem.status.input_sample_rate
+    ));
+    out.push_str(&format!(
+        "Active Virtual Output: {:?} ({} Hz)\n",
+        telem.status.active_output_name, telem.status.output_sample_rate
+    ));
+    out.push_str(&format!(
+        "Active Monitor: {:?}\n",
+        telem.status.active_monitor_name
+    ));
+    if let Some(ref waiting) = telem.status.waiting_device_name {
+        out.push_str(&format!("Waiting Device: {}\n", waiting));
+    }
+    out.push_str(&format!(
+        "Configured: in={:?}, out={:?}, mon={:?}\n",
+        cfg.input_device, cfg.output_device, cfg.monitor_device
+    ));
+    out.push_str(&format!(
+        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, vad={} ({} dB)\n",
+        telem.nc_enabled,
+        telem.model_variant,
+        cfg.atten_lim_db,
+        cfg.input_gain_db,
+        cfg.vad_gate_enabled,
+        cfg.vad_threshold_db
+    ));
+    out.push_str(&format!(
+        "Metrics: cpu={:.1}%, latency={:.1} ms, drift={:+.1} ppm, reconnects={}, drops={}, underruns={}\n",
+        telem.cpu_load_pct,
+        telem.latency_ms,
+        telem.drift_ppm,
+        telem.status.reconnect_count,
+        telem.status.input_drop_count,
+        telem.status.output_underrun_count
+    ));
+    if let Some(ref err) = telem.status.last_error {
+        out.push_str(&format!("Last Error: {}\n", err));
+    }
+    out.push_str("Detected Inputs:\n");
+    for d in &devs.inputs {
+        out.push_str(&format!(
+            "  - {} ({} Hz, {} ch{}{})\n",
+            d.name,
+            d.sample_rate,
+            d.channels,
+            if d.is_default { ", default" } else { "" },
+            if d.is_virtual_cable { ", virtual" } else { "" }
+        ));
+    }
+    out.push_str("Detected Outputs:\n");
+    for d in &devs.outputs {
+        out.push_str(&format!(
+            "  - {} ({} Hz, {} ch{}{})\n",
+            d.name,
+            d.sample_rate,
+            d.channels,
+            if d.is_default { ", default" } else { "" },
+            if d.is_virtual_cable { ", virtual" } else { "" }
+        ));
+    }
+    out
+}
+
+#[tauri::command]
 fn quit_app(app: AppHandle, state: State<'_, AppState>) {
     state.engine.stop();
     app.exit(0);
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
 fn toggle_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        let visible = win.is_visible().unwrap_or(false);
-        if visible {
-            let _ = win.show();
-            let _ = win.set_focus();
+        if win.is_visible().unwrap_or(false) {
+            let _ = win.hide();
         } else {
             let _ = win.show();
+            let _ = win.unminimize();
             let _ = win.set_focus();
         }
     }
@@ -274,16 +390,26 @@ fn toggle_main_window(app: &AppHandle) {
 
 pub fn run() {
     let _ = env_logger::try_init();
-    let initial_cfg = AppConfig::load();
-    let engine = AudioEngineHandle::spawn(&initial_cfg);
-    let init_nc = initial_cfg.nc_enabled;
 
     tauri::Builder::default()
-        .manage(AppState {
-            engine,
-            config: Mutex::new(initial_cfg),
-        })
+        // Register single-instance FIRST so duplicate launches focus the running window and exit
+        // before spawning any audio engine or loading DeepFilterNet3.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .setup(move |app| {
+            let initial_cfg = AppConfig::load();
+            let init_nc = initial_cfg.nc_enabled;
+            let engine = AudioEngineHandle::spawn(&initial_cfg);
+            app.manage(AppState {
+                engine,
+                config: Mutex::new(initial_cfg),
+            });
+
             let show_item =
                 MenuItem::with_id(app, "show", "Shizuka を開く", true, None::<&str>)?;
             let toggle_item = MenuItem::with_id(
@@ -316,7 +442,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app_handle, event| match event.id.as_ref() {
                     "show" => {
-                        toggle_main_window(app_handle);
+                        show_main_window(app_handle);
                     }
                     "toggle_nc" => {
                         let st = app_handle.state::<AppState>();
@@ -352,10 +478,15 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            let start_minimized = std::env::args().any(|arg| arg == "--minimized");
+            if !start_minimized {
+                show_main_window(app.handle());
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Keep running in system tray when window close [X] button is clicked (Krisp behavior)
+            // Keep running in system tray when window close [X] button is clicked
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
@@ -375,6 +506,9 @@ pub fn run() {
             set_monitor_volume,
             install_virtual_driver,
             set_window_theme,
+            get_autostart_enabled,
+            set_autostart_enabled,
+            get_diagnostics_text,
             quit_app,
         ])
         .run(tauri::generate_context!())

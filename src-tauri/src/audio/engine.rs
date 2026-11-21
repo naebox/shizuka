@@ -6,12 +6,14 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use ringbuf::{traits::*, HeapRb};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio::devices::{find_input_device, find_output_device, list_audio_devices};
+use crate::audio::devices::{
+    default_physical_input_name, find_input_device, find_output_device, list_audio_devices,
+};
 use crate::audio::processor::{soft_limit, NoiseProcessor, DFN_HOP_SIZE, DFN_SAMPLE_RATE};
 use crate::audio::resampler::{AdaptiveOutputResampler, DriftController, InputResampler48k};
 use crate::config::{AppConfig, ModelVariant};
@@ -26,13 +28,28 @@ fn load_f32(atom: &AtomicU32) -> f32 {
     f32::from_bits(atom.load(Ordering::Relaxed))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    Running,
+    WaitingDevice,
+    Reconnecting,
+    #[default]
+    Stopped,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineDeviceStatus {
+    pub connection_state: ConnectionState,
+    pub waiting_device_name: Option<String>,
     pub active_input_name: Option<String>,
     pub active_output_name: Option<String>,
     pub active_monitor_name: Option<String>,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
+    pub reconnect_count: u32,
+    pub input_drop_count: u64,
+    pub output_underrun_count: u64,
     pub last_error: Option<String>,
 }
 
@@ -82,6 +99,11 @@ pub struct SharedAudioState {
     pub latency_ms_bits: AtomicU32,
     pub process_time_us: AtomicU32,
 
+    pub input_callback_frames: AtomicU64,
+    pub input_drop_count: AtomicU64,
+    pub output_underrun_count: AtomicU64,
+    pub reconnect_count: AtomicU32,
+
     pub status: Mutex<EngineDeviceStatus>,
 }
 
@@ -125,6 +147,11 @@ impl SharedAudioState {
             latency_ms_bits: AtomicU32::new(0.0f32.to_bits()),
             process_time_us: AtomicU32::new(0),
 
+            input_callback_frames: AtomicU64::new(0),
+            input_drop_count: AtomicU64::new(0),
+            output_underrun_count: AtomicU64::new(0),
+            reconnect_count: AtomicU32::new(0),
+
             status: Mutex::new(EngineDeviceStatus::default()),
         }
     }
@@ -140,11 +167,14 @@ impl SharedAudioState {
         let proc_us = self.process_time_us.load(Ordering::Relaxed) as f32;
         // 10ms = 10,000 us budget per frame
         let cpu_load_pct = (proc_us / 10_000.0 * 100.0).clamp(0.0, 100.0);
-        let status = self
+        let mut status = self
             .status
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        status.reconnect_count = self.reconnect_count.load(Ordering::Relaxed);
+        status.input_drop_count = self.input_drop_count.load(Ordering::Relaxed);
+        status.output_underrun_count = self.output_underrun_count.load(Ordering::Relaxed);
 
         AudioTelemetry {
             stream_running: self.stream_running.load(Ordering::Relaxed),
@@ -169,7 +199,19 @@ impl SharedAudioState {
     }
 }
 
-pub enum EngineCommand {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Input,
+    VirtualOutput,
+    Monitor,
+}
+
+enum PipelineStartError {
+    WaitingForDevice(Option<String>),
+    Other(anyhow::Error),
+}
+
+enum EngineCommand {
     StartOrRestart {
         input_device: Option<String>,
         output_device: Option<String>,
@@ -180,6 +222,11 @@ pub enum EngineCommand {
     SetLiveMonitor {
         enabled: bool,
         monitor_device: Option<String>,
+    },
+    StreamError {
+        generation: u64,
+        kind: StreamKind,
+        message: String,
     },
 }
 
@@ -200,6 +247,7 @@ struct RunningPipeline {
     stop_flag: Arc<AtomicBool>,
     worker_join: Option<JoinHandle<()>>,
     mon_tx: mpsc::Sender<Option<MonitorSink>>,
+    active_input_name: String,
     _input_stream: Stream,
     _virtual_output_stream: Option<Stream>,
 }
@@ -226,11 +274,12 @@ impl AudioEngineHandle {
 
         let shared_ctrl = Arc::clone(&shared);
         let init_cfg = initial_cfg.clone();
+        let ctrl_tx = cmd_tx.clone();
 
         thread::Builder::new()
             .name("shizuka-audio-ctrl".into())
             .spawn(move || {
-                audio_control_loop(cmd_rx, shared_ctrl, init_cfg);
+                audio_control_loop(cmd_rx, ctrl_tx, shared_ctrl, init_cfg);
             })
             .expect("Failed to spawn audio controller thread");
 
@@ -297,18 +346,80 @@ impl AudioEngineHandle {
     }
 }
 
+#[derive(Clone)]
+struct StreamErrorNotifier {
+    tx: mpsc::Sender<EngineCommand>,
+    generation: u64,
+    kind: StreamKind,
+    sent: Arc<AtomicBool>,
+}
+
+impl StreamErrorNotifier {
+    fn new(tx: mpsc::Sender<EngineCommand>, generation: u64, kind: StreamKind) -> Self {
+        Self {
+            tx,
+            generation,
+            kind,
+            sent: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn notify(&self, err: cpal::StreamError) {
+        log::error!(
+            "Audio {:?} stream error (gen {}): {}",
+            self.kind,
+            self.generation,
+            err
+        );
+        if !self.sent.swap(true, Ordering::Relaxed) {
+            let _ = self.tx.send(EngineCommand::StreamError {
+                generation: self.generation,
+                kind: self.kind,
+                message: err.to_string(),
+            });
+        }
+    }
+}
+
+fn reconnect_backoff_duration(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(600),
+        1 => Duration::from_millis(1200),
+        2 => Duration::from_millis(2000),
+        _ => Duration::from_millis(3000),
+    }
+}
+
+fn reset_audio_meters(shared: &SharedAudioState) {
+    store_f32(&shared.input_rms_db_bits, -90.0);
+    store_f32(&shared.output_rms_db_bits, -90.0);
+    store_f32(&shared.monitor_rms_db_bits, -90.0);
+    shared.vad_speaking.store(false, Ordering::Relaxed);
+}
+
 fn audio_control_loop(
     cmd_rx: mpsc::Receiver<EngineCommand>,
+    cmd_tx: mpsc::Sender<EngineCommand>,
     shared: Arc<SharedAudioState>,
     init_cfg: AppConfig,
 ) {
     let mut main_pipe: Option<RunningPipeline> = None;
     let mut live_mon_pipe: Option<MonitorPipeline> = None;
 
-    // Create lock-free ringbuffer dedicated to live monitor output (48kHz mono)
     let mut cur_in_dev = init_cfg.input_device.clone();
     let mut cur_out_dev = init_cfg.output_device.clone();
     let mut cur_mon_dev = init_cfg.monitor_device.clone();
+    let mut want_running = init_cfg.stream_active;
+    let mut want_mon = false;
+
+    let mut main_gen: u64 = 0;
+    let mut mon_gen: u64 = 0;
+    let mut retry_attempt: u32 = 0;
+    let mut next_retry_at: Option<Instant> = None;
+    let mut pipe_started_at = Instant::now();
+    let mut last_seen_frames: u64 = 0;
+    let mut stall_ticks: u32 = 0;
+    let mut watchdog_ticks: u32 = 0;
 
     // Auto-select recommended virtual cable on first run if none configured
     if cur_out_dev.is_none() {
@@ -320,9 +431,11 @@ fn audio_control_loop(
 
     let apply_live_monitor = |enabled: bool,
                               mon_name: Option<String>,
+                              mon_gen: &mut u64,
                               main_pipe: &mut Option<RunningPipeline>,
-                              live_mon_pipe: &mut Option<MonitorPipeline>| {
+                              live_mon_pipe: &mut Option<MonitorPipeline>| -> bool {
         // Detach previous monitor stream cleanly before opening a new one
+        *mon_gen = mon_gen.wrapping_add(1);
         if let Some(pipe) = main_pipe.as_ref() {
             let _ = pipe.mon_tx.send(None);
         }
@@ -333,19 +446,28 @@ fn audio_control_loop(
             if let Ok(mut st) = shared.status.lock() {
                 st.active_monitor_name = None;
             }
-            return;
+            return false;
         }
 
         if let Some(pipe) = main_pipe.as_ref() {
-            match build_live_monitor_stream(mon_name.as_deref()) {
+            let notifier =
+                StreamErrorNotifier::new(cmd_tx.clone(), *mon_gen, StreamKind::Monitor);
+            match build_live_monitor_stream(mon_name.as_deref(), notifier) {
                 Ok((mon_pipe, sink, actual_mon_name)) => {
                     let _ = pipe.mon_tx.send(Some(sink));
                     *live_mon_pipe = Some(mon_pipe);
                     shared.live_monitor_enabled.store(true, Ordering::Relaxed);
                     if let Ok(mut st) = shared.status.lock() {
                         st.active_monitor_name = Some(actual_mon_name);
-                        st.last_error = None;
+                        if st
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("再生デバイス") || e.contains("マイクテスト"))
+                        {
+                            st.last_error = None;
+                        }
                     }
+                    true
                 }
                 Err(e) => {
                     shared.live_monitor_enabled.store(false, Ordering::Relaxed);
@@ -353,115 +475,408 @@ fn audio_control_loop(
                         st.active_monitor_name = None;
                         st.last_error = Some(format!("{:#}", e));
                     }
+                    false
                 }
             }
         } else {
             shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+            false
         }
     };
 
     let start_main = |in_name: Option<String>,
                       out_name: Option<String>,
                       mon_name: Option<String>,
+                      want_mon: &mut bool,
+                      main_gen: &mut u64,
+                      mon_gen: &mut u64,
+                      retry_attempt: &mut u32,
+                      next_retry_at: &mut Option<Instant>,
+                      pipe_started_at: &mut Instant,
+                      last_seen_frames: &mut u64,
+                      stall_ticks: &mut u32,
                       main_pipe: &mut Option<RunningPipeline>,
                       live_mon_pipe: &mut Option<MonitorPipeline>| {
-        let keep_mon = shared.live_monitor_enabled.load(Ordering::Relaxed);
+        *main_gen = main_gen.wrapping_add(1);
+        let current_gen = *main_gen;
         if let Some(old) = main_pipe.take() {
             old.stop();
         }
         let _ = live_mon_pipe.take();
 
-        match build_main_pipeline(&shared, in_name.as_deref(), out_name.as_deref()) {
+        match build_main_pipeline(
+            &shared,
+            &cmd_tx,
+            current_gen,
+            in_name.as_deref(),
+            out_name.as_deref(),
+        ) {
             Ok(pipe) => {
                 *main_pipe = Some(pipe);
-                if keep_mon {
-                    apply_live_monitor(true, mon_name, main_pipe, live_mon_pipe);
+                *retry_attempt = 0;
+                *next_retry_at = None;
+                *pipe_started_at = Instant::now();
+                *last_seen_frames = shared.input_callback_frames.load(Ordering::Relaxed);
+                *stall_ticks = 0;
+                if *want_mon {
+                    *want_mon = apply_live_monitor(true, mon_name, mon_gen, main_pipe, live_mon_pipe);
                 }
             }
-            Err(e) => {
+            Err(PipelineStartError::WaitingForDevice(missing_name)) => {
                 shared.stream_running.store(false, Ordering::Relaxed);
                 shared.virtual_out_connected.store(false, Ordering::Relaxed);
                 shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                reset_audio_meters(&shared);
                 if let Ok(mut st) = shared.status.lock() {
+                    st.connection_state = ConnectionState::WaitingDevice;
+                    st.waiting_device_name = missing_name;
+                    st.active_input_name = None;
+                    st.active_output_name = None;
+                    st.active_monitor_name = None;
+                    st.last_error = None;
+                }
+                *next_retry_at = Some(Instant::now() + reconnect_backoff_duration(*retry_attempt));
+                *retry_attempt = retry_attempt.saturating_add(1);
+            }
+            Err(PipelineStartError::Other(e)) => {
+                shared.stream_running.store(false, Ordering::Relaxed);
+                shared.virtual_out_connected.store(false, Ordering::Relaxed);
+                shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                reset_audio_meters(&shared);
+                if let Ok(mut st) = shared.status.lock() {
+                    st.connection_state = ConnectionState::Reconnecting;
+                    st.waiting_device_name = in_name;
                     st.active_monitor_name = None;
                     st.last_error = Some(format!("{:#}", e));
                 }
+                *next_retry_at = Some(Instant::now() + reconnect_backoff_duration(*retry_attempt));
+                *retry_attempt = retry_attempt.saturating_add(1);
             }
         }
     };
 
-    if init_cfg.stream_active {
+    if want_running {
         start_main(
             cur_in_dev.clone(),
             cur_out_dev.clone(),
             cur_mon_dev.clone(),
+            &mut want_mon,
+            &mut main_gen,
+            &mut mon_gen,
+            &mut retry_attempt,
+            &mut next_retry_at,
+            &mut pipe_started_at,
+            &mut last_seen_frames,
+            &mut stall_ticks,
             &mut main_pipe,
             &mut live_mon_pipe,
         );
+    } else if let Ok(mut st) = shared.status.lock() {
+        st.connection_state = ConnectionState::Stopped;
     }
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            EngineCommand::StartOrRestart {
-                input_device,
-                output_device,
-                monitor_device,
-            } => {
-                cur_in_dev = input_device;
-                cur_out_dev = output_device;
-                cur_mon_dev = monitor_device;
-                start_main(
-                    cur_in_dev.clone(),
-                    cur_out_dev.clone(),
-                    cur_mon_dev.clone(),
-                    &mut main_pipe,
-                    &mut live_mon_pipe,
-                );
-            }
-            EngineCommand::SetModelVariant(variant) => {
-                let prev = u8_to_variant(shared.model_variant_u8.load(Ordering::Relaxed));
-                shared
-                    .model_variant_u8
-                    .store(variant_to_u8(variant), Ordering::SeqCst);
-                if main_pipe.is_some() && prev != variant {
+    loop {
+        match cmd_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(cmd) => match cmd {
+                EngineCommand::StartOrRestart {
+                    input_device,
+                    output_device,
+                    monitor_device,
+                } => {
+                    cur_in_dev = input_device;
+                    cur_out_dev = output_device;
+                    cur_mon_dev = monitor_device;
+                    want_running = true;
+                    retry_attempt = 0;
                     start_main(
                         cur_in_dev.clone(),
                         cur_out_dev.clone(),
                         cur_mon_dev.clone(),
+                        &mut want_mon,
+                        &mut main_gen,
+                        &mut mon_gen,
+                        &mut retry_attempt,
+                        &mut next_retry_at,
+                        &mut pipe_started_at,
+                        &mut last_seen_frames,
+                        &mut stall_ticks,
                         &mut main_pipe,
                         &mut live_mon_pipe,
                     );
                 }
+                EngineCommand::SetModelVariant(variant) => {
+                    let prev = u8_to_variant(shared.model_variant_u8.load(Ordering::Relaxed));
+                    shared
+                        .model_variant_u8
+                        .store(variant_to_u8(variant), Ordering::SeqCst);
+                    if main_pipe.is_some() && prev != variant {
+                        start_main(
+                            cur_in_dev.clone(),
+                            cur_out_dev.clone(),
+                            cur_mon_dev.clone(),
+                            &mut want_mon,
+                            &mut main_gen,
+                            &mut mon_gen,
+                            &mut retry_attempt,
+                            &mut next_retry_at,
+                            &mut pipe_started_at,
+                            &mut last_seen_frames,
+                            &mut stall_ticks,
+                            &mut main_pipe,
+                            &mut live_mon_pipe,
+                        );
+                    }
+                }
+                EngineCommand::Stop => {
+                    want_running = false;
+                    want_mon = false;
+                    main_gen = main_gen.wrapping_add(1);
+                    mon_gen = mon_gen.wrapping_add(1);
+                    next_retry_at = None;
+                    retry_attempt = 0;
+                    if let Some(old) = main_pipe.take() {
+                        old.stop();
+                    }
+                    let _ = live_mon_pipe.take();
+                    shared.stream_running.store(false, Ordering::Relaxed);
+                    shared.virtual_out_connected.store(false, Ordering::Relaxed);
+                    shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                    reset_audio_meters(&shared);
+                    if let Ok(mut st) = shared.status.lock() {
+                        st.connection_state = ConnectionState::Stopped;
+                        st.waiting_device_name = None;
+                        st.active_monitor_name = None;
+                    }
+                }
+                EngineCommand::SetLiveMonitor {
+                    enabled,
+                    monitor_device,
+                } => {
+                    cur_mon_dev = monitor_device;
+                    want_mon = enabled;
+                    if enabled && main_pipe.is_none() {
+                        want_running = true;
+                        retry_attempt = 0;
+                        start_main(
+                            cur_in_dev.clone(),
+                            cur_out_dev.clone(),
+                            cur_mon_dev.clone(),
+                            &mut want_mon,
+                            &mut main_gen,
+                            &mut mon_gen,
+                            &mut retry_attempt,
+                            &mut next_retry_at,
+                            &mut pipe_started_at,
+                            &mut last_seen_frames,
+                            &mut stall_ticks,
+                            &mut main_pipe,
+                            &mut live_mon_pipe,
+                        );
+                    } else {
+                        want_mon = apply_live_monitor(
+                            enabled,
+                            cur_mon_dev.clone(),
+                            &mut mon_gen,
+                            &mut main_pipe,
+                            &mut live_mon_pipe,
+                        );
+                    }
+                }
+                EngineCommand::StreamError {
+                    generation,
+                    kind,
+                    message,
+                } => match kind {
+                    StreamKind::Monitor => {
+                        if generation == mon_gen && want_mon {
+                            log::warn!(
+                                "Live monitor stream interrupted ({}); attempting immediate reopen",
+                                message
+                            );
+                            want_mon = apply_live_monitor(
+                                true,
+                                cur_mon_dev.clone(),
+                                &mut mon_gen,
+                                &mut main_pipe,
+                                &mut live_mon_pipe,
+                            );
+                        }
+                    }
+                    StreamKind::Input | StreamKind::VirtualOutput => {
+                        if generation == main_gen && want_running {
+                            log::warn!(
+                                "Audio {:?} stream interrupted ({}); scheduling auto-reconnect",
+                                kind,
+                                message
+                            );
+                            main_gen = main_gen.wrapping_add(1);
+                            if let Some(old) = main_pipe.take() {
+                                old.stop();
+                            }
+                            let _ = live_mon_pipe.take();
+                            shared.stream_running.store(false, Ordering::Relaxed);
+                            shared.virtual_out_connected.store(false, Ordering::Relaxed);
+                            shared.live_monitor_enabled.store(false, Ordering::Relaxed);
+                            shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                            reset_audio_meters(&shared);
+
+                            let input_missing = find_input_device(cur_in_dev.as_deref()).is_none();
+                            if let Ok(mut st) = shared.status.lock() {
+                                st.active_input_name = None;
+                                st.active_output_name = None;
+                                st.active_monitor_name = None;
+                                if input_missing {
+                                    st.connection_state = ConnectionState::WaitingDevice;
+                                    st.waiting_device_name = cur_in_dev.clone();
+                                    st.last_error = None;
+                                } else {
+                                    st.connection_state = ConnectionState::Reconnecting;
+                                    st.waiting_device_name = cur_in_dev.clone();
+                                    st.last_error = Some(format!(
+                                        "オーディオストリームを再接続しています: {}",
+                                        message
+                                    ));
+                                }
+                            }
+                            retry_attempt = 0;
+                            next_retry_at =
+                                Some(Instant::now() + reconnect_backoff_duration(retry_attempt));
+                        }
+                    }
+                },
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                watchdog_ticks = watchdog_ticks.wrapping_add(1);
+                if !want_running {
+                    continue;
+                }
+
+                if main_pipe.is_some() {
+                    // 1. Sleep/wake & silent USB stall watchdog (after 2s startup grace period)
+                    if pipe_started_at.elapsed() >= Duration::from_secs(2) {
+                        let cur_frames = shared.input_callback_frames.load(Ordering::Relaxed);
+                        if cur_frames == last_seen_frames {
+                            stall_ticks = stall_ticks.saturating_add(1);
+                            if stall_ticks >= 5 {
+                                log::warn!(
+                                    "Input audio stream stalled for 2.5s (sleep/wake or USB disconnect); reconnecting"
+                                );
+                                shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                                start_main(
+                                    cur_in_dev.clone(),
+                                    cur_out_dev.clone(),
+                                    cur_mon_dev.clone(),
+                                    &mut want_mon,
+                                    &mut main_gen,
+                                    &mut mon_gen,
+                                    &mut retry_attempt,
+                                    &mut next_retry_at,
+                                    &mut pipe_started_at,
+                                    &mut last_seen_frames,
+                                    &mut stall_ticks,
+                                    &mut main_pipe,
+                                    &mut live_mon_pipe,
+                                );
+                                continue;
+                            }
+                        } else {
+                            last_seen_frames = cur_frames;
+                            stall_ticks = 0;
+                        }
+                    }
+
+                    // 2. When set to "auto" (None), follow OS default physical microphone changes (~every 2s)
+                    if cur_in_dev.is_none() && watchdog_ticks % 4 == 0 {
+                        if let Some(os_default) = default_physical_input_name() {
+                            let changed = main_pipe
+                                .as_ref()
+                                .is_some_and(|p| p.active_input_name != os_default);
+                            if changed {
+                                log::info!(
+                                    "OS default microphone changed to '{}'; switching automatically",
+                                    os_default
+                                );
+                                shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                                start_main(
+                                    cur_in_dev.clone(),
+                                    cur_out_dev.clone(),
+                                    cur_mon_dev.clone(),
+                                    &mut want_mon,
+                                    &mut main_gen,
+                                    &mut mon_gen,
+                                    &mut retry_attempt,
+                                    &mut next_retry_at,
+                                    &mut pipe_started_at,
+                                    &mut last_seen_frames,
+                                    &mut stall_ticks,
+                                    &mut main_pipe,
+                                    &mut live_mon_pipe,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // 3. Reattach virtual output automatically if it reappears after driver install/reset (~every 3s)
+                    if cur_out_dev.is_some()
+                        && !shared.virtual_out_connected.load(Ordering::Relaxed)
+                        && watchdog_ticks % 6 == 0
+                        && find_output_device(cur_out_dev.as_deref(), false).is_some()
+                    {
+                        log::info!("Configured virtual output reappeared; reconnecting pipeline");
+                        shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                        start_main(
+                            cur_in_dev.clone(),
+                            cur_out_dev.clone(),
+                            cur_mon_dev.clone(),
+                            &mut want_mon,
+                            &mut main_gen,
+                            &mut mon_gen,
+                            &mut retry_attempt,
+                            &mut next_retry_at,
+                            &mut pipe_started_at,
+                            &mut last_seen_frames,
+                            &mut stall_ticks,
+                            &mut main_pipe,
+                            &mut live_mon_pipe,
+                        );
+                    }
+                } else if next_retry_at.is_none_or(|t| Instant::now() >= t) {
+                    // Waiting for disconnected physical microphone or transient retry
+                    if find_input_device(cur_in_dev.as_deref()).is_some() {
+                        shared.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                        start_main(
+                            cur_in_dev.clone(),
+                            cur_out_dev.clone(),
+                            cur_mon_dev.clone(),
+                            &mut want_mon,
+                            &mut main_gen,
+                            &mut mon_gen,
+                            &mut retry_attempt,
+                            &mut next_retry_at,
+                            &mut pipe_started_at,
+                            &mut last_seen_frames,
+                            &mut stall_ticks,
+                            &mut main_pipe,
+                            &mut live_mon_pipe,
+                        );
+                    } else {
+                        if let Ok(mut st) = shared.status.lock() {
+                            st.connection_state = ConnectionState::WaitingDevice;
+                            st.waiting_device_name = cur_in_dev.clone();
+                        }
+                        next_retry_at =
+                            Some(Instant::now() + reconnect_backoff_duration(retry_attempt));
+                        retry_attempt = retry_attempt.saturating_add(1);
+                    }
+                }
             }
-            EngineCommand::Stop => {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if let Some(old) = main_pipe.take() {
                     old.stop();
                 }
                 let _ = live_mon_pipe.take();
-                shared.stream_running.store(false, Ordering::Relaxed);
-                shared.virtual_out_connected.store(false, Ordering::Relaxed);
-                shared.live_monitor_enabled.store(false, Ordering::Relaxed);
-                store_f32(&shared.input_rms_db_bits, -90.0);
-                store_f32(&shared.output_rms_db_bits, -90.0);
-                store_f32(&shared.monitor_rms_db_bits, -90.0);
-            }
-            EngineCommand::SetLiveMonitor {
-                enabled,
-                monitor_device,
-            } => {
-                cur_mon_dev = monitor_device;
-                if enabled && main_pipe.is_none() {
-                    shared.live_monitor_enabled.store(true, Ordering::Relaxed);
-                    start_main(
-                        cur_in_dev.clone(),
-                        cur_out_dev.clone(),
-                        cur_mon_dev.clone(),
-                        &mut main_pipe,
-                        &mut live_mon_pipe,
-                    );
-                } else {
-                    apply_live_monitor(enabled, cur_mon_dev.clone(), &mut main_pipe, &mut live_mon_pipe);
-                }
+                break;
             }
         }
     }
@@ -469,6 +884,7 @@ fn audio_control_loop(
 
 fn build_live_monitor_stream(
     mon_name: Option<&str>,
+    err_notifier: StreamErrorNotifier,
 ) -> Result<(MonitorPipeline, MonitorSink, String)> {
     let mon_dev = find_output_device(mon_name, true)
         .ok_or_else(|| anyhow!("マイクテスト用のスピーカー／ヘッドホンが見つかりません"))?;
@@ -490,8 +906,16 @@ fn build_live_monitor_stream(
 
     let resampler = AdaptiveOutputResampler::new(sr_mon)?;
     let drift = DriftController::new(mon_target, sr_mon);
-    let stream = build_output_stream_from_rb(&mon_dev, &mon_cfg, mon_fmt, ch_mon, mon_cons)
-        .with_context(|| format!("再生デバイス「{}」のストリーム作成に失敗しました", actual_mon_name))?;
+    let stream = build_output_stream_from_rb(
+        &mon_dev,
+        &mon_cfg,
+        mon_fmt,
+        ch_mon,
+        mon_cons,
+        None,
+        err_notifier,
+    )
+    .with_context(|| format!("再生デバイス「{}」のストリーム作成に失敗しました", actual_mon_name))?;
     stream
         .play()
         .with_context(|| format!("再生デバイス「{}」の再生開始に失敗しました", actual_mon_name))?;
@@ -510,15 +934,19 @@ fn build_live_monitor_stream(
 
 fn build_main_pipeline(
     shared: &Arc<SharedAudioState>,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+    generation: u64,
     in_name: Option<&str>,
     out_name: Option<&str>,
-) -> Result<RunningPipeline> {
-    let in_dev = find_input_device(in_name)
-        .ok_or_else(|| anyhow!("利用可能なマイク入力デバイスが見つかりません"))?;
+) -> std::result::Result<RunningPipeline, PipelineStartError> {
+    let in_dev = find_input_device(in_name).ok_or_else(|| {
+        PipelineStartError::WaitingForDevice(in_name.filter(|s| !s.is_empty()).map(String::from))
+    })?;
     let actual_in_name = in_dev.name().unwrap_or_else(|_| "Unknown Mic".into());
     let supported_in = in_dev
         .default_input_config()
-        .context("マイクの標準入力フォーマットを取得できません")?;
+        .context("マイクの標準入力フォーマットを取得できません")
+        .map_err(PipelineStartError::Other)?;
     let in_sample_format = supported_in.sample_format();
     let mut in_cfg: StreamConfig = supported_in.into();
     // Request a low-latency buffer (~10ms) when supported by WASAPI/CoreAudio
@@ -526,10 +954,10 @@ fn build_main_pipeline(
     let sr_in = in_cfg.sample_rate.0;
     let ch_in = in_cfg.channels as usize;
 
-    // Optional virtual output device (e.g., CABLE Input on Windows, BlackHole 2ch on macOS)
-    let opt_out_dev = find_output_device(out_name, false);
+    // Optional virtual output device (e.g., CABLE Input on Windows, Shizuka Virtual Mic on macOS)
     let mut actual_out_name: Option<String> = None;
     let mut sr_out = DFN_SAMPLE_RATE as u32;
+    let mut virtual_out_warning: Option<String> = None;
 
     // SPSC RingBuffer for Input (capacity: 500ms of mono samples)
     let in_rb = HeapRb::<f32>::new((sr_in as usize / 2).max(8_192));
@@ -540,28 +968,68 @@ fn build_main_pipeline(
     let mut virtual_stream_opt = None;
     let mut target_out_frames = (sr_out as usize * 30) / 1000; // 30ms target latency
 
-    if let Some(out_dev) = opt_out_dev {
-        if let Ok(supported_out) = out_dev.default_output_config() {
-            actual_out_name = out_dev.name().ok();
-            let out_fmt = supported_out.sample_format();
-            let out_cfg: StreamConfig = supported_out.into();
-            sr_out = out_cfg.sample_rate.0;
-            let ch_out = out_cfg.channels as usize;
+    if let Some(target_out) = out_name.filter(|s| !s.is_empty()) {
+        match find_output_device(Some(target_out), false) {
+            Some(out_dev) => match out_dev.default_output_config() {
+                Ok(supported_out) => {
+                    let resolved_out_name = out_dev
+                        .name()
+                        .unwrap_or_else(|_| target_out.to_string());
+                    let out_fmt = supported_out.sample_format();
+                    let out_cfg: StreamConfig = supported_out.into();
+                    sr_out = out_cfg.sample_rate.0;
+                    let ch_out = out_cfg.channels as usize;
 
-            // Target 30ms occupancy in output ring buffer to absorb OS callback jitter cleanly
-            target_out_frames = ((sr_out as usize) * 30) / 1000;
-            let out_rb_cap = (sr_out as usize / 2).max(8_192);
-            let out_rb = HeapRb::<f32>::new(out_rb_cap);
-            let (mut out_prod, out_cons) = out_rb.split();
+                    // Target 30ms occupancy in output ring buffer to absorb OS callback jitter cleanly
+                    target_out_frames = ((sr_out as usize) * 30) / 1000;
+                    let out_rb_cap = (sr_out as usize / 2).max(8_192);
+                    let out_rb = HeapRb::<f32>::new(out_rb_cap);
+                    let (mut out_prod, out_cons) = out_rb.split();
 
-            // Pre-fill target_out_frames with silence so output starts right at optimal drift equilibrium
-            let silence = vec![0.0f32; target_out_frames];
-            let _ = out_prod.push_slice(&silence);
+                    // Pre-fill target_out_frames with silence so output starts right at optimal drift equilibrium
+                    let silence = vec![0.0f32; target_out_frames];
+                    let _ = out_prod.push_slice(&silence);
 
-            let stream = build_output_stream_from_rb(&out_dev, &out_cfg, out_fmt, ch_out, out_cons)?;
-
-            out_prod_opt = Some(out_prod);
-            virtual_stream_opt = Some(stream);
+                    let out_notifier = StreamErrorNotifier::new(
+                        cmd_tx.clone(),
+                        generation,
+                        StreamKind::VirtualOutput,
+                    );
+                    match build_output_stream_from_rb(
+                        &out_dev,
+                        &out_cfg,
+                        out_fmt,
+                        ch_out,
+                        out_cons,
+                        Some(Arc::clone(shared)),
+                        out_notifier,
+                    ) {
+                        Ok(stream) => {
+                            actual_out_name = Some(resolved_out_name);
+                            out_prod_opt = Some(out_prod);
+                            virtual_stream_opt = Some(stream);
+                        }
+                        Err(e) => {
+                            virtual_out_warning = Some(format!(
+                                "仮想出力「{}」のストリーム作成に失敗しました: {:#}",
+                                resolved_out_name, e
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    virtual_out_warning = Some(format!(
+                        "仮想出力「{}」のフォーマット取得に失敗しました: {}",
+                        target_out, e
+                    ));
+                }
+            },
+            None => {
+                virtual_out_warning = Some(format!(
+                    "仮想出力「{}」が見つかりません（再接続待ち）",
+                    target_out
+                ));
+            }
         }
     }
 
@@ -572,8 +1040,10 @@ fn build_main_pipeline(
     let init_thresh = load_f32(&shared.min_db_thresh_bits);
     let init_vad_en = shared.vad_gate_enabled.load(Ordering::Relaxed);
     let init_vad_thresh = load_f32(&shared.vad_threshold_bits);
-    let mut in_resampler = InputResampler48k::new(sr_in)?;
-    let mut out_resampler = AdaptiveOutputResampler::new(sr_out)?;
+    let mut in_resampler =
+        InputResampler48k::new(sr_in).map_err(PipelineStartError::Other)?;
+    let mut out_resampler =
+        AdaptiveOutputResampler::new(sr_out).map_err(PipelineStartError::Other)?;
     let mut drift_ctrl = DriftController::new(target_out_frames, sr_out);
 
     let (mon_tx, mon_rx) = mpsc::channel::<Option<MonitorSink>>();
@@ -792,20 +1262,36 @@ fn build_main_pipeline(
             if let Some(h) = rt_handle {
                 let _ = demote_current_thread_from_real_time(h);
             }
-        })?;
+        })
+        .map_err(|e| PipelineStartError::Other(e.into()))?;
 
     init_rx
         .recv()
-        .map_err(|_| anyhow!("AI推論スレッドの初期化待機中に中断されました"))??;
+        .map_err(|_| {
+            PipelineStartError::Other(anyhow!("AI推論スレッドの初期化待機中に中断されました"))
+        })?
+        .map_err(PipelineStartError::Other)?;
 
     // Start virtual output stream AFTER neural network init so ring buffer never starves at startup
-    if let Some(ref virt_stream) = virtual_stream_opt {
-        virt_stream
-            .play()
-            .context("仮想マイク出力ストリームの開始に失敗しました")?;
+    if let Some(virt_stream) = virtual_stream_opt.take() {
+        match virt_stream.play() {
+            Ok(()) => {
+                virtual_stream_opt = Some(virt_stream);
+            }
+            Err(e) => {
+                let label = actual_out_name
+                    .take()
+                    .unwrap_or_else(|| "仮想出力".to_string());
+                virtual_out_warning = Some(format!(
+                    "仮想出力「{}」の再生開始に失敗しました: {}",
+                    label, e
+                ));
+            }
+        }
     }
 
     let worker_thread_handle = worker_join.thread().clone();
+    let in_err_notifier = StreamErrorNotifier::new(cmd_tx.clone(), generation, StreamKind::Input);
     let input_stream = build_input_stream_to_rb(
         &in_dev,
         &in_cfg,
@@ -813,10 +1299,14 @@ fn build_main_pipeline(
         ch_in,
         in_prod,
         worker_thread_handle,
-    )?;
+        Arc::clone(shared),
+        in_err_notifier,
+    )
+    .map_err(PipelineStartError::Other)?;
     input_stream
         .play()
-        .context("マイク入力ストリームの開始に失敗しました")?;
+        .context("マイク入力ストリームの開始に失敗しました")
+        .map_err(PipelineStartError::Other)?;
 
     let virt_connected = virtual_stream_opt.is_some();
     shared.stream_running.store(true, Ordering::Relaxed);
@@ -825,17 +1315,20 @@ fn build_main_pipeline(
         .store(virt_connected, Ordering::Relaxed);
 
     if let Ok(mut st) = shared.status.lock() {
-        st.active_input_name = Some(actual_in_name);
+        st.connection_state = ConnectionState::Running;
+        st.waiting_device_name = None;
+        st.active_input_name = Some(actual_in_name.clone());
         st.active_output_name = actual_out_name;
         st.input_sample_rate = sr_in;
         st.output_sample_rate = sr_out;
-        st.last_error = None;
+        st.last_error = virtual_out_warning;
     }
 
     Ok(RunningPipeline {
         stop_flag,
         worker_join: Some(worker_join),
         mon_tx,
+        active_input_name: actual_in_name,
         _input_stream: input_stream,
         _virtual_output_stream: virtual_stream_opt,
     })
@@ -848,26 +1341,64 @@ fn build_input_stream_to_rb(
     channels: usize,
     prod: ringbuf::HeapProd<f32>,
     worker_thread: thread::Thread,
+    shared: Arc<SharedAudioState>,
+    err_notifier: StreamErrorNotifier,
 ) -> Result<Stream> {
     match format {
-        SampleFormat::F32 => {
-            build_input_typed::<f32>(device, config, channels, prod, worker_thread)
-        }
-        SampleFormat::F64 => {
-            build_input_typed::<f64>(device, config, channels, prod, worker_thread)
-        }
-        SampleFormat::I16 => {
-            build_input_typed::<i16>(device, config, channels, prod, worker_thread)
-        }
-        SampleFormat::U16 => {
-            build_input_typed::<u16>(device, config, channels, prod, worker_thread)
-        }
-        SampleFormat::I32 => {
-            build_input_typed::<i32>(device, config, channels, prod, worker_thread)
-        }
-        SampleFormat::U32 => {
-            build_input_typed::<u32>(device, config, channels, prod, worker_thread)
-        }
+        SampleFormat::F32 => build_input_typed::<f32>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::F64 => build_input_typed::<f64>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::I16 => build_input_typed::<i16>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::U16 => build_input_typed::<u16>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::I32 => build_input_typed::<i32>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::U32 => build_input_typed::<u32>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
         other => Err(anyhow!("未対応の入力サンプル形式: {:?}", other)),
     }
 }
@@ -929,6 +1460,8 @@ fn build_input_typed<T>(
     channels: usize,
     mut prod: ringbuf::HeapProd<f32>,
     worker_thread: thread::Thread,
+    shared: Arc<SharedAudioState>,
+    err_notifier: StreamErrorNotifier,
 ) -> Result<Stream>
 where
     T: SizedSample,
@@ -944,14 +1477,18 @@ where
         move |data: &[T], _| {
             let mut mono_scratch = [0.0f32; 512];
             let mut count = 0usize;
+            let mut total_frames = 0u64;
+            let mut dropped_frames = 0u64;
 
             match ch {
                 1 => {
                     for &s in data {
                         mono_scratch[count] = f32::from_sample(s);
                         count += 1;
+                        total_frames += 1;
                         if count == mono_scratch.len() {
-                            let _ = prod.push_slice(&mono_scratch);
+                            let pushed = prod.push_slice(&mono_scratch);
+                            dropped_frames += (count - pushed) as u64;
                             count = 0;
                         }
                     }
@@ -962,8 +1499,10 @@ where
                         let r = f32::from_sample(frame[1]);
                         mono_scratch[count] = stereo_dm.process(l, r);
                         count += 1;
+                        total_frames += 1;
                         if count == mono_scratch.len() {
-                            let _ = prod.push_slice(&mono_scratch);
+                            let pushed = prod.push_slice(&mono_scratch);
+                            dropped_frames += (count - pushed) as u64;
                             count = 0;
                         }
                     }
@@ -976,19 +1515,32 @@ where
                         }
                         mono_scratch[count] = sum * inv_ch;
                         count += 1;
+                        total_frames += 1;
                         if count == mono_scratch.len() {
-                            let _ = prod.push_slice(&mono_scratch);
+                            let pushed = prod.push_slice(&mono_scratch);
+                            dropped_frames += (count - pushed) as u64;
                             count = 0;
                         }
                     }
                 }
             }
             if count > 0 {
-                let _ = prod.push_slice(&mono_scratch[..count]);
+                let pushed = prod.push_slice(&mono_scratch[..count]);
+                dropped_frames += (count - pushed) as u64;
+            }
+            if total_frames > 0 {
+                shared
+                    .input_callback_frames
+                    .fetch_add(total_frames, Ordering::Relaxed);
+            }
+            if dropped_frames > 0 {
+                shared
+                    .input_drop_count
+                    .fetch_add(dropped_frames, Ordering::Relaxed);
             }
             worker_thread.unpark();
         },
-        |err| log::error!("Audio input stream error: {}", err),
+        move |err| err_notifier.notify(err),
         None,
     )?;
 
@@ -1001,14 +1553,58 @@ fn build_output_stream_from_rb(
     format: SampleFormat,
     channels: usize,
     cons: ringbuf::HeapCons<f32>,
+    underrun_shared: Option<Arc<SharedAudioState>>,
+    err_notifier: StreamErrorNotifier,
 ) -> Result<Stream> {
     match format {
-        SampleFormat::F32 => build_output_typed::<f32>(device, config, channels, cons),
-        SampleFormat::F64 => build_output_typed::<f64>(device, config, channels, cons),
-        SampleFormat::I16 => build_output_typed::<i16>(device, config, channels, cons),
-        SampleFormat::U16 => build_output_typed::<u16>(device, config, channels, cons),
-        SampleFormat::I32 => build_output_typed::<i32>(device, config, channels, cons),
-        SampleFormat::U32 => build_output_typed::<u32>(device, config, channels, cons),
+        SampleFormat::F32 => build_output_typed::<f32>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::F64 => build_output_typed::<f64>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::I16 => build_output_typed::<i16>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::U16 => build_output_typed::<u16>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::I32 => build_output_typed::<i32>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::U32 => build_output_typed::<u32>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
         other => Err(anyhow!("未対応の出力サンプル形式: {:?}", other)),
     }
 }
@@ -1018,6 +1614,8 @@ fn build_output_typed<T>(
     config: &StreamConfig,
     channels: usize,
     mut cons: ringbuf::HeapCons<f32>,
+    underrun_shared: Option<Arc<SharedAudioState>>,
+    err_notifier: StreamErrorNotifier,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32>,
@@ -1033,10 +1631,14 @@ where
             let mut mono_scratch = [0.0f32; 512];
             let total_frames = data.len() / ch;
             let mut written_frames = 0usize;
+            let mut had_underrun = false;
 
             while written_frames < total_frames {
                 let batch = (total_frames - written_frames).min(mono_scratch.len());
                 let popped = cons.pop_slice(&mut mono_scratch[..batch]);
+                if popped < batch {
+                    had_underrun = true;
+                }
 
                 for i in 0..batch {
                     let val = if i < popped {
@@ -1056,8 +1658,13 @@ where
                 }
                 written_frames += batch;
             }
+            if had_underrun {
+                if let Some(ref sh) = underrun_shared {
+                    sh.output_underrun_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         },
-        |err| log::error!("Audio output stream error: {}", err),
+        move |err| err_notifier.notify(err),
         None,
     )?;
 
@@ -1190,5 +1797,21 @@ mod tests {
         assert!((monitor_volume_to_gain(0.5) - 1.0).abs() < 0.01);
         assert!(monitor_volume_to_gain(0.8) > 2.0 && monitor_volume_to_gain(0.8) < 2.2);
         assert!((monitor_volume_to_gain(1.0) - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_reconnect_backoff_and_error_dedup() {
+        assert_eq!(reconnect_backoff_duration(0), Duration::from_millis(600));
+        assert_eq!(reconnect_backoff_duration(1), Duration::from_millis(1200));
+        assert_eq!(reconnect_backoff_duration(2), Duration::from_millis(2000));
+        assert_eq!(reconnect_backoff_duration(3), Duration::from_millis(3000));
+        assert_eq!(reconnect_backoff_duration(99), Duration::from_millis(3000));
+
+        let (tx, rx) = mpsc::channel();
+        let notifier = StreamErrorNotifier::new(tx, 7, StreamKind::Input);
+        notifier.notify(cpal::StreamError::DeviceNotAvailable);
+        notifier.notify(cpal::StreamError::DeviceNotAvailable);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "Duplicate errors on same stream must be suppressed");
     }
 }

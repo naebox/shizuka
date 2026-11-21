@@ -1374,6 +1374,210 @@
     font-size: 0.72rem;
   }
 
+  .status-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 0.55rem 0.7rem;
+    border-radius: 0.55rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border-ui);
+    color: var(--text-primary);
+    font-size: 0.72rem;
+    line-height: 1.4;
+  }
+
+  .status-banner-dot {
+    inline-size: 0.45rem;
+    block-size: 0.45rem;
+    margin-block-start: 0.28rem;
+    border-radius: 50%;
+    background: var(--border-strong);
+    flex-shrink: 0;
+
+    @media (prefers-reduced-motion: no-preference) {
+      animation: shizuka-pulse 1.6s ease-in-out infinite;
+    }
+  }
+
+  /* Native Settings Modal (<dialog>) */
+  dialog.settings-dialog {
+    inline-size: min(21.25rem, calc(100vi - 1.5rem));
+    max-block-size: calc(100vb - 2rem);
+    margin: auto;
+    padding: 0;
+    border: 1px solid var(--border-ui);
+    border-radius: 0.85rem;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    box-shadow: 0 18px 42px rgb(0 0 0 / 0.42);
+    opacity: 0;
+    transition-property: opacity, transform, display, overlay;
+    transition-duration: 180ms;
+    transition-timing-function: ease-out;
+    transition-behavior: allow-discrete;
+
+    @media (prefers-reduced-motion: no-preference) {
+      transform: translateY(6px) scale(0.97);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      transition-duration: 80ms;
+    }
+  }
+
+  dialog.settings-dialog:modal {
+    overscroll-behavior: contain;
+  }
+
+  dialog.settings-dialog[open] {
+    display: flex;
+    flex-direction: column;
+  }
+
+  dialog.settings-dialog[open]:where(:not([data-closing])) {
+    opacity: 1;
+
+    @starting-style {
+      opacity: 0;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      transform: translateY(0) scale(1);
+
+      @starting-style {
+        transform: translateY(6px) scale(0.97);
+      }
+    }
+  }
+
+  dialog.settings-dialog::backdrop {
+    overflow: hidden;
+    overscroll-behavior: contain;
+    background-color: rgb(0 0 0 / 0);
+    backdrop-filter: blur(0px);
+    transition-property: background-color, backdrop-filter, display, overlay;
+    transition-duration: 180ms;
+    transition-timing-function: ease-out;
+    transition-behavior: allow-discrete;
+
+    @media (prefers-reduced-motion: reduce) {
+      transition-duration: 80ms;
+    }
+  }
+
+  dialog.settings-dialog[open]:where(:not([data-closing]))::backdrop {
+    background-color: light-dark(rgb(11 11 12 / 0.36), rgb(0 0 0 / 0.62));
+    backdrop-filter: blur(2px);
+
+    @starting-style {
+      background-color: rgb(0 0 0 / 0);
+      backdrop-filter: blur(0px);
+    }
+  }
+
+  .settings-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.7rem 0.85rem;
+    border-block-end: 1px solid var(--border-subtle);
+  }
+
+  .settings-dialog-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .settings-dialog-body {
+    padding: 0.8rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    overflow-y: auto;
+  }
+
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .settings-group-label {
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+  }
+
+  .settings-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.55rem 0.65rem;
+    border-radius: 0.55rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .settings-toggle-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-inline-size: 0;
+  }
+
+  .settings-toggle-title {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .diag-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.4rem;
+  }
+
+  .diag-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding: 0.45rem 0.55rem;
+    border-radius: 0.45rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .diag-key {
+    font-size: 0.64rem;
+    color: var(--text-secondary);
+  }
+
+  .diag-val {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .settings-dialog-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.55rem 0.85rem;
+    border-block-start: 1px solid var(--border-subtle);
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+  }
+
   /* Footer */
   .footer-bar {
     display: flex;
@@ -1402,6 +1606,18 @@
       color: var(--text-primary);
       text-decoration-thickness: 2px;
     }
+  }
+}
+
+@keyframes shizuka-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
   }
 }
 

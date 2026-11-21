@@ -155,16 +155,34 @@ pub fn list_audio_devices() -> DeviceListResponse {
     }
 }
 
-pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
+/// Returns the current OS default physical (non-virtual) microphone name, if any.
+pub fn default_physical_input_name() -> Option<String> {
     let host = cpal::default_host();
-    if let Some(target) = preferred_name {
-        if let Ok(mut devs) = host.input_devices() {
-            if let Some(found) = devs.find(|d| d.name().ok().as_deref() == Some(target)) {
-                return Some(found);
+    if let Some(def) = host.default_input_device() {
+        if let Ok(name) = def.name() {
+            if !is_virtual_audio_device(&name) {
+                return Some(name);
             }
         }
     }
-    // Prefer non-virtual default input device
+    host.input_devices()
+        .ok()?
+        .filter_map(|d| d.name().ok())
+        .find(|n| !should_hide_device(n) && !is_virtual_audio_device(n))
+}
+
+/// Finds an input device by exact name when `preferred_name` is `Some` (never silently falls back
+/// to a different microphone so unplugged USB mics enter a clean waiting-for-reconnect state).
+/// When `preferred_name` is `None` or empty ("auto"), selects the OS default physical microphone.
+pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    if let Some(target) = preferred_name.filter(|s| !s.is_empty()) {
+        if let Ok(mut devs) = host.input_devices() {
+            return devs.find(|d| d.name().ok().as_deref() == Some(target));
+        }
+        return None;
+    }
+    // Auto mode: prefer non-virtual OS default input device
     if let Some(def) = host.default_input_device() {
         if let Ok(name) = def.name() {
             if !is_virtual_audio_device(&name) {
@@ -174,9 +192,11 @@ pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
             return Some(def);
         }
     }
-    host.input_devices()
-        .ok()?
-        .find(|d| d.name().map(|n| !is_virtual_audio_device(&n)).unwrap_or(true))
+    host.input_devices().ok()?.find(|d| {
+        d.name()
+            .map(|n| !should_hide_device(&n) && !is_virtual_audio_device(&n))
+            .unwrap_or(true)
+    })
 }
 
 pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: bool) -> Option<cpal::Device> {

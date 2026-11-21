@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,11 +87,58 @@ impl AppConfig {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::config_path();
+        self.save_to_path(&path)
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
+        let tmp_name = format!(
+            "{}.{}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("settings.json"),
+            std::process::id()
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            let _ = file.sync_all();
+        }
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_atomic_save_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("shizuka-cfg-test-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut cfg = AppConfig::default();
+        cfg.input_device = Some("In 1-2 (MOTU M Series)".to_string());
+        cfg.atten_lim_db = 80.0;
+        cfg.save_to_path(&path).expect("initial atomic save");
+
+        cfg.atten_lim_db = 55.0;
+        cfg.save_to_path(&path).expect("overwrite atomic save");
+
+        let raw = fs::read_to_string(&path).expect("read saved json");
+        let loaded: AppConfig = serde_json::from_str(&raw).expect("parse saved json");
+        assert_eq!(loaded.input_device.as_deref(), Some("In 1-2 (MOTU M Series)"));
+        assert_eq!(loaded.atten_lim_db, 55.0);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

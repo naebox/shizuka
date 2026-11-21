@@ -32,12 +32,23 @@ export interface AppConfig {
   stream_active: boolean;
 }
 
+export type ConnectionState =
+  | "running"
+  | "waiting_device"
+  | "reconnecting"
+  | "stopped";
+
 export interface EngineDeviceStatus {
+  connection_state: ConnectionState;
+  waiting_device_name: string | null;
   active_input_name: string | null;
   active_output_name: string | null;
   active_monitor_name: string | null;
   input_sample_rate: number;
   output_sample_rate: number;
+  reconnect_count: number;
+  input_drop_count: number;
+  output_underrun_count: number;
   last_error: string | null;
 }
 

@@ -1,7 +1,16 @@
-import { type CSSProperties, useEffect, useId, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  Check,
   CheckCircle2,
+  ClipboardCopy,
   Download,
   Headphones,
   Mic,
@@ -9,6 +18,7 @@ import {
   Moon,
   Play,
   RefreshCw,
+  Settings,
   Sliders,
   Square,
   Sun,
@@ -16,6 +26,7 @@ import {
   Volume2,
   VolumeX,
   Waves,
+  X,
 } from "lucide-react";
 import type {
   AppConfig,
@@ -128,29 +139,134 @@ export function App() {
   const monCleanId = `${uid}-mon-clean`;
   const monRawId = `${uid}-mon-raw`;
   const monVolSliderId = `${uid}-mon-vol-slider`;
+  const settingsTitleId = `${uid}-settings-title`;
+  const autostartSwitchId = `${uid}-autostart-switch`;
+  const autostartHintId = `${uid}-autostart-hint`;
+
+  const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
+  const lastReconnectCountRef = useRef<number>(0);
 
   const [devices, setDevices] = useState<DeviceListResponse | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [telemetry, setTelemetry] = useState<AudioTelemetry | null>(null);
   const [monitorClean, setMonitorClean] = useState(true);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [diagCopied, setDiagCopied] = useState(false);
   const [installingDriver, setInstallingDriver] = useState(false);
   const [installMessage, setInstallMessage] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
 
-  const refreshDevicesAndConfig = async () => {
+  const refreshDevicesAndConfig = useCallback(async () => {
     try {
-      const [devs, cfg] = await Promise.all([
+      const [devs, cfg, autostart] = await Promise.all([
         invoke<DeviceListResponse>("get_devices"),
         invoke<AppConfig>("get_config"),
+        invoke<boolean>("get_autostart_enabled").catch(() => false),
       ]);
       setDevices(devs);
       setConfig(cfg);
+      setAutostartEnabled(autostart);
     } catch (err) {
       console.error("Failed to load audio devices/config:", err);
     }
-  };
+  }, []);
+
+  const closeSettingsDialog = useCallback(async () => {
+    const dialog = settingsDialogRef.current;
+    if (!dialog || !dialog.open) return;
+    const supportsNativeTopLayerExit =
+      typeof window !== "undefined" &&
+      Boolean(window.CSS?.supports?.("overlay", "auto"));
+    if (!supportsNativeTopLayerExit) {
+      dialog.setAttribute("data-closing", "");
+      const animations = dialog.getAnimations({ subtree: true });
+      if (animations.length > 0) {
+        await Promise.race([
+          Promise.allSettled(animations.map((a) => a.finished)),
+          new Promise((r) => setTimeout(r, 400)),
+        ]);
+      }
+      if (!dialog.hasAttribute("data-closing")) return;
+      dialog.removeAttribute("data-closing");
+    }
+    dialog.close();
+  }, []);
+
+  const openSettingsDialog = useCallback(() => {
+    const dialog = settingsDialogRef.current;
+    if (!dialog || dialog.open) return;
+    dialog.removeAttribute("data-closing");
+    setAutostartError(null);
+    setDiagCopied(false);
+    void invoke<boolean>("get_autostart_enabled")
+      .then(setAutostartEnabled)
+      .catch(() => {});
+    dialog.showModal();
+  }, []);
+
+  useEffect(() => {
+    const dialog = settingsDialogRef.current;
+    if (!dialog) return;
+
+    const onClose = () => {
+      dialog.removeAttribute("data-closing");
+      dialog.returnValue = "";
+    };
+    dialog.addEventListener("close", onClose);
+
+    const supportsNativeTopLayerExit =
+      typeof window !== "undefined" &&
+      Boolean(window.CSS?.supports?.("overlay", "auto"));
+    const onCancel = (e: Event) => {
+      if (!supportsNativeTopLayerExit) {
+        e.preventDefault();
+        void closeSettingsDialog();
+      }
+    };
+    dialog.addEventListener("cancel", onCancel);
+
+    // Fallback for browsers without <dialog closedby="any"> (WKWebView / Safari):
+    // require both pointerdown and pointerup outside the dialog bounding box.
+    const supportsClosedBy =
+      typeof HTMLDialogElement !== "undefined" &&
+      "closedBy" in HTMLDialogElement.prototype;
+    let pressedOutside = false;
+    const isOutside = (e: PointerEvent) => {
+      const r = dialog.getBoundingClientRect();
+      return (
+        e.clientX < r.left ||
+        e.clientX > r.right ||
+        e.clientY < r.top ||
+        e.clientY > r.bottom
+      );
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      pressedOutside = isOutside(e);
+    };
+    const onPointerUp = (e: PointerEvent) => {
+      if (pressedOutside && isOutside(e)) {
+        void closeSettingsDialog();
+      }
+      pressedOutside = false;
+    };
+    if (!supportsClosedBy) {
+      dialog.addEventListener("pointerdown", onPointerDown);
+      dialog.addEventListener("pointerup", onPointerUp);
+    }
+
+    return () => {
+      dialog.removeEventListener("close", onClose);
+      dialog.removeEventListener("cancel", onCancel);
+      if (!supportsClosedBy) {
+        dialog.removeEventListener("pointerdown", onPointerDown);
+        dialog.removeEventListener("pointerup", onPointerUp);
+      }
+    };
+  }, [closeSettingsDialog]);
 
   useEffect(() => {
     const initialStored = readStoredColorScheme();
@@ -177,12 +293,16 @@ export function App() {
             ? { ...prev, nc_enabled: snap.nc_enabled }
             : prev
         );
+        if (snap.status.reconnect_count !== lastReconnectCountRef.current) {
+          lastReconnectCountRef.current = snap.status.reconnect_count;
+          void refreshDevicesAndConfig();
+        }
       } catch {
         // Ignore transient IPC error during shutdown
       }
     }, 50);
     return () => clearInterval(timer);
-  }, []);
+  }, [refreshDevicesAndConfig]);
 
   const ncEnabled = telemetry?.nc_enabled ?? config?.nc_enabled ?? true;
 
@@ -291,6 +411,32 @@ export function App() {
     await invoke("quit_app");
   };
 
+  const handleToggleAutostart = async (next: boolean) => {
+    setAutostartBusy(true);
+    setAutostartError(null);
+    try {
+      const actual = await invoke<boolean>("set_autostart_enabled", {
+        enabled: next,
+      });
+      setAutostartEnabled(actual);
+    } catch (err) {
+      setAutostartError(typeof err === "string" ? err : String(err));
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
+
+  const handleCopyDiagnostics = async () => {
+    try {
+      const text = await invoke<string>("get_diagnostics_text");
+      await navigator.clipboard.writeText(text);
+      setDiagCopied(true);
+      window.setTimeout(() => setDiagCopied(false), 2200);
+    } catch (err) {
+      console.error("Failed to copy diagnostics:", err);
+    }
+  };
+
   const handleInstallVirtualDriver = async () => {
     setInstallingDriver(true);
     setInstallMessage(null);
@@ -325,6 +471,15 @@ export function App() {
     ? dbToRatio(telemetry?.monitor_rms_db ?? -90)
     : 0;
   const isMac = devices?.platform === "macos";
+  const connState = telemetry?.status.connection_state ?? "running";
+  const connStateLabel =
+    connState === "running"
+      ? "稼働中"
+      : connState === "waiting_device"
+      ? "再接続待ち"
+      : connState === "reconnecting"
+      ? "再接続中"
+      : "停止中";
 
   const activePreset =
     attenDb <= 30 ? "natural" : attenDb >= 90 ? "max" : "balanced";
@@ -368,15 +523,42 @@ export function App() {
           <button
             type="button"
             className="icon-btn"
-            onClick={refreshDevicesAndConfig}
+            onClick={() => void refreshDevicesAndConfig()}
             aria-label="オーディオデバイスを再スキャン"
           >
             <RefreshCw size={14} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={openSettingsDialog}
+            aria-label="アプリ設定を開く"
+          >
+            <Settings size={14} aria-hidden="true" />
           </button>
         </div>
       </header>
 
       <main className="main-stack">
+        {connState === "waiting_device" && (
+          <div className="status-banner" role="status">
+            <span className="status-banner-dot" aria-hidden="true" />
+            <span>
+              <strong>マイク再接続待ち：</strong>
+              {telemetry?.status.waiting_device_name
+                ? `「${telemetry.status.waiting_device_name}」が接続されると自動で再開します。`
+                : "マイクが接続されると自動で再開します。"}
+            </span>
+          </div>
+        )}
+
+        {connState === "reconnecting" && (
+          <div className="status-banner" role="status">
+            <span className="status-banner-dot" aria-hidden="true" />
+            <span>オーディオストリームを自動復旧しています...</span>
+          </div>
+        )}
+
         {telemetry?.status.last_error && (
           <div className="error-banner" role="alert">
             <TriangleAlert
@@ -1048,6 +1230,115 @@ export function App() {
           完全終了
         </button>
       </footer>
+
+      {/* Native Modal Settings Dialog (<dialog> with light-dismiss & top-layer transitions) */}
+      <dialog
+        ref={settingsDialogRef}
+        className="settings-dialog"
+        aria-labelledby={settingsTitleId}
+        {...({ closedby: "any" } as Record<string, string>)}
+      >
+        <div className="settings-dialog-header">
+          <h2 id={settingsTitleId} className="settings-dialog-title">
+            <Settings size={14} aria-hidden="true" />
+            <span>アプリ設定</span>
+          </h2>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => void closeSettingsDialog()}
+            aria-label="アプリ設定を閉じる"
+          >
+            <X size={14} aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="settings-dialog-body">
+          <div className="settings-group">
+            <span className="settings-group-label">起動と常駐</span>
+            <div className="settings-toggle-row">
+              <div className="settings-toggle-copy">
+                <label
+                  htmlFor={autostartSwitchId}
+                  className="settings-toggle-title"
+                >
+                  OS 起動時にトレイへ常駐起動
+                </label>
+                <span id={autostartHintId} className="field-hint">
+                  ウィンドウを出さず{isMac ? "メニューバー" : "タスクトレイ"}で静かに待機します
+                </span>
+              </div>
+              <input
+                id={autostartSwitchId}
+                name="autostart_enabled"
+                type="checkbox"
+                autoFocus
+                role={supportsNativeSwitch ? undefined : "switch"}
+                className="nc-toggle compact"
+                checked={autostartEnabled}
+                disabled={autostartBusy}
+                aria-describedby={autostartHintId}
+                onChange={(e) =>
+                  void handleToggleAutostart(e.currentTarget.checked)
+                }
+                {...({ switch: "" } as Record<string, string>)}
+              />
+            </div>
+            {autostartError && (
+              <div className="error-banner" role="alert">
+                {autostartError}
+              </div>
+            )}
+          </div>
+
+          <div className="settings-group">
+            <span className="settings-group-label">自動復旧・診断情報</span>
+            <div className="diag-grid">
+              <div className="diag-item">
+                <span className="diag-key">パイプライン状態</span>
+                <span className="diag-val">{connStateLabel}</span>
+              </div>
+              <div className="diag-item">
+                <span className="diag-key">自動復旧回数</span>
+                <span className="diag-val">
+                  {telemetry?.status.reconnect_count ?? 0} 回
+                </span>
+              </div>
+              <div className="diag-item">
+                <span className="diag-key">入力ドロップ</span>
+                <span className="diag-val">
+                  {telemetry?.status.input_drop_count ?? 0}
+                </span>
+              </div>
+              <div className="diag-item">
+                <span className="diag-key">出力アンダーラン</span>
+                <span className="diag-val">
+                  {telemetry?.status.output_underrun_count ?? 0}
+                </span>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void handleCopyDiagnostics()}
+            >
+              {diagCopied ? (
+                <Check size={14} aria-hidden="true" />
+              ) : (
+                <ClipboardCopy size={14} aria-hidden="true" />
+              )}
+              <span>
+                {diagCopied ? "診断情報をコピーしました" : "診断情報をコピー"}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <div className="settings-dialog-footer">
+          <span>Shizuka v0.2.0</span>
+          <span>ESC または外側クリックで閉じる</span>
+        </div>
+      </dialog>
     </div>
   );
 }
