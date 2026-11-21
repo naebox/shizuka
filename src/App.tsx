@@ -1238,105 +1238,107 @@ export function App() {
         aria-labelledby={settingsTitleId}
         {...({ closedby: "any" } as Record<string, string>)}
       >
-        <div className="settings-dialog-header">
-          <h2 id={settingsTitleId} className="settings-dialog-title">
-            <Settings size={14} aria-hidden="true" />
-            <span>アプリ設定</span>
-          </h2>
-          <button
-            type="button"
-            className="icon-btn"
-            onClick={() => void closeSettingsDialog()}
-            aria-label="アプリ設定を閉じる"
-          >
-            <X size={14} aria-hidden="true" />
-          </button>
-        </div>
-
-        <div className="settings-dialog-body">
-          <div className="settings-group">
-            <span className="settings-group-label">起動と常駐</span>
-            <div className="settings-toggle-row">
-              <div className="settings-toggle-copy">
-                <label
-                  htmlFor={autostartSwitchId}
-                  className="settings-toggle-title"
-                >
-                  OS 起動時にトレイへ常駐起動
-                </label>
-                <span id={autostartHintId} className="field-hint">
-                  ウィンドウを出さず{isMac ? "メニューバー" : "タスクトレイ"}で静かに待機します
-                </span>
-              </div>
-              <input
-                id={autostartSwitchId}
-                name="autostart_enabled"
-                type="checkbox"
-                autoFocus
-                role={supportsNativeSwitch ? undefined : "switch"}
-                className="nc-toggle compact"
-                checked={autostartEnabled}
-                disabled={autostartBusy}
-                aria-describedby={autostartHintId}
-                onChange={(e) =>
-                  void handleToggleAutostart(e.currentTarget.checked)
-                }
-                {...({ switch: "" } as Record<string, string>)}
-              />
-            </div>
-            {autostartError && (
-              <div className="error-banner" role="alert">
-                {autostartError}
-              </div>
-            )}
-          </div>
-
-          <div className="settings-group">
-            <span className="settings-group-label">自動復旧・診断情報</span>
-            <div className="diag-grid">
-              <div className="diag-item">
-                <span className="diag-key">パイプライン状態</span>
-                <span className="diag-val">{connStateLabel}</span>
-              </div>
-              <div className="diag-item">
-                <span className="diag-key">自動復旧回数</span>
-                <span className="diag-val">
-                  {telemetry?.status.reconnect_count ?? 0} 回
-                </span>
-              </div>
-              <div className="diag-item">
-                <span className="diag-key">入力ドロップ</span>
-                <span className="diag-val">
-                  {telemetry?.status.input_drop_count ?? 0}
-                </span>
-              </div>
-              <div className="diag-item">
-                <span className="diag-key">出力アンダーラン</span>
-                <span className="diag-val">
-                  {telemetry?.status.output_underrun_count ?? 0}
-                </span>
-              </div>
-            </div>
+        <div className="settings-dialog-panel">
+          <div className="settings-dialog-header">
+            <h2 id={settingsTitleId} className="settings-dialog-title">
+              <Settings size={14} aria-hidden="true" />
+              <span>アプリ設定</span>
+            </h2>
             <button
               type="button"
-              className="btn"
-              onClick={() => void handleCopyDiagnostics()}
+              className="icon-btn"
+              onClick={() => void closeSettingsDialog()}
+              aria-label="アプリ設定を閉じる"
             >
-              {diagCopied ? (
-                <Check size={14} aria-hidden="true" />
-              ) : (
-                <ClipboardCopy size={14} aria-hidden="true" />
-              )}
-              <span>
-                {diagCopied ? "診断情報をコピーしました" : "診断情報をコピー"}
-              </span>
+              <X size={14} aria-hidden="true" />
             </button>
           </div>
-        </div>
 
-        <div className="settings-dialog-footer">
-          <span>Shizuka v0.2.0</span>
-          <span>ESC または外側クリックで閉じる</span>
+          <div className="settings-dialog-body">
+            <div className="settings-group">
+              <span className="settings-group-label">起動と常駐</span>
+              <div className="settings-toggle-row">
+                <div className="settings-toggle-copy">
+                  <label
+                    htmlFor={autostartSwitchId}
+                    className="settings-toggle-title"
+                  >
+                    OS 起動時にトレイへ常駐起動
+                  </label>
+                  <span id={autostartHintId} className="field-hint">
+                    ウィンドウを出さず{isMac ? "メニューバー" : "タスクトレイ"}で静かに待機します
+                  </span>
+                </div>
+                <input
+                  id={autostartSwitchId}
+                  name="autostart_enabled"
+                  type="checkbox"
+                  autoFocus
+                  role={supportsNativeSwitch ? undefined : "switch"}
+                  className="nc-toggle compact"
+                  checked={autostartEnabled}
+                  disabled={autostartBusy}
+                  aria-describedby={autostartHintId}
+                  onChange={(e) =>
+                    void handleToggleAutostart(e.currentTarget.checked)
+                  }
+                  {...({ switch: "" } as Record<string, string>)}
+                />
+              </div>
+              {autostartError && (
+                <div className="error-banner" role="alert">
+                  {autostartError}
+                </div>
+              )}
+            </div>
+
+            <div className="settings-group">
+              <span className="settings-group-label">自動復旧・診断情報</span>
+              <div className="diag-grid">
+                <div className="diag-item">
+                  <span className="diag-key">パイプライン状態</span>
+                  <span className="diag-val">{connStateLabel}</span>
+                </div>
+                <div className="diag-item">
+                  <span className="diag-key">自動復旧回数</span>
+                  <span className="diag-val">
+                    {telemetry?.status.reconnect_count ?? 0} 回
+                  </span>
+                </div>
+                <div className="diag-item">
+                  <span className="diag-key">入力ドロップ</span>
+                  <span className="diag-val">
+                    {telemetry?.status.input_drop_count ?? 0}
+                  </span>
+                </div>
+                <div className="diag-item">
+                  <span className="diag-key">出力アンダーラン</span>
+                  <span className="diag-val">
+                    {telemetry?.status.output_underrun_count ?? 0}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => void handleCopyDiagnostics()}
+              >
+                {diagCopied ? (
+                  <Check size={14} aria-hidden="true" />
+                ) : (
+                  <ClipboardCopy size={14} aria-hidden="true" />
+                )}
+                <span>
+                  {diagCopied ? "診断情報をコピーしました" : "診断情報をコピー"}
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-dialog-footer">
+            <span>Shizuka v0.2.0</span>
+            <span>ESC または外側クリックで閉じる</span>
+          </div>
         </div>
       </dialog>
     </div>

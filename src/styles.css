@@ -1402,9 +1402,16 @@
 
   /* Native Settings Modal (<dialog>) */
   dialog.settings-dialog {
-    inline-size: min(21.25rem, calc(100vi - 1.5rem));
-    max-block-size: calc(100vb - 2rem);
+    /* Pin fixed viewport positioning & bounds on base <dialog> so removing :modal
+       on dialog.close() never teleports the closing modal to document bottom. */
+    position: fixed;
+    inset: 0;
     margin: auto;
+    inline-size: min(21.25rem, calc(100vi - 1.5rem));
+    max-inline-size: calc(100vi - 1.5rem);
+    max-block-size: calc(100vb - 2rem);
+    block-size: fit-content;
+    overflow: hidden;
     padding: 0;
     border: 1px solid var(--border-ui);
     border-radius: 0.85rem;
@@ -1413,7 +1420,7 @@
     box-shadow: 0 18px 42px rgb(0 0 0 / 0.42);
     opacity: 0;
     transition-property: opacity, transform, display, overlay;
-    transition-duration: 180ms;
+    transition-duration: 160ms;
     transition-timing-function: ease-out;
     transition-behavior: allow-discrete;
 
@@ -1428,11 +1435,6 @@
 
   dialog.settings-dialog:modal {
     overscroll-behavior: contain;
-  }
-
-  dialog.settings-dialog[open] {
-    display: flex;
-    flex-direction: column;
   }
 
   dialog.settings-dialog[open]:where(:not([data-closing])) {
@@ -1454,10 +1456,11 @@
   dialog.settings-dialog::backdrop {
     overflow: hidden;
     overscroll-behavior: contain;
-    background-color: rgb(0 0 0 / 0);
-    backdrop-filter: blur(0px);
-    transition-property: background-color, backdrop-filter, display, overlay;
-    transition-duration: 180ms;
+    background-color: light-dark(rgb(11 11 12 / 0.36), rgb(0 0 0 / 0.62));
+    backdrop-filter: blur(2px);
+    opacity: 0;
+    transition-property: opacity, display, overlay;
+    transition-duration: 160ms;
     transition-timing-function: ease-out;
     transition-behavior: allow-discrete;
 
@@ -1467,13 +1470,17 @@
   }
 
   dialog.settings-dialog[open]:where(:not([data-closing]))::backdrop {
-    background-color: light-dark(rgb(11 11 12 / 0.36), rgb(0 0 0 / 0.62));
-    backdrop-filter: blur(2px);
+    opacity: 1;
 
     @starting-style {
-      background-color: rgb(0 0 0 / 0);
-      backdrop-filter: blur(0px);
+      opacity: 0;
     }
+  }
+
+  .settings-dialog-panel {
+    display: flex;
+    flex-direction: column;
+    max-block-size: calc(100vb - 2rem);
   }
 
   .settings-dialog-header {
