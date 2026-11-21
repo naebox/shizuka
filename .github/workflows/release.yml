@@ -53,7 +53,7 @@ jobs:
           - **Windows（推奨・インストーラ）**: `Shizuka_*_x64-setup.exe`
           - **Windows（ポータブル版・インストール不要）**: `Shizuka_*_windows_x64_portable.zip`
           - **Windows（MSI パッケージ）**: `Shizuka_*_x64_en-US.msi`
-          - **macOS（Apple Silicon / M1〜M4）**: `Shizuka_*_aarch64.dmg`
+          - **macOS（Apple Silicon / M1 以降）**: `Shizuka_*_aarch64.dmg`
           - **macOS（Intel）**: `Shizuka_*_x64.dmg`
 
           > [!NOTE]

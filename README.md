@@ -22,7 +22,7 @@
 | **Windows (x64)** | `Shizuka_*_x64-setup.exe` | 推奨インストーラ（NSIS・日本語対応） |
 | **Windows (x64)** | `Shizuka_*_windows_x64_portable.zip` | インストール不要のポータブル版 |
 | **Windows (x64)** | `Shizuka_*_x64_en-US.msi` | MSI パッケージ |
-| **macOS (Apple Silicon)** | `Shizuka_*_aarch64.dmg` | M1 / M2 / M3 / M4 搭載 Mac 向け |
+| **macOS (Apple Silicon)** | `Shizuka_*_aarch64.dmg` | M1 以降搭載 Mac 向け |
 | **macOS (Intel)** | `Shizuka_*_x64.dmg` | Intel Mac 向け |
 
 > [!NOTE]
