@@ -233,32 +233,38 @@
     flex-shrink: 0;
     display: block;
 
-    & .mark-stroke {
-      stroke: var(--text-primary);
+    & .mark-tile {
+      fill: #2a302c;
+      stroke: light-dark(rgb(0 0 0 / 0.08), rgb(255 255 255 / 0.14));
+      stroke-width: 2.5;
     }
 
-    & .mark-bars {
-      fill: var(--text-primary);
+    & .mark-wave {
+      stroke: #9ba39e;
     }
 
-    & .mark-led {
-      fill: transparent;
-      stroke: var(--border-ui);
-      stroke-width: 1.4;
+    & .mark-still {
+      stroke: #636b66;
     }
 
-    &.active .mark-led {
-      fill: var(--color-led-green);
-      stroke: none;
+    &.active .mark-wave {
+      stroke: #ffffff;
+    }
+
+    &.active .mark-still {
+      stroke: #66b97a;
 
       @media (forced-colors: active) {
         forced-color-adjust: none;
       }
     }
 
-    &.muted .mark-led {
-      fill: var(--color-led-red);
-      stroke: none;
+    &.muted .mark-wave {
+      stroke: #9ba39e;
+    }
+
+    &.muted .mark-still {
+      stroke: var(--color-led-red);
 
       @media (forced-colors: active) {
         forced-color-adjust: none;

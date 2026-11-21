@@ -266,26 +266,41 @@ function ShizukaMark({
   active: boolean;
   muted: boolean;
 }) {
+  const clipId = useId();
   return (
     <svg
       className={`brand-mark ${muted ? "muted" : active ? "active" : ""}`}
-      viewBox="0 0 26 26"
+      viewBox="0 0 100 100"
       width="26"
       height="26"
       shapeRendering="geometricPrecision"
       aria-hidden="true"
     >
-      <path
-        className="mark-stroke"
-        d="M 16.42 22.93 A 10.5 10.5 0 1 1 22.93 16.42"
-        fill="none"
-        strokeWidth="2.1"
-        strokeLinecap="round"
-      />
-      <circle className="mark-led" cx="20.42" cy="20.42" r="2.15" />
-      <rect className="mark-bars" x="8" y="10" width="2" height="6" rx="1" />
-      <rect className="mark-bars" x="12" y="8" width="2" height="10" rx="1" />
-      <rect className="mark-bars" x="16" y="10" width="2" height="6" rx="1" />
+      <defs>
+        <clipPath id={clipId}>
+          <rect x="4" y="4" width="92" height="92" rx="24" />
+        </clipPath>
+      </defs>
+      <rect className="mark-tile" x="4" y="4" width="92" height="92" rx="24" />
+      <g clipPath={`url(#${clipId})`}>
+        <path
+          className="mark-wave"
+          d="M 1 50 L 9 50 C 13.5 50 15.5 30 20 30 C 24.5 30 28.5 70 33 70 C 37.5 70 40.5 40 45 40 C 49 40 51 56 54.5 56 C 58 56 59.5 50 63 50 L 66 50"
+          fill="none"
+          strokeWidth="8.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        <line
+          className="mark-still"
+          x1="66"
+          y1="50"
+          x2="84.5"
+          y2="50"
+          strokeWidth="8.6"
+          strokeLinecap="round"
+        />
+      </g>
     </svg>
   );
 }
