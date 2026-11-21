@@ -1212,10 +1212,7 @@ export function App() {
       </main>
 
       <footer className="footer-bar">
-        <span>
-          クロック同期: {(telemetry?.drift_ppm ?? 0) >= 0 ? "+" : ""}
-          {(telemetry?.drift_ppm ?? 0).toFixed(0)} ppm | 閉じる[×]でトレイ常駐
-        </span>
+        <span>閉じる[×]でトレイ常駐</span>
         <button
           type="button"
           className="quit-btn"
@@ -1294,9 +1291,24 @@ export function App() {
                   <span className="diag-val">{connStateLabel}</span>
                 </div>
                 <div className="diag-item">
+                  <span className="diag-key">クロック同期補正</span>
+                  <span className="diag-val">
+                    {(telemetry?.drift_ppm ?? 0) >= 0 ? "+" : ""}
+                    {(telemetry?.drift_ppm ?? 0).toFixed(0)} ppm
+                  </span>
+                </div>
+                <div className="diag-item">
                   <span className="diag-key">自動復旧回数</span>
                   <span className="diag-val">
                     {telemetry?.status.reconnect_count ?? 0} 回
+                  </span>
+                </div>
+                <div className="diag-item">
+                  <span className="diag-key">サンプルレート</span>
+                  <span className="diag-val">
+                    {telemetry?.status.input_sample_rate
+                      ? `${Math.round(telemetry.status.input_sample_rate / 1000)} kHz`
+                      : "—"}
                   </span>
                 </div>
                 <div className="diag-item">
