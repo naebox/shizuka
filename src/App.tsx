@@ -8,11 +8,13 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  AudioLines,
   Check,
   CheckCircle2,
   ClipboardCopy,
   Download,
   Headphones,
+  Keyboard,
   Mic,
   MicOff,
   Moon,
@@ -34,6 +36,7 @@ import type {
   DeviceListResponse,
   InstallDriverResult,
   ModelVariant,
+  ShortcutAction,
 } from "./types";
 
 const supportsNativeSwitch =
@@ -41,6 +44,189 @@ const supportsNativeSwitch =
   "switch" in HTMLInputElement.prototype;
 
 const COLOR_SCHEME_STORAGE_KEY = "color-scheme";
+
+const MODIFIER_CODES = new Set([
+  "ControlLeft",
+  "ControlRight",
+  "ShiftLeft",
+  "ShiftRight",
+  "AltLeft",
+  "AltRight",
+  "MetaLeft",
+  "MetaRight",
+]);
+
+const UNMODIFIED_ALLOWED_CODES = new Set([
+  "F1",
+  "F2",
+  "F3",
+  "F4",
+  "F5",
+  "F6",
+  "F7",
+  "F8",
+  "F9",
+  "F10",
+  "F11",
+  "F12",
+  "F13",
+  "F14",
+  "F15",
+  "F16",
+  "F17",
+  "F18",
+  "F19",
+  "F20",
+  "F21",
+  "F22",
+  "F23",
+  "F24",
+  "Pause",
+  "ScrollLock",
+  "PrintScreen",
+  "NumLock",
+  "AudioVolumeMute",
+  "MediaPlayPause",
+  "MediaStop",
+  "MediaTrackNext",
+  "MediaTrackPrevious",
+]);
+
+const SUPPORTED_PRIMARY_CODES = new Set([
+  ...UNMODIFIED_ALLOWED_CODES,
+  "Space",
+  "Minus",
+  "Equal",
+  "BracketLeft",
+  "BracketRight",
+  "Backslash",
+  "Semicolon",
+  "Quote",
+  "Backquote",
+  "Comma",
+  "Period",
+  "Slash",
+  "Insert",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Numpad0",
+  "Numpad1",
+  "Numpad2",
+  "Numpad3",
+  "Numpad4",
+  "Numpad5",
+  "Numpad6",
+  "Numpad7",
+  "Numpad8",
+  "Numpad9",
+  "NumpadAdd",
+  "NumpadSubtract",
+  "NumpadMultiply",
+  "NumpadDivide",
+  "NumpadDecimal",
+]);
+
+function isSupportedPrimaryCode(code: string): boolean {
+  return (
+    /^Key[A-Z]$/.test(code) ||
+    /^Digit[0-9]$/.test(code) ||
+    SUPPORTED_PRIMARY_CODES.has(code)
+  );
+}
+
+function buildAcceleratorFromKeyEvent(
+  e: KeyboardEvent
+): { ok: true; value: string } | { ok: false; error: string } | null {
+  if (MODIFIER_CODES.has(e.code)) {
+    return null;
+  }
+  if (!isSupportedPrimaryCode(e.code)) {
+    return {
+      ok: false,
+      error: "このキーはショートカットに割り当てできません。別のキーを押してください。",
+    };
+  }
+  const mods: string[] = [];
+  if (e.ctrlKey) mods.push("Control");
+  if (e.altKey) mods.push("Alt");
+  if (e.shiftKey) mods.push("Shift");
+  if (e.metaKey) mods.push("Super");
+
+  if (mods.length === 0 && !UNMODIFIED_ALLOWED_CODES.has(e.code)) {
+    return {
+      ok: false,
+      error:
+        "単一キーはファンクションキー（F1〜F24 等）のみ登録できます。Ctrl / Alt / Shift 等と組み合わせてください。",
+    };
+  }
+
+  return {
+    ok: true,
+    value: [...mods, e.code].join("+"),
+  };
+}
+
+const KEY_DISPLAY_MAP: Record<string, string> = {
+  Space: "Space",
+  Minus: "-",
+  Equal: "=",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Semicolon: ";",
+  Quote: "'",
+  Backquote: "`",
+  Comma: ",",
+  Period: ".",
+  Slash: "/",
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+  ArrowLeft: "←",
+  ArrowRight: "→",
+  NumpadAdd: "Num+",
+  NumpadSubtract: "Num-",
+  NumpadMultiply: "Num*",
+  NumpadDivide: "Num/",
+  NumpadDecimal: "Num.",
+  AudioVolumeMute: "Mute",
+  MediaPlayPause: "Play",
+  MediaStop: "Stop",
+  MediaTrackNext: "Next",
+  MediaTrackPrevious: "Prev",
+};
+
+function formatShortcutLabel(
+  accelerator: string | null | undefined,
+  isMac: boolean
+): string {
+  if (!accelerator) return "未割当";
+  const parts = accelerator.split("+").map((p) => p.trim());
+  return parts
+    .map((part) => {
+      if (part === "Control" || part === "Ctrl") return isMac ? "⌃" : "Ctrl";
+      if (part === "Alt") return isMac ? "⌥" : "Alt";
+      if (part === "Shift") return isMac ? "⇧" : "Shift";
+      if (part === "Super" || part === "Meta" || part === "Command") {
+        return isMac ? "⌘" : "Win";
+      }
+      if (part === "CommandOrControl" || part === "CmdOrControl") {
+        return isMac ? "⌘" : "Ctrl";
+      }
+      if (part.startsWith("Key") && part.length === 4) return part.slice(3);
+      if (part.startsWith("Digit") && part.length === 6) return part.slice(5);
+      if (part.startsWith("Numpad") && part.length === 7) {
+        return `Num${part.slice(6)}`;
+      }
+      return KEY_DISPLAY_MAP[part] ?? part;
+    })
+    .join(" + ");
+}
 
 function getSystemColorScheme(): "dark" | "light" {
   return typeof window !== "undefined" &&
@@ -65,14 +251,21 @@ function applyColorSchemeMeta(content: "dark" | "light" | "light dark") {
   if (meta) {
     meta.content = content;
   }
-  const nativeTheme = content === "dark" || content === "light" ? content : null;
+  const nativeTheme =
+    content === "dark" || content === "light" ? content : null;
   void invoke("set_window_theme", { theme: nativeTheme }).catch(() => {});
 }
 
-function ShizukaMark({ active }: { active: boolean }) {
+function ShizukaMark({
+  active,
+  muted,
+}: {
+  active: boolean;
+  muted: boolean;
+}) {
   return (
     <svg
-      className={`brand-mark ${active ? "active" : ""}`}
+      className={`brand-mark ${muted ? "muted" : active ? "active" : ""}`}
       viewBox="0 0 26 26"
       width="26"
       height="26"
@@ -124,6 +317,10 @@ export function App() {
   const presetMaxId = `${uid}-preset-max`;
   const attenSliderId = `${uid}-atten-slider`;
   const gainSliderId = `${uid}-gain-slider`;
+  const hpfSwitchId = `${uid}-hpf-switch`;
+  const hpfHintId = `${uid}-hpf-hint`;
+  const agcSwitchId = `${uid}-agc-switch`;
+  const agcHintId = `${uid}-agc-hint`;
   const vadSwitchId = `${uid}-vad-switch`;
   const vadSliderId = `${uid}-vad-slider`;
   const vadHintId = `${uid}-vad-hint`;
@@ -136,9 +333,13 @@ export function App() {
   const settingsTitleId = `${uid}-settings-title`;
   const autostartSwitchId = `${uid}-autostart-switch`;
   const autostartHintId = `${uid}-autostart-hint`;
+  const cueSoundSwitchId = `${uid}-cue-sound-switch`;
+  const cueSoundHintId = `${uid}-cue-sound-hint`;
 
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
   const lastReconnectCountRef = useRef<number>(0);
+  const lastConfigRevisionRef = useRef<number>(0);
+  const recordingActionRef = useRef<ShortcutAction | null>(null);
 
   const [devices, setDevices] = useState<DeviceListResponse | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -147,12 +348,17 @@ export function App() {
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [recordingAction, setRecordingAction] =
+    useState<ShortcutAction | null>(null);
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
   const [diagCopied, setDiagCopied] = useState(false);
   const [installingDriver, setInstallingDriver] = useState(false);
   const [installMessage, setInstallMessage] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
+
+  recordingActionRef.current = recordingAction;
 
   const refreshDevicesAndConfig = useCallback(async () => {
     try {
@@ -169,7 +375,30 @@ export function App() {
     }
   }, []);
 
+  const stopShortcutRecording = useCallback(async () => {
+    if (recordingActionRef.current === null) return;
+    recordingActionRef.current = null;
+    setRecordingAction(null);
+    await invoke("set_shortcuts_paused", { paused: false }).catch(() => {});
+  }, []);
+
+  const startShortcutRecording = useCallback(async (action: ShortcutAction) => {
+    setShortcutError(null);
+    if (recordingActionRef.current === action) {
+      await stopShortcutRecording();
+      return;
+    }
+    try {
+      await invoke("set_shortcuts_paused", { paused: true });
+      recordingActionRef.current = action;
+      setRecordingAction(action);
+    } catch (err) {
+      setShortcutError(typeof err === "string" ? err : String(err));
+    }
+  }, [stopShortcutRecording]);
+
   const closeSettingsDialog = useCallback(async () => {
+    await stopShortcutRecording();
     const dialog = settingsDialogRef.current;
     if (!dialog || !dialog.open) return;
     const supportsNativeTopLayerExit =
@@ -188,19 +417,77 @@ export function App() {
       dialog.removeAttribute("data-closing");
     }
     dialog.close();
-  }, []);
+  }, [stopShortcutRecording]);
 
   const openSettingsDialog = useCallback(() => {
     const dialog = settingsDialogRef.current;
     if (!dialog || dialog.open) return;
     dialog.removeAttribute("data-closing");
     setAutostartError(null);
+    setShortcutError(null);
     setDiagCopied(false);
     void invoke<boolean>("get_autostart_enabled")
       .then(setAutostartEnabled)
       .catch(() => {});
+    void invoke<string | null>("get_shortcut_warning")
+      .then((warn) => {
+        if (warn) setShortcutError(warn);
+      })
+      .catch(() => {});
     dialog.showModal();
   }, []);
+
+  // Capture keyboard shortcut while recording inside Settings dialog
+  useEffect(() => {
+    if (recordingAction === null) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.code === "Escape" || e.key === "Escape") {
+        setShortcutError(null);
+        void stopShortcutRecording();
+        return;
+      }
+
+      const parsed = buildAcceleratorFromKeyEvent(e);
+      if (parsed === null) {
+        return;
+      }
+      if (!parsed.ok) {
+        setShortcutError(parsed.error);
+        return;
+      }
+
+      const targetAction = recordingAction;
+      void (async () => {
+        try {
+          // Backend validates OS registration, commits, and atomically unpauses shortcuts
+          const updated = await invoke<AppConfig>("set_shortcut", {
+            action: targetAction,
+            accelerator: parsed.value,
+          });
+          setConfig(updated);
+          recordingActionRef.current = null;
+          setRecordingAction(null);
+          setShortcutError(null);
+        } catch (err) {
+          setShortcutError(typeof err === "string" ? err : String(err));
+          recordingActionRef.current = null;
+          setRecordingAction(null);
+          await invoke("set_shortcuts_paused", { paused: false }).catch(
+            () => {}
+          );
+        }
+      })();
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [recordingAction, stopShortcutRecording]);
 
   useEffect(() => {
     const dialog = settingsDialogRef.current;
@@ -209,6 +496,11 @@ export function App() {
     const onClose = () => {
       dialog.removeAttribute("data-closing");
       dialog.returnValue = "";
+      if (recordingActionRef.current !== null) {
+        recordingActionRef.current = null;
+        setRecordingAction(null);
+        void invoke("set_shortcuts_paused", { paused: false }).catch(() => {});
+      }
     };
     dialog.addEventListener("close", onClose);
 
@@ -216,6 +508,13 @@ export function App() {
       typeof window !== "undefined" &&
       Boolean(window.CSS?.supports?.("overlay", "auto"));
     const onCancel = (e: Event) => {
+      // Protect both Chromium and WKWebView from closing dialog when Esc cancels key recording
+      if (recordingActionRef.current !== null) {
+        e.preventDefault();
+        setShortcutError(null);
+        void stopShortcutRecording();
+        return;
+      }
       if (!supportsNativeTopLayerExit) {
         e.preventDefault();
         void closeSettingsDialog();
@@ -242,7 +541,11 @@ export function App() {
       pressedOutside = isOutside(e);
     };
     const onPointerUp = (e: PointerEvent) => {
-      if (pressedOutside && isOutside(e)) {
+      if (
+        recordingActionRef.current === null &&
+        pressedOutside &&
+        isOutside(e)
+      ) {
         void closeSettingsDialog();
       }
       pressedOutside = false;
@@ -260,7 +563,7 @@ export function App() {
         dialog.removeEventListener("pointerup", onPointerUp);
       }
     };
-  }, [closeSettingsDialog]);
+  }, [closeSettingsDialog, stopShortcutRecording]);
 
   useEffect(() => {
     const initialStored = readStoredColorScheme();
@@ -290,6 +593,11 @@ export function App() {
         if (snap.status.reconnect_count !== lastReconnectCountRef.current) {
           lastReconnectCountRef.current = snap.status.reconnect_count;
           void refreshDevicesAndConfig();
+        } else if (snap.config_revision !== lastConfigRevisionRef.current) {
+          lastConfigRevisionRef.current = snap.config_revision;
+          void invoke<AppConfig>("get_config")
+            .then(setConfig)
+            .catch(() => {});
         }
       } catch {
         // Ignore transient IPC error during shutdown
@@ -299,10 +607,16 @@ export function App() {
   }, [refreshDevicesAndConfig]);
 
   const ncEnabled = telemetry?.nc_enabled ?? config?.nc_enabled ?? true;
+  const micMuted = telemetry?.mic_muted ?? false;
 
   const handleToggleNc = async (next: boolean) => {
     setConfig((prev) => (prev ? { ...prev, nc_enabled: next } : prev));
     await invoke("set_nc_enabled", { enabled: next });
+  };
+
+  const handleToggleMute = async () => {
+    const next = !micMuted;
+    await invoke("set_mic_muted", { muted: next });
   };
 
   // Two-state color-scheme toggle: pins explicit opposite of rendered scheme,
@@ -336,18 +650,19 @@ export function App() {
     nextMon: string | null
   ) => {
     if (!config) return;
-    const updated: AppConfig = {
+    const optimistic: AppConfig = {
       ...config,
       input_device: nextIn,
       output_device: nextOut,
       monitor_device: nextMon,
     };
-    setConfig(updated);
-    await invoke("select_devices", {
+    setConfig(optimistic);
+    const synced = await invoke<AppConfig>("select_devices", {
       inputDevice: nextIn,
       outputDevice: nextOut,
       monitorDevice: nextMon,
     });
+    setConfig(synced);
   };
 
   const handleModelVariantChange = async (nextVariant: ModelVariant) => {
@@ -362,7 +677,9 @@ export function App() {
     postFilterBeta: number,
     inputGainDb: number,
     vadGateEnabled: boolean,
-    vadThresholdDb: number
+    vadThresholdDb: number,
+    hpfEnabled: boolean,
+    agcEnabled: boolean
   ) => {
     if (!config) return;
     const minThresh = config.min_db_thresh;
@@ -373,6 +690,8 @@ export function App() {
       input_gain_db: inputGainDb,
       vad_gate_enabled: vadGateEnabled,
       vad_threshold_db: vadThresholdDb,
+      hpf_enabled: hpfEnabled,
+      agc_enabled: agcEnabled,
     });
     await invoke("update_dsp_params", {
       attenLimDb,
@@ -381,7 +700,30 @@ export function App() {
       minDbThresh: minThresh,
       vadGateEnabled,
       vadThresholdDb,
+      hpfEnabled,
+      agcEnabled,
     });
+  };
+
+  const handleClearShortcut = async (action: ShortcutAction) => {
+    setShortcutError(null);
+    await stopShortcutRecording();
+    try {
+      const updated = await invoke<AppConfig>("set_shortcut", {
+        action,
+        accelerator: null,
+      });
+      setConfig(updated);
+    } catch (err) {
+      setShortcutError(typeof err === "string" ? err : String(err));
+    }
+  };
+
+  const handleToggleShortcutSound = async (enabled: boolean) => {
+    setConfig((prev) =>
+      prev ? { ...prev, shortcut_sound_enabled: enabled } : prev
+    );
+    await invoke("set_shortcut_sound_enabled", { enabled });
   };
 
   const handleToggleLiveMonitor = async () => {
@@ -451,11 +793,15 @@ export function App() {
   const modelVariant: ModelVariant =
     config?.model_variant ?? telemetry?.model_variant ?? "standard";
   const attenDb = config?.atten_lim_db ?? 65;
-  const pfBeta = config?.post_filter_beta ?? 0.02;
+  const pfBeta = config?.post_filter_beta ?? 0.0;
   const gainDb = config?.input_gain_db ?? 0;
   const vadGateEnabled =
     config?.vad_gate_enabled ?? telemetry?.vad_gate_enabled ?? true;
   const vadThreshDb = config?.vad_threshold_db ?? -5;
+  const hpfEnabled = config?.hpf_enabled ?? telemetry?.hpf_enabled ?? true;
+  const agcEnabled = config?.agc_enabled ?? telemetry?.agc_enabled ?? false;
+  const agcGainDb = telemetry?.agc_gain_db ?? 0;
+  const clippingActive = telemetry?.clipping_active ?? false;
   const vadSpeaking = telemetry?.vad_speaking ?? false;
   const liveMonitorEnabled = telemetry?.live_monitor_enabled ?? false;
   const monVolPct = Math.round(
@@ -465,6 +811,7 @@ export function App() {
     ? dbToRatio(telemetry?.monitor_rms_db ?? -90)
     : 0;
   const isMac = devices?.platform === "macos";
+  const shortcutSoundEnabled = config?.shortcut_sound_enabled ?? true;
   const connState = telemetry?.status.connection_state ?? "running";
   const connStateLabel =
     connState === "running"
@@ -485,12 +832,19 @@ export function App() {
     vadThreshDb > 0
       ? `+${vadThreshDb.toFixed(1)} dB`
       : `${vadThreshDb.toFixed(1)} dB`;
+  const agcLiveText =
+    agcGainDb >= 0
+      ? `+${agcGainDb.toFixed(1)} dB`
+      : `${agcGainDb.toFixed(1)} dB`;
 
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <ShizukaMark active={Boolean(telemetry?.stream_running && ncEnabled)} />
+          <ShizukaMark
+            active={Boolean(telemetry?.stream_running && ncEnabled)}
+            muted={micMuted}
+          />
           <h1 className="brand-title">Shizuka</h1>
         </div>
         <div className="badge-row">
@@ -558,21 +912,24 @@ export function App() {
             <TriangleAlert
               size={13}
               aria-hidden="true"
-              style={{ verticalAlign: "text-bottom", marginInlineEnd: "0.3rem" }}
+              style={{
+                verticalAlign: "text-bottom",
+                marginInlineEnd: "0.3rem",
+              }}
             />
             {telemetry.status.last_error}
           </div>
         )}
 
-        {/* Primary Noise Cancellation Switch & Live Meters */}
+        {/* Primary Noise Cancellation Switch, Mic Mute & Live Meters */}
         <section
-          className="card hero-card"
+          className={`card hero-card ${micMuted ? "is-muted" : ""}`}
           aria-labelledby={`${uid}-hero-heading`}
         >
           <div className="hero-top">
             <div className="hero-title-row">
               <span className="hero-icon-box" aria-hidden="true">
-                {ncEnabled ? <Mic size={15} /> : <MicOff size={15} />}
+                <AudioLines size={15} />
               </span>
               <label
                 id={`${uid}-hero-heading`}
@@ -586,7 +943,7 @@ export function App() {
                 aria-hidden="true"
               >
                 <span className="nc-state-dot" />
-                <span>{ncEnabled ? "ON" : "OFF"}</span>
+                <span>{ncEnabled ? "ON" : "スルー"}</span>
               </span>
             </div>
             <input
@@ -599,6 +956,36 @@ export function App() {
               onChange={(e) => void handleToggleNc(e.currentTarget.checked)}
               {...({ switch: "" } as Record<string, string>)}
             />
+          </div>
+
+          <div className="hero-mute-row">
+            <div className="hero-mute-info">
+              <span
+                className={`mute-status-dot ${micMuted ? "is-muted" : ""}`}
+                aria-hidden="true"
+              />
+              <span className="hero-mute-label">
+                {micMuted ? "マイクミュート中（無音）" : "マイク送信中"}
+              </span>
+              {config?.shortcut_toggle_mute && (
+                <kbd className="inline-kbd">
+                  {formatShortcutLabel(config.shortcut_toggle_mute, isMac)}
+                </kbd>
+              )}
+            </div>
+            <button
+              type="button"
+              className={`mute-pill-btn ${micMuted ? "is-muted" : ""}`}
+              aria-pressed={micMuted}
+              onClick={() => void handleToggleMute()}
+            >
+              {micMuted ? (
+                <MicOff size={12} aria-hidden="true" />
+              ) : (
+                <Mic size={12} aria-hidden="true" />
+              )}
+              <span>{micMuted ? "ミュート解除" : "ミュート"}</span>
+            </button>
           </div>
 
           <div className="meters-box">
@@ -619,21 +1006,44 @@ export function App() {
               <div className="meter-label">
                 <span className="meter-label-left">
                   <label htmlFor={outputMeterId}>
-                    {ncEnabled ? "ノイズ除去後" : "スルー出力 (未処理)"}
+                    {micMuted
+                      ? "ミュート中 (無音送信)"
+                      : ncEnabled
+                      ? "ノイズ除去後"
+                      : "スルー出力 (未処理)"}
                   </label>
-                  {ncEnabled && (telemetry?.noise_reduced_db ?? 0) > 1.5 && (
-                    <span className="reduction-badge">
-                      -{(telemetry?.noise_reduced_db ?? 0).toFixed(0)} dB
+                  {!micMuted &&
+                    ncEnabled &&
+                    (telemetry?.noise_reduced_db ?? 0) > 1.5 && (
+                      <span className="reduction-badge">
+                        -{(telemetry?.noise_reduced_db ?? 0).toFixed(0)} dB
+                      </span>
+                    )}
+                  {clippingActive && (
+                    <span
+                      className="clip-badge"
+                      role="status"
+                      title="入力または出力がリミッターに達しました。入力ゲインを下げてください。"
+                    >
+                      CLIP
                     </span>
                   )}
                 </span>
-                <span>{(telemetry?.output_rms_db ?? -90).toFixed(0)} dB</span>
+                <span>
+                  {micMuted
+                    ? "-∞ dB"
+                    : `${(telemetry?.output_rms_db ?? -90).toFixed(0)} dB`}
+                </span>
               </div>
               <progress
                 id={outputMeterId}
-                className={`audio-meter ${ncEnabled ? "" : "raw"}`}
+                className={`audio-meter ${
+                  micMuted ? "muted" : ncEnabled ? "" : "raw"
+                }`}
                 max={1}
-                value={dbToRatio(telemetry?.output_rms_db ?? -90)}
+                value={
+                  micMuted ? 0 : dbToRatio(telemetry?.output_rms_db ?? -90)
+                }
               />
             </div>
           </div>
@@ -795,7 +1205,7 @@ export function App() {
           )}
         </section>
 
-        {/* Secondary Disclosure: Noise Suppression Strength, AI Model & VAD Gate */}
+        {/* Secondary Disclosure: Noise Suppression Strength, AI Model, HPF, AGC & VAD Gate */}
         <details className="disclosure-card" open>
           <summary>
             <Sliders size={14} aria-hidden="true" />
@@ -867,7 +1277,9 @@ export function App() {
                         0.0,
                         gainDb,
                         vadGateEnabled,
-                        vadThreshDb
+                        vadThreshDb,
+                        hpfEnabled,
+                        agcEnabled
                       )
                     }
                   />
@@ -888,10 +1300,12 @@ export function App() {
                     onChange={() =>
                       void handleParamChange(
                         65,
-                        0.02,
+                        0.0,
                         gainDb,
                         vadGateEnabled,
-                        vadThreshDb
+                        vadThreshDb,
+                        hpfEnabled,
+                        agcEnabled
                       )
                     }
                   />
@@ -912,10 +1326,12 @@ export function App() {
                     onChange={() =>
                       void handleParamChange(
                         100,
-                        0.035,
+                        0.015,
                         gainDb,
                         vadGateEnabled,
-                        vadThreshDb
+                        vadThreshDb,
+                        hpfEnabled,
+                        agcEnabled
                       )
                     }
                   />
@@ -946,7 +1362,9 @@ export function App() {
                     pfBeta,
                     gainDb,
                     vadGateEnabled,
-                    vadThreshDb
+                    vadThreshDb,
+                    hpfEnabled,
+                    agcEnabled
                   )
                 }
               />
@@ -974,10 +1392,86 @@ export function App() {
                     pfBeta,
                     Number(e.target.value),
                     vadGateEnabled,
-                    vadThreshDb
+                    vadThreshDb,
+                    hpfEnabled,
+                    agcEnabled
                   )
                 }
               />
+            </div>
+
+            {/* Voice Conditioning Toggles: HPF 80Hz & VAD-Gated AGC */}
+            <div className="dsp-toggle-section">
+              <div className="dsp-toggle-row">
+                <div className="dsp-toggle-copy">
+                  <label htmlFor={hpfSwitchId} className="vad-title">
+                    ハイパスフィルタ (HPF 65Hz)
+                  </label>
+                  <span id={hpfHintId} className="field-hint">
+                    机の振動・アーム衝撃・吹かれ音などの超低域ノイズをカット
+                  </span>
+                </div>
+                <input
+                  id={hpfSwitchId}
+                  name="hpf_enabled"
+                  type="checkbox"
+                  role={supportsNativeSwitch ? undefined : "switch"}
+                  className="nc-toggle compact"
+                  checked={hpfEnabled}
+                  aria-describedby={hpfHintId}
+                  onChange={(e) =>
+                    void handleParamChange(
+                      attenDb,
+                      pfBeta,
+                      gainDb,
+                      vadGateEnabled,
+                      vadThreshDb,
+                      e.currentTarget.checked,
+                      agcEnabled
+                    )
+                  }
+                  {...({ switch: "" } as Record<string, string>)}
+                />
+              </div>
+
+              <div className="dsp-toggle-row">
+                <div className="dsp-toggle-copy">
+                  <div className="vad-title-group">
+                    <label htmlFor={agcSwitchId} className="vad-title">
+                      オートゲイン (AGC)
+                    </label>
+                    {agcEnabled && (
+                      <span className="agc-live-pill" aria-hidden="true">
+                        {agcLiveText}
+                      </span>
+                    )}
+                  </div>
+                  <span id={agcHintId} className="field-hint">
+                    発話区間のみで声の音量を自動均一化（無音時のノイズ増幅を防止）
+                  </span>
+                </div>
+                <input
+                  id={agcSwitchId}
+                  name="agc_enabled"
+                  type="checkbox"
+                  role={supportsNativeSwitch ? undefined : "switch"}
+                  className="nc-toggle compact"
+                  checked={agcEnabled}
+                  aria-describedby={agcHintId}
+                  onChange={(e) =>
+                    void handleParamChange(
+                      attenDb,
+                      pfBeta,
+                      gainDb,
+                      vadGateEnabled,
+                      vadThreshDb,
+                      hpfEnabled,
+                      e.currentTarget.checked
+                    )
+                  }
+                  {...({ switch: "" } as Record<string, string>)}
+                />
+              </div>
             </div>
 
             <div className="vad-section">
@@ -1019,7 +1513,9 @@ export function App() {
                       pfBeta,
                       gainDb,
                       e.currentTarget.checked,
-                      vadThreshDb
+                      vadThreshDb,
+                      hpfEnabled,
+                      agcEnabled
                     )
                   }
                   {...({ switch: "" } as Record<string, string>)}
@@ -1055,7 +1551,9 @@ export function App() {
                       pfBeta,
                       gainDb,
                       vadGateEnabled,
-                      Number(e.target.value)
+                      Number(e.target.value),
+                      hpfEnabled,
+                      agcEnabled
                     )
                   }
                 />
@@ -1227,7 +1725,9 @@ export function App() {
         ref={settingsDialogRef}
         className="settings-dialog"
         aria-labelledby={settingsTitleId}
-        {...({ closedby: "any" } as Record<string, string>)}
+        {...({
+          closedby: recordingAction !== null ? "none" : "any",
+        } as Record<string, string>)}
       >
         <div className="settings-dialog-panel">
           <div className="settings-dialog-header">
@@ -1257,7 +1757,8 @@ export function App() {
                     OS 起動時にバックグラウンドで自動起動
                   </label>
                   <span id={autostartHintId} className="field-hint">
-                    ウィンドウを出さず{isMac ? "メニューバー" : "通知領域"}で静かに待機します
+                    ウィンドウを出さず{isMac ? "メニューバー" : "通知領域"}
+                    で静かに待機します
                   </span>
                 </div>
                 <input
@@ -1279,6 +1780,129 @@ export function App() {
               {autostartError && (
                 <div className="error-banner" role="alert">
                   {autostartError}
+                </div>
+              )}
+            </div>
+
+            <div className="settings-group">
+              <span className="settings-group-label">
+                グローバルショートカット・操作音
+              </span>
+
+              <div className="shortcut-row">
+                <div className="shortcut-copy">
+                  <span className="shortcut-title">ノイズ除去 ON / OFF</span>
+                  <kbd
+                    className={`shortcut-kbd ${
+                      config?.shortcut_toggle_nc ? "" : "is-empty"
+                    }`}
+                  >
+                    {formatShortcutLabel(config?.shortcut_toggle_nc, isMac)}
+                  </kbd>
+                </div>
+                <div className="shortcut-actions">
+                  <button
+                    type="button"
+                    className={`shortcut-record-btn ${
+                      recordingAction === "toggle_nc" ? "is-recording" : ""
+                    }`}
+                    aria-pressed={recordingAction === "toggle_nc"}
+                    onClick={() => void startShortcutRecording("toggle_nc")}
+                  >
+                    <Keyboard size={12} aria-hidden="true" />
+                    <span>
+                      {recordingAction === "toggle_nc"
+                        ? "キーを入力 (Esc取消)"
+                        : "設定"}
+                    </span>
+                    <span className="visually-hidden">
+                      （ノイズ除去 ON/OFF）
+                    </span>
+                  </button>
+                  {config?.shortcut_toggle_nc && (
+                    <button
+                      type="button"
+                      className="icon-btn shortcut-clear-btn"
+                      onClick={() => void handleClearShortcut("toggle_nc")}
+                      aria-label="ノイズ除去 ON/OFF のショートカットを解除"
+                    >
+                      <X size={12} aria-hidden="true" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="shortcut-row">
+                <div className="shortcut-copy">
+                  <span className="shortcut-title">マイクミュート</span>
+                  <kbd
+                    className={`shortcut-kbd ${
+                      config?.shortcut_toggle_mute ? "" : "is-empty"
+                    }`}
+                  >
+                    {formatShortcutLabel(config?.shortcut_toggle_mute, isMac)}
+                  </kbd>
+                </div>
+                <div className="shortcut-actions">
+                  <button
+                    type="button"
+                    className={`shortcut-record-btn ${
+                      recordingAction === "toggle_mute" ? "is-recording" : ""
+                    }`}
+                    aria-pressed={recordingAction === "toggle_mute"}
+                    onClick={() => void startShortcutRecording("toggle_mute")}
+                  >
+                    <Keyboard size={12} aria-hidden="true" />
+                    <span>
+                      {recordingAction === "toggle_mute"
+                        ? "キーを入力 (Esc取消)"
+                        : "設定"}
+                    </span>
+                    <span className="visually-hidden">（マイクミュート）</span>
+                  </button>
+                  {config?.shortcut_toggle_mute && (
+                    <button
+                      type="button"
+                      className="icon-btn shortcut-clear-btn"
+                      onClick={() => void handleClearShortcut("toggle_mute")}
+                      aria-label="マイクミュートのショートカットを解除"
+                    >
+                      <X size={12} aria-hidden="true" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="settings-toggle-row">
+                <div className="settings-toggle-copy">
+                  <label
+                    htmlFor={cueSoundSwitchId}
+                    className="settings-toggle-title"
+                  >
+                    ショートカット操作音
+                  </label>
+                  <span id={cueSoundHintId} className="field-hint">
+                    ホットキーやトレイ切替時に控えめな確認音を鳴らします
+                  </span>
+                </div>
+                <input
+                  id={cueSoundSwitchId}
+                  name="shortcut_sound_enabled"
+                  type="checkbox"
+                  role={supportsNativeSwitch ? undefined : "switch"}
+                  className="nc-toggle compact"
+                  checked={shortcutSoundEnabled}
+                  aria-describedby={cueSoundHintId}
+                  onChange={(e) =>
+                    void handleToggleShortcutSound(e.currentTarget.checked)
+                  }
+                  {...({ switch: "" } as Record<string, string>)}
+                />
+              </div>
+
+              {shortcutError && (
+                <div className="error-banner" role="alert">
+                  {shortcutError}
                 </div>
               )}
             </div>
@@ -1307,7 +1931,9 @@ export function App() {
                   <span className="diag-key">サンプルレート</span>
                   <span className="diag-val">
                     {telemetry?.status.input_sample_rate
-                      ? `${Math.round(telemetry.status.input_sample_rate / 1000)} kHz`
+                      ? `${Math.round(
+                          telemetry.status.input_sample_rate / 1000
+                        )} kHz`
                       : "—"}
                   </span>
                 </div>
@@ -1342,7 +1968,7 @@ export function App() {
           </div>
 
           <div className="settings-dialog-footer">
-            <span>Shizuka v0.2.0</span>
+            <span>Shizuka v0.3.0</span>
             <span>ESC または外側クリックで閉じる</span>
           </div>
         </div>

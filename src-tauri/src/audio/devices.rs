@@ -43,10 +43,8 @@ fn virtual_output_priority(name: &str) -> u8 {
         115 // Native MIT Shizuka HAL driver on macOS
     } else if lower.contains("clearvoice virtual") {
         110 // Legacy ClearVoice HAL driver compatibility on macOS
-    } else if lower.contains("cable input") {
-        100 // VB-CABLE primary sink on Windows
-    } else if lower.contains("blackhole 2ch") {
-        100 // BlackHole 2ch primary sink on macOS
+    } else if lower.contains("cable input") || lower.contains("blackhole 2ch") {
+        100 // VB-CABLE primary sink on Windows / BlackHole 2ch primary sink on macOS
     } else if lower.contains("blackhole") || lower.contains("vb-audio") {
         85
     } else if lower.contains("voicemeeter") || lower.contains("virtual audio") {

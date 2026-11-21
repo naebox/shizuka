@@ -53,13 +53,32 @@ pub struct EngineDeviceStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DspParams {
+    pub atten_lim_db: f32,
+    pub post_filter_beta: f32,
+    pub input_gain_db: f32,
+    pub min_db_thresh: f32,
+    pub vad_gate_enabled: bool,
+    pub vad_threshold_db: f32,
+    pub hpf_enabled: bool,
+    pub agc_enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioTelemetry {
     pub stream_running: bool,
     pub nc_enabled: bool,
+    pub mic_muted: bool,
     pub model_variant: ModelVariant,
     pub vad_gate_enabled: bool,
     pub vad_speaking: bool,
+    pub hpf_enabled: bool,
+    pub agc_enabled: bool,
+    pub agc_gain_db: f32,
+    pub clipping_active: bool,
+    pub clip_count: u64,
+    pub config_revision: u64,
     pub virtual_out_connected: bool,
     pub live_monitor_enabled: bool,
     pub monitor_clean: bool,
@@ -77,6 +96,7 @@ pub struct AudioTelemetry {
 
 pub struct SharedAudioState {
     pub nc_enabled: AtomicBool,
+    pub mic_muted: AtomicBool,
     pub model_variant_u8: AtomicU8,
     pub atten_lim_bits: AtomicU32,
     pub pf_beta_bits: AtomicU32,
@@ -85,6 +105,12 @@ pub struct SharedAudioState {
     pub vad_gate_enabled: AtomicBool,
     pub vad_threshold_bits: AtomicU32,
     pub vad_speaking: AtomicBool,
+    pub hpf_enabled: AtomicBool,
+    pub agc_enabled: AtomicBool,
+    pub agc_gain_db_bits: AtomicU32,
+    pub clipping_active: AtomicBool,
+    pub clip_count: AtomicU64,
+    pub config_revision: AtomicU64,
     pub live_monitor_enabled: AtomicBool,
     pub monitor_clean: AtomicBool,
     pub monitor_volume_bits: AtomicU32,
@@ -125,6 +151,7 @@ impl SharedAudioState {
     pub fn from_config(cfg: &AppConfig) -> Self {
         Self {
             nc_enabled: AtomicBool::new(cfg.nc_enabled),
+            mic_muted: AtomicBool::new(false),
             model_variant_u8: AtomicU8::new(variant_to_u8(cfg.model_variant)),
             atten_lim_bits: AtomicU32::new(cfg.atten_lim_db.to_bits()),
             pf_beta_bits: AtomicU32::new(cfg.post_filter_beta.to_bits()),
@@ -133,6 +160,12 @@ impl SharedAudioState {
             vad_gate_enabled: AtomicBool::new(cfg.vad_gate_enabled),
             vad_threshold_bits: AtomicU32::new(cfg.vad_threshold_db.to_bits()),
             vad_speaking: AtomicBool::new(false),
+            hpf_enabled: AtomicBool::new(cfg.hpf_enabled),
+            agc_enabled: AtomicBool::new(cfg.agc_enabled),
+            agc_gain_db_bits: AtomicU32::new(0.0f32.to_bits()),
+            clipping_active: AtomicBool::new(false),
+            clip_count: AtomicU64::new(0),
+            config_revision: AtomicU64::new(0),
             live_monitor_enabled: AtomicBool::new(false),
             monitor_clean: AtomicBool::new(true),
             monitor_volume_bits: AtomicU32::new(cfg.monitor_volume.clamp(0.0, 1.0).to_bits()),
@@ -156,10 +189,39 @@ impl SharedAudioState {
         }
     }
 
+    pub fn apply_dsp_params(&self, params: DspParams) {
+        store_f32(&self.atten_lim_bits, params.atten_lim_db);
+        store_f32(&self.pf_beta_bits, params.post_filter_beta);
+        store_f32(&self.input_gain_bits, params.input_gain_db);
+        store_f32(&self.min_db_thresh_bits, params.min_db_thresh);
+        self.vad_gate_enabled
+            .store(params.vad_gate_enabled, Ordering::Relaxed);
+        store_f32(&self.vad_threshold_bits, params.vad_threshold_db);
+        self.hpf_enabled
+            .store(params.hpf_enabled, Ordering::Relaxed);
+        self.agc_enabled
+            .store(params.agc_enabled, Ordering::Relaxed);
+    }
+
+    pub fn apply_config_dsp(&self, cfg: &AppConfig) {
+        self.apply_dsp_params(DspParams {
+            atten_lim_db: cfg.atten_lim_db,
+            post_filter_beta: cfg.post_filter_beta,
+            input_gain_db: cfg.input_gain_db,
+            min_db_thresh: cfg.min_db_thresh,
+            vad_gate_enabled: cfg.vad_gate_enabled,
+            vad_threshold_db: cfg.vad_threshold_db,
+            hpf_enabled: cfg.hpf_enabled,
+            agc_enabled: cfg.agc_enabled,
+        });
+    }
+
     pub fn snapshot(&self) -> AudioTelemetry {
         let in_db = load_f32(&self.input_rms_db_bits);
         let out_db = load_f32(&self.output_rms_db_bits);
-        let reduced = if self.nc_enabled.load(Ordering::Relaxed) {
+        let nc_enabled = self.nc_enabled.load(Ordering::Relaxed);
+        let mic_muted = self.mic_muted.load(Ordering::Relaxed);
+        let reduced = if nc_enabled && !mic_muted {
             (in_db - out_db).max(0.0)
         } else {
             0.0
@@ -178,10 +240,17 @@ impl SharedAudioState {
 
         AudioTelemetry {
             stream_running: self.stream_running.load(Ordering::Relaxed),
-            nc_enabled: self.nc_enabled.load(Ordering::Relaxed),
+            nc_enabled,
+            mic_muted,
             model_variant: u8_to_variant(self.model_variant_u8.load(Ordering::Relaxed)),
             vad_gate_enabled: self.vad_gate_enabled.load(Ordering::Relaxed),
             vad_speaking: self.vad_speaking.load(Ordering::Relaxed),
+            hpf_enabled: self.hpf_enabled.load(Ordering::Relaxed),
+            agc_enabled: self.agc_enabled.load(Ordering::Relaxed),
+            agc_gain_db: load_f32(&self.agc_gain_db_bits),
+            clipping_active: self.clipping_active.load(Ordering::Relaxed),
+            clip_count: self.clip_count.load(Ordering::Relaxed),
+            config_revision: self.config_revision.load(Ordering::Relaxed),
             virtual_out_connected: self.virtual_out_connected.load(Ordering::Relaxed),
             live_monitor_enabled: self.live_monitor_enabled.load(Ordering::Relaxed),
             monitor_clean: self.monitor_clean.load(Ordering::Relaxed),
@@ -216,6 +285,7 @@ enum EngineCommand {
         input_device: Option<String>,
         output_device: Option<String>,
         monitor_device: Option<String>,
+        profile_already_applied: bool,
     },
     SetModelVariant(ModelVariant),
     Stop,
@@ -268,18 +338,18 @@ struct MonitorPipeline {
 }
 
 impl AudioEngineHandle {
-    pub fn spawn(initial_cfg: &AppConfig) -> Self {
-        let shared = Arc::new(SharedAudioState::from_config(initial_cfg));
+    pub fn spawn(config: Arc<Mutex<AppConfig>>) -> Self {
+        let init_cfg = config.lock().map(|g| g.clone()).unwrap_or_default();
+        let shared = Arc::new(SharedAudioState::from_config(&init_cfg));
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
 
         let shared_ctrl = Arc::clone(&shared);
-        let init_cfg = initial_cfg.clone();
         let ctrl_tx = cmd_tx.clone();
 
         thread::Builder::new()
             .name("shizuka-audio-ctrl".into())
             .spawn(move || {
-                audio_control_loop(cmd_rx, ctrl_tx, shared_ctrl, init_cfg);
+                audio_control_loop(cmd_rx, ctrl_tx, shared_ctrl, config, init_cfg);
             })
             .expect("Failed to spawn audio controller thread");
 
@@ -291,11 +361,13 @@ impl AudioEngineHandle {
         input_device: Option<String>,
         output_device: Option<String>,
         monitor_device: Option<String>,
+        profile_already_applied: bool,
     ) {
         let _ = self.cmd_tx.send(EngineCommand::StartOrRestart {
             input_device,
             output_device,
             monitor_device,
+            profile_already_applied,
         });
     }
 
@@ -307,23 +379,12 @@ impl AudioEngineHandle {
         self.shared.nc_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    pub fn set_params(
-        &self,
-        atten_lim_db: f32,
-        pf_beta: f32,
-        input_gain_db: f32,
-        min_db_thresh: f32,
-        vad_gate_enabled: bool,
-        vad_threshold_db: f32,
-    ) {
-        store_f32(&self.shared.atten_lim_bits, atten_lim_db);
-        store_f32(&self.shared.pf_beta_bits, pf_beta);
-        store_f32(&self.shared.input_gain_bits, input_gain_db);
-        store_f32(&self.shared.min_db_thresh_bits, min_db_thresh);
-        self.shared
-            .vad_gate_enabled
-            .store(vad_gate_enabled, Ordering::Relaxed);
-        store_f32(&self.shared.vad_threshold_bits, vad_threshold_db);
+    pub fn set_mic_muted(&self, muted: bool) {
+        self.shared.mic_muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn set_params(&self, params: DspParams) {
+        self.shared.apply_dsp_params(params);
     }
 
     pub fn set_model_variant(&self, variant: ModelVariant) {
@@ -394,13 +455,16 @@ fn reset_audio_meters(shared: &SharedAudioState) {
     store_f32(&shared.input_rms_db_bits, -90.0);
     store_f32(&shared.output_rms_db_bits, -90.0);
     store_f32(&shared.monitor_rms_db_bits, -90.0);
+    store_f32(&shared.agc_gain_db_bits, 0.0);
     shared.vad_speaking.store(false, Ordering::Relaxed);
+    shared.clipping_active.store(false, Ordering::Relaxed);
 }
 
 fn audio_control_loop(
     cmd_rx: mpsc::Receiver<EngineCommand>,
     cmd_tx: mpsc::Sender<EngineCommand>,
     shared: Arc<SharedAudioState>,
+    config: Arc<Mutex<AppConfig>>,
     init_cfg: AppConfig,
 ) {
     let mut main_pipe: Option<RunningPipeline> = None;
@@ -411,6 +475,7 @@ fn audio_control_loop(
     let mut cur_mon_dev = init_cfg.monitor_device.clone();
     let mut want_running = init_cfg.stream_active;
     let mut want_mon = false;
+    let mut last_profile_mic: Option<String> = None;
 
     let mut main_gen: u64 = 0;
     let mut mon_gen: u64 = 0;
@@ -487,6 +552,8 @@ fn audio_control_loop(
     let start_main = |in_name: Option<String>,
                       out_name: Option<String>,
                       mon_name: Option<String>,
+                      profile_already_applied: bool,
+                      last_profile_mic: &mut Option<String>,
                       want_mon: &mut bool,
                       main_gen: &mut u64,
                       mon_gen: &mut u64,
@@ -506,10 +573,13 @@ fn audio_control_loop(
 
         match build_main_pipeline(
             &shared,
+            &config,
             &cmd_tx,
             current_gen,
             in_name.as_deref(),
             out_name.as_deref(),
+            last_profile_mic,
+            profile_already_applied,
         ) {
             Ok(pipe) => {
                 *main_pipe = Some(pipe);
@@ -560,6 +630,8 @@ fn audio_control_loop(
             cur_in_dev.clone(),
             cur_out_dev.clone(),
             cur_mon_dev.clone(),
+            false,
+            &mut last_profile_mic,
             &mut want_mon,
             &mut main_gen,
             &mut mon_gen,
@@ -582,6 +654,7 @@ fn audio_control_loop(
                     input_device,
                     output_device,
                     monitor_device,
+                    profile_already_applied,
                 } => {
                     cur_in_dev = input_device;
                     cur_out_dev = output_device;
@@ -592,6 +665,8 @@ fn audio_control_loop(
                         cur_in_dev.clone(),
                         cur_out_dev.clone(),
                         cur_mon_dev.clone(),
+                        profile_already_applied,
+                        &mut last_profile_mic,
                         &mut want_mon,
                         &mut main_gen,
                         &mut mon_gen,
@@ -614,6 +689,8 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            true,
+                            &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
@@ -661,6 +738,8 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            false,
+                            &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
@@ -766,6 +845,8 @@ fn audio_control_loop(
                                     cur_in_dev.clone(),
                                     cur_out_dev.clone(),
                                     cur_mon_dev.clone(),
+                                    false,
+                                    &mut last_profile_mic,
                                     &mut want_mon,
                                     &mut main_gen,
                                     &mut mon_gen,
@@ -786,7 +867,7 @@ fn audio_control_loop(
                     }
 
                     // 2. When set to "auto" (None), follow OS default physical microphone changes (~every 2s)
-                    if cur_in_dev.is_none() && watchdog_ticks % 4 == 0 {
+                    if cur_in_dev.is_none() && watchdog_ticks.is_multiple_of(4) {
                         if let Some(os_default) = default_physical_input_name() {
                             let changed = main_pipe
                                 .as_ref()
@@ -801,6 +882,8 @@ fn audio_control_loop(
                                     cur_in_dev.clone(),
                                     cur_out_dev.clone(),
                                     cur_mon_dev.clone(),
+                                    false,
+                                    &mut last_profile_mic,
                                     &mut want_mon,
                                     &mut main_gen,
                                     &mut mon_gen,
@@ -820,7 +903,7 @@ fn audio_control_loop(
                     // 3. Reattach virtual output automatically if it reappears after driver install/reset (~every 3s)
                     if cur_out_dev.is_some()
                         && !shared.virtual_out_connected.load(Ordering::Relaxed)
-                        && watchdog_ticks % 6 == 0
+                        && watchdog_ticks.is_multiple_of(6)
                         && find_output_device(cur_out_dev.as_deref(), false).is_some()
                     {
                         log::info!("Configured virtual output reappeared; reconnecting pipeline");
@@ -829,6 +912,8 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            true,
+                            &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
@@ -849,6 +934,8 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            false,
+                            &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
@@ -932,17 +1019,35 @@ fn build_live_monitor_stream(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_main_pipeline(
     shared: &Arc<SharedAudioState>,
+    config: &Arc<Mutex<AppConfig>>,
     cmd_tx: &mpsc::Sender<EngineCommand>,
     generation: u64,
     in_name: Option<&str>,
     out_name: Option<&str>,
+    last_profile_mic: &mut Option<String>,
+    profile_already_applied: bool,
 ) -> std::result::Result<RunningPipeline, PipelineStartError> {
     let in_dev = find_input_device(in_name).ok_or_else(|| {
         PipelineStartError::WaitingForDevice(in_name.filter(|s| !s.is_empty()).map(String::from))
     })?;
     let actual_in_name = in_dev.name().unwrap_or_else(|_| "Unknown Mic".into());
+
+    // Restore per-microphone profile automatically on startup, OS default mic switch, or reconnect
+    // (runs on the non-RT control thread before launching the real-time DSP worker).
+    if !profile_already_applied && last_profile_mic.as_deref() != Some(actual_in_name.as_str()) {
+        if let Ok(mut cfg) = config.lock() {
+            let changed = cfg.switch_to_mic_profile(last_profile_mic.as_deref(), &actual_in_name);
+            if changed {
+                shared.apply_config_dsp(&cfg);
+                let _ = cfg.save();
+                shared.config_revision.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    *last_profile_mic = Some(actual_in_name.clone());
     let supported_in = in_dev
         .default_input_config()
         .context("マイクの標準入力フォーマットを取得できません")
@@ -1040,6 +1145,8 @@ fn build_main_pipeline(
     let init_thresh = load_f32(&shared.min_db_thresh_bits);
     let init_vad_en = shared.vad_gate_enabled.load(Ordering::Relaxed);
     let init_vad_thresh = load_f32(&shared.vad_threshold_bits);
+    let init_hpf_en = shared.hpf_enabled.load(Ordering::Relaxed);
+    let init_agc_en = shared.agc_enabled.load(Ordering::Relaxed);
     let mut in_resampler =
         InputResampler48k::new(sr_in).map_err(PipelineStartError::Other)?;
     let mut out_resampler =
@@ -1063,6 +1170,8 @@ fn build_main_pipeline(
                 init_thresh,
                 init_vad_en,
                 init_vad_thresh,
+                init_hpf_en,
+                init_agc_en,
             ) {
                 Ok(p) => {
                     let _ = init_tx.send(Ok(()));
@@ -1092,6 +1201,7 @@ fn build_main_pipeline(
             let mut smooth_in_db = -85.0f32;
             let mut smooth_enh_db = -85.0f32;
             let mut smooth_out_db = -85.0f32;
+            let mut clip_hold_frames: u32 = 0;
 
             let mut mon_clean_mix = if shared_worker.monitor_clean.load(Ordering::Relaxed) {
                 1.0f32
@@ -1124,8 +1234,11 @@ fn build_main_pipeline(
 
                     let t0 = Instant::now();
 
-                    // Sync lock-free parameters from UI
+                    // Sync lock-free parameters from UI / shortcuts
                     processor.set_enabled(shared_worker.nc_enabled.load(Ordering::Relaxed));
+                    processor.set_mic_muted(shared_worker.mic_muted.load(Ordering::Relaxed));
+                    processor.set_hpf_enabled(shared_worker.hpf_enabled.load(Ordering::Relaxed));
+                    processor.set_agc_enabled(shared_worker.agc_enabled.load(Ordering::Relaxed));
                     processor.set_attenuation_limit(load_f32(&shared_worker.atten_lim_bits));
                     processor.set_post_filter_beta(load_f32(&shared_worker.pf_beta_bits));
                     processor.set_input_gain_db(load_f32(&shared_worker.input_gain_bits));
@@ -1142,7 +1255,7 @@ fn build_main_pipeline(
                         continue;
                     }
 
-                    let (lsnr, vad_speaking) = processor.process_frame_48k(
+                    let res = processor.process_frame_48k(
                         &frame_48k_in,
                         &mut frame_48k_raw,
                         &mut frame_48k_enh,
@@ -1150,7 +1263,23 @@ fn build_main_pipeline(
                     );
                     shared_worker
                         .vad_speaking
-                        .store(vad_speaking, Ordering::Relaxed);
+                        .store(res.vad_speaking, Ordering::Relaxed);
+                    store_f32(&shared_worker.agc_gain_db_bits, res.agc_gain_db);
+
+                    // Hold clipping warning for 1.5s (150 x 10ms frames) so 50ms UI polling never misses peaks
+                    if res.clipped {
+                        if clip_hold_frames == 0 {
+                            shared_worker.clip_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        clip_hold_frames = 150;
+                    } else {
+                        clip_hold_frames = clip_hold_frames.saturating_sub(1);
+                    }
+                    shared_worker
+                        .clipping_active
+                        .store(clip_hold_frames > 0, Ordering::Relaxed);
+
+                    let lsnr = res.lsnr_db;
 
                     // Push to Virtual Microphone Output with PI Clock Drift Compensation
                     if let Some(out_prod) = &mut out_prod_opt {
@@ -1334,6 +1463,7 @@ fn build_main_pipeline(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_input_stream_to_rb(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -1640,10 +1770,10 @@ where
                     had_underrun = true;
                 }
 
-                for i in 0..batch {
+                for (i, &sample) in mono_scratch.iter().enumerate().take(batch) {
                     let val = if i < popped {
-                        last_sample = mono_scratch[i];
-                        mono_scratch[i]
+                        last_sample = sample;
+                        sample
                     } else {
                         // Gentle exponential decay to zero on rare underrun to avoid sharp click
                         last_sample *= 0.95;
@@ -1733,9 +1863,9 @@ mod tests {
         let mut total_popped = 0usize;
 
         for f in 0..20 {
-            for i in 0..DFN_HOP_SIZE {
+            for (i, s) in frame.iter_mut().enumerate() {
                 let t = (f * DFN_HOP_SIZE + i) as f32 / 48_000.0;
-                frame[i] = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+                *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
             }
             let occ = prod.occupied_len();
             let rel = drift.update(occ);

@@ -46,6 +46,14 @@
     0 0 0.45rem rgb(16 185 129 / 0.5)
   );
 
+  /* Alert / Mute / Clip Hardware-LED Red Accent (>= 3:1 UI dot, >= 4.5:1 text) */
+  --color-led-red: light-dark(#dc2626, #ef4444);
+  --color-text-red: light-dark(#b91c1c, #f87171);
+  --led-red-glow: light-dark(
+    0 0 0.35rem rgb(220 38 38 / 0.32),
+    0 0 0.45rem rgb(239 68 68 / 0.52)
+  );
+
   /* Meters & Tracks (>= 3:1 track boundary contrast in both schemes) */
   --color-meter-raw: light-dark(#767670, #787874);
   --color-track: light-dark(#e5e5df, #252528);
@@ -88,6 +96,9 @@
     --color-led-green: Highlight;
     --color-text-green: Highlight;
     --led-glow: none;
+    --color-led-red: Mark;
+    --color-text-red: CanvasText;
+    --led-red-glow: none;
     --color-track: Canvas;
     --color-track-border: GrayText;
     --discord-meter-track: GrayText;
@@ -244,6 +255,15 @@
         forced-color-adjust: none;
       }
     }
+
+    &.muted .mark-led {
+      fill: var(--color-led-red);
+      stroke: none;
+
+      @media (forced-colors: active) {
+        forced-color-adjust: none;
+      }
+    }
   }
 
   .brand-title {
@@ -326,6 +346,14 @@
 
     &:has(.nc-toggle:checked) {
       --hero-border: var(--border-strong);
+    }
+
+    &.is-muted {
+      --hero-border: color-mix(
+        in oklab,
+        var(--color-led-red) 62%,
+        var(--border-subtle)
+      );
     }
   }
 
@@ -504,10 +532,120 @@
     }
   }
 
+  /* Compact Mic Mute Bar inside Hero Card */
+  .hero-mute-row {
+    margin-block-start: 0.55rem;
+    padding-block-start: 0.55rem;
+    border-block-start: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    min-block-size: 1.85rem;
+  }
+
+  .hero-mute-info {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-inline-size: 0;
+    flex: 1;
+  }
+
+  .mute-status-dot {
+    inline-size: 0.42rem;
+    block-size: 0.42rem;
+    border-radius: 50%;
+    background: var(--color-led-green);
+    box-shadow: var(--led-glow);
+    flex-shrink: 0;
+
+    &.is-muted {
+      background: var(--color-led-red);
+      box-shadow: var(--led-red-glow);
+    }
+
+    @media (forced-colors: active) {
+      forced-color-adjust: none;
+    }
+  }
+
+  .hero-mute-label {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+
+    .hero-card.is-muted & {
+      color: var(--color-text-red);
+      font-weight: 600;
+    }
+  }
+
+  .inline-kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.62rem;
+    line-height: 1.2;
+    padding: 0.1rem 0.32rem;
+    border-radius: 0.3rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .mute-pill-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.3rem;
+    min-block-size: 1.75rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-ui);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+
+    @media (prefers-reduced-motion: no-preference) {
+      transition: background-color 140ms ease, border-color 140ms ease,
+        color 140ms ease, scale 120ms ease;
+    }
+
+    &:hover {
+      border-color: var(--border-strong);
+      box-shadow: var(--hover-shadow);
+    }
+
+    &:active {
+      scale: 0.96;
+    }
+
+    &.is-muted {
+      background: color-mix(in oklab, var(--color-led-red) 14%, var(--bg-card));
+      border-color: color-mix(
+        in oklab,
+        var(--color-led-red) 60%,
+        var(--border-subtle)
+      );
+      color: var(--color-text-red);
+
+      &:hover {
+        border-color: var(--color-led-red);
+      }
+    }
+  }
+
   /* Monochrome Audio Level Meters (<progress>) */
   .meters-box {
-    margin-block-start: 0.7rem;
-    padding-block-start: 0.65rem;
+    margin-block-start: 0.55rem;
+    padding-block-start: 0.55rem;
     border-block-start: 1px solid var(--border-subtle);
     display: flex;
     flex-direction: column;
@@ -546,6 +684,21 @@
     line-height: 1;
   }
 
+  .clip-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.08rem 0.34rem;
+    border-radius: 0.3rem;
+    background: color-mix(in oklab, var(--color-led-red) 16%, var(--bg-card));
+    border: 1px solid
+      color-mix(in oklab, var(--color-led-red) 60%, var(--border-subtle));
+    color: var(--color-text-red);
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    line-height: 1.1;
+  }
+
   progress.audio-meter {
     --progress-bar-radius: 999px;
     --progress-bar-track: var(--color-track);
@@ -561,6 +714,11 @@
 
     &.raw {
       --progress-bar-fill: var(--color-meter-raw);
+    }
+
+    &.muted {
+      --progress-bar-fill: var(--color-led-red);
+      opacity: 0.55;
     }
   }
 
@@ -1020,6 +1178,46 @@
   input[type="range"].range-control:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  /* Voice Conditioning Toggles (HPF 80Hz & VAD-Gated AGC) */
+  .dsp-toggle-section {
+    margin-block-start: 0.65rem;
+    padding-block-start: 0.65rem;
+    border-block-start: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+
+  .dsp-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem;
+  }
+
+  .dsp-toggle-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-inline-size: 0;
+    flex: 1;
+  }
+
+  .agc-live-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-size: 0.64rem;
+    font-weight: 600;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
   }
 
   /* VAD Noise Gate Section inside Disclosure Body */
@@ -1538,6 +1736,107 @@
     font-weight: 600;
     color: var(--text-primary);
     cursor: pointer;
+  }
+
+  /* Global Shortcut Key Recording Rows inside Settings Dialog */
+  .shortcut-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0.5rem 0.65rem;
+    border-radius: 0.55rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .shortcut-copy {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.22rem;
+    min-inline-size: 0;
+    flex: 1;
+  }
+
+  .shortcut-title {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .shortcut-kbd {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.68rem;
+    font-weight: 600;
+    line-height: 1.2;
+    padding: 0.16rem 0.42rem;
+    border-radius: 0.35rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border-ui);
+    color: var(--text-primary);
+    max-inline-size: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.is-empty {
+      border-style: dashed;
+      border-color: var(--border-subtle);
+      color: var(--text-secondary);
+      font-weight: 500;
+      font-family: inherit;
+    }
+  }
+
+  .shortcut-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    flex-shrink: 0;
+  }
+
+  .shortcut-record-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.3rem;
+    min-block-size: 1.75rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 0.45rem;
+    border: 1px solid var(--border-ui);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+
+    @media (prefers-reduced-motion: no-preference) {
+      transition: background-color 140ms ease, border-color 140ms ease,
+        color 140ms ease, scale 120ms ease;
+    }
+
+    &:hover {
+      border-color: var(--border-strong);
+      box-shadow: var(--hover-shadow);
+    }
+
+    &:active {
+      scale: 0.96;
+    }
+
+    &.is-recording {
+      background: var(--color-accent);
+      border-color: var(--color-accent);
+      color: var(--color-accent-contrast);
+    }
+  }
+
+  .shortcut-clear-btn {
+    min-inline-size: 1.75rem;
+    min-block-size: 1.75rem;
   }
 
   .diag-grid {

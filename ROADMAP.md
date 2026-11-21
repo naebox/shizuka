@@ -48,19 +48,21 @@ flowchart LR
 
 ---
 
-## Phase 2: `v0.3.0` — 音質強化（HPF / AGC / マイク別記憶）＆グローバルショートカット
+## Phase 2: `v0.3.0` — 音質強化（HPF / AGC / マイク別記憶）＆グローバルショートカット（リリース済み）
 
 音質の完成度と、フルスクリーンゲーム・会議中のハンズフリー操作を仕上げます。
 
-- [ ] **ハイパスフィルタ (HPF 約80Hz)** ([processor.rs](./src-tauri/src/audio/processor.rs))
-  - ゼロアロケーション 2 次 Butterworth フィルタを AI 推論前に配置し、机の振動・アーム衝撃・吹かれ音を除去。
-- [ ] **VAD 連動・軽量オートゲイン (AGC) ＋クリッピング警告** ([processor.rs](./src-tauri/src/audio/processor.rs), [App.tsx](./src/App.tsx))
-  - `vad_speaking == true` の発話区間のみで追従するため、無音時の背景ノイズ持ち上げを防止。リミッター作動時にクリップ警告を表示。
-- [ ] **マイク別プロファイル自動記憶** ([config.rs](./src-tauri/src/config.rs), [lib.rs](./src-tauri/src/lib.rs))
+- [x] **ハイパスフィルタ (HPF 約65Hz)** ([processor.rs](./src-tauri/src/audio/processor.rs))
+  - ゼロアロケーション 2 次 Butterworth フィルタを AI 推論前に配置し、声の基音（85〜120Hz）を保ちつつ机の振動・アーム衝撃・吹かれ音を除去。
+  - DeepFilterNet3 の不連続なステージスキップ（`20 dB` / `30 dB` 境界）および過剰なポストフィルタ・強制ゼロマスクを緩和し、高 SN 比マイクでの音量ジャンプ・機械音・途切れを解消。
+- [x] **VAD 連動・軽量オートゲイン (AGC) ＋クリッピング警告** ([processor.rs](./src-tauri/src/audio/processor.rs), [App.tsx](./src/App.tsx))
+  - `vad_speaking == true` の発話区間のみで追従するため、無音時の背景ノイズ持ち上げを防止。リミッター作動時にクリップ警告（`CLIP`）を表示。
+- [x] **マイク別プロファイル自動記憶** ([config.rs](./src-tauri/src/config.rs), [lib.rs](./src-tauri/src/lib.rs))
   - 物理マイク名ごとにゲイン・除去強度・VAD・HPF・AGC 設定を自動保存・復元（UI 増加ゼロ）。
-- [ ] **グローバルショートカット＆マイクミュート** ([lib.rs](./src-tauri/src/lib.rs), [engine.rs](./src-tauri/src/audio/engine.rs))
+- [x] **グローバルショートカット＆マイクミュート** ([lib.rs](./src-tauri/src/lib.rs), [shortcuts.rs](./src-tauri/src/shortcuts.rs), [cue.rs](./src-tauri/src/audio/cue.rs))
   - `tauri-plugin-global-shortcut`（初期値未割当）で「ノイズ除去 ON/OFF」と「マイクミュート」を任意キー登録可能に。
   - ミュート専用トレイアイコン（`tray-mute.png`）＋控えめな合成操作音（設定で消音可）。
+- [x] `v0.3.0` リリース公開（macOS 実機フル検証は Phase 4 で最終確認）
 
 ---
 

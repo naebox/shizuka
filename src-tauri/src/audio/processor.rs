@@ -6,11 +6,125 @@ use crate::config::ModelVariant;
 
 pub const DFN_SAMPLE_RATE: usize = 48_000;
 pub const DFN_HOP_SIZE: usize = 480; // 10ms frame at 48kHz
+pub const HPF_CUTOFF_HZ: f64 = 65.0; // Removes desk rumble & plosives while preserving 85-120Hz voice fundamentals
+
+/// Knee threshold of `soft_limit()` (~ -0.72 dBFS); exceeding this triggers clipping detection.
+pub const CLIP_DETECT_THRESH: f32 = 0.92;
 
 const DFN3_STANDARD_BYTES: &[u8] = include_bytes!("../../models/DeepFilterNet3_onnx.tar.gz");
 
+/// Result metrics emitted by `NoiseProcessor::process_frame_48k` per 10ms frame.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameProcessResult {
+    pub lsnr_db: f32,
+    pub vad_speaking: bool,
+    pub agc_gain_db: f32,
+    pub clipped: bool,
+}
+
+/// Zero-allocation 2nd-order Butterworth High-Pass Filter (~65 Hz @ 48 kHz).
+/// Uses `f64` coefficients and Direct Form II Transposed state for precision at low fc/fs ratios.
+/// Removes desk thumps, boom-arm vibrations, air-conditioner rumble, plosives, and DC offset
+/// before AI inference while keeping low vocal fundamentals (85-120 Hz) intact.
+struct HighPassFilter {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+    enabled: bool,
+    mix: f32,
+}
+
+impl HighPassFilter {
+    fn new(sample_rate_hz: f64, cutoff_hz: f64, enabled: bool) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * cutoff_hz / sample_rate_hz;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let q = std::f64::consts::FRAC_1_SQRT_2; // Butterworth Q = 1 / sqrt(2)
+        let alpha = sin_w0 / (2.0 * q);
+        let a0 = 1.0 + alpha;
+
+        let b0 = ((1.0 + cos_w0) * 0.5) / a0;
+        let b1 = -(1.0 + cos_w0) / a0;
+        let b2 = ((1.0 + cos_w0) * 0.5) / a0;
+        let a1 = (-2.0 * cos_w0) / a0;
+        let a2 = (1.0 - alpha) / a0;
+
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            z1: 0.0,
+            z2: 0.0,
+            enabled,
+            mix: if enabled { 1.0 } else { 0.0 },
+        }
+    }
+
+    #[inline]
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Processes one sample through the biquad state continuously so toggling HPF never clicks.
+    #[inline]
+    fn tick_filter(&mut self, sample: f32) -> f32 {
+        let x = if sample.is_finite() {
+            sample as f64
+        } else {
+            0.0
+        };
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        // Flush denormals to zero to avoid x86 CPU stalls during extended silence
+        if self.z1.abs() < 1e-24 {
+            self.z1 = 0.0;
+        }
+        if self.z2.abs() < 1e-24 {
+            self.z2 = 0.0;
+        }
+        y as f32
+    }
+
+    /// Filters a 480-sample frame into `out_480` with clickless 10ms dry/wet ramping on toggle.
+    fn process_frame(&mut self, in_480: &[f32], out_480: &mut [f32]) {
+        let target_mix = if self.enabled { 1.0_f32 } else { 0.0_f32 };
+        let transitioning = (self.mix - target_mix).abs() > 1e-4;
+
+        if !transitioning {
+            self.mix = target_mix;
+            if self.enabled {
+                for i in 0..DFN_HOP_SIZE {
+                    out_480[i] = self.tick_filter(in_480[i]);
+                }
+            } else {
+                for &x in &in_480[..DFN_HOP_SIZE] {
+                    let _ = self.tick_filter(x);
+                }
+                out_480[..DFN_HOP_SIZE].copy_from_slice(&in_480[..DFN_HOP_SIZE]);
+            }
+        } else {
+            let step = (target_mix - self.mix) / (DFN_HOP_SIZE as f32);
+            let mut m = self.mix;
+            for i in 0..DFN_HOP_SIZE {
+                m = (m + step).clamp(0.0, 1.0);
+                let dry = in_480[i];
+                let wet = self.tick_filter(dry);
+                out_480[i] = dry * (1.0 - m) + wet * m;
+            }
+            self.mix = target_mix;
+        }
+    }
+}
+
 /// Hysteresis + Hold + Sample-Smoothed Voice Activity Detection (VAD) Noise Gate.
-/// Uses DeepFilterNet3's neural local SNR (`lsnr`) and post-filtered frame energy
+/// Uses DeepFilterNet3's neural local SNR (`lsnr`) and pre-AGC post-DFN frame energy
 /// to silence residual keystrokes and room hiss completely between speech phrases
 /// without clipping word onsets or trailing syllables.
 struct VadGate {
@@ -28,7 +142,7 @@ impl VadGate {
         Self {
             enabled,
             open_thresh_db: open_thresh_db.clamp(-18.0, 12.0),
-            is_open: false,
+            is_open: !enabled,
             hold_frames_left: 0,
             envelope_gain: if enabled { 0.0 } else { 1.0 },
         }
@@ -40,37 +154,24 @@ impl VadGate {
         self.open_thresh_db = open_thresh_db.clamp(-18.0, 12.0);
     }
 
-    /// Evaluates speech presence and applies per-sample smooth envelope gain to `enh_480`.
-    /// Returns `true` when voice activity is currently detected (including hangover hold).
-    fn process(&mut self, lsnr_db: f32, enh_480: &mut [f32], atten_lim_db: f32) -> bool {
+    /// Evaluates speech presence on pre-AGC post-DFN audio.
+    /// Returns `(speech_active_now, gate_open_or_speaking)`:
+    /// - `speech_active_now`: strict instantaneous voice presence (used to gate AGC updates so
+    ///   AGC never pumps background noise during silence or hangover tails).
+    /// - `gate_open_or_speaking`: voice activity status including hysteresis + 180ms hangover hold.
+    fn evaluate(&mut self, lsnr_db: f32, pre_agc_rms_db: f32) -> (bool, bool) {
         if !self.enabled {
             self.is_open = true;
-            // Smoothly ramp back to 1.0 if just disabled
-            for s in enh_480.iter_mut() {
-                self.envelope_gain += 0.02 * (1.0 - self.envelope_gain);
-                *s *= self.envelope_gain;
-            }
-            return lsnr_db >= self.open_thresh_db;
+            let speech_now = lsnr_db >= self.open_thresh_db && pre_agc_rms_db >= -52.0;
+            return (speech_now, speech_now);
         }
-
-        // Measure post-DFN frame energy so dead-quiet floor never false-triggers
-        let mut sum_sq = 0.0f32;
-        for &s in enh_480.iter() {
-            sum_sq += s * s;
-        }
-        let rms = (sum_sq / DFN_HOP_SIZE as f32).sqrt();
-        let rms_db = if rms < 1e-6 {
-            -120.0
-        } else {
-            20.0 * rms.log10()
-        };
 
         let speech_active_now = if self.is_open {
             // 3.5 dB hysteresis keeps trailing consonants & quiet sentence endings intact
-            lsnr_db >= (self.open_thresh_db - 3.5) && rms_db >= -66.0
+            lsnr_db >= (self.open_thresh_db - 3.5) && pre_agc_rms_db >= -66.0
         } else {
-            (lsnr_db >= self.open_thresh_db && rms_db >= -60.0)
-                || (lsnr_db >= self.open_thresh_db + 4.5 && rms_db >= -65.0)
+            (lsnr_db >= self.open_thresh_db && pre_agc_rms_db >= -60.0)
+                || (lsnr_db >= self.open_thresh_db + 4.5 && pre_agc_rms_db >= -65.0)
         };
 
         if speech_active_now {
@@ -81,6 +182,23 @@ impl VadGate {
             self.is_open = true;
         } else {
             self.is_open = false;
+        }
+
+        (speech_active_now, self.is_open)
+    }
+
+    /// Applies per-sample smooth gate envelope gain to `enh_480`.
+    fn apply_envelope(&mut self, enh_480: &mut [f32], atten_lim_db: f32) {
+        if !self.enabled {
+            if (self.envelope_gain - 1.0).abs() < 1e-4 {
+                self.envelope_gain = 1.0;
+                return;
+            }
+            for s in enh_480.iter_mut() {
+                self.envelope_gain += 0.02 * (1.0 - self.envelope_gain);
+                *s *= self.envelope_gain;
+            }
+            return;
         }
 
         // Complete silence (0.0) in Balanced/Max modes; gentle -32 dB floor in Natural mode
@@ -103,8 +221,79 @@ impl VadGate {
             };
             *s *= g;
         }
+    }
+}
 
-        self.is_open
+/// Lightweight VAD-Gated Automatic Gain Control (AGC).
+/// Tracks speech RMS exclusively when `speech_active_now == true` and voice level exceeds the
+/// speech floor, holding gain flat during silence/pauses to prevent background noise pumping.
+struct VadAgc {
+    enabled: bool,
+    current_gain_db: f32,
+    smoothed_gain_linear: f32,
+}
+
+impl VadAgc {
+    const TARGET_RMS_DB: f32 = -18.0; // Standard Discord / conferencing voice RMS target
+    const MIN_GAIN_DB: f32 = -12.0;
+    const MAX_GAIN_DB: f32 = 18.0;
+    const MIN_SPEECH_RMS_DB: f32 = -45.0; // Ignore near-silent frames even if lsnr momentarily spikes
+    const ALPHA_DOWN: f32 = 0.08; // ~120ms attack when attenuating loud speech
+    const ALPHA_UP: f32 = 0.0125; // ~800ms release when boosting quiet speech
+    const ALPHA_BYPASS: f32 = 0.12; // ~80ms smooth return to 0 dB when AGC disabled
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            current_gain_db: 0.0,
+            smoothed_gain_linear: 1.0,
+        }
+    }
+
+    #[inline]
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Updates gain only on confirmed active speech frames and applies sample-interpolated gain
+    /// to `enh_480`. Returns current applied AGC gain in dB.
+    fn process(
+        &mut self,
+        speech_active_now: bool,
+        pre_agc_rms_db: f32,
+        enh_480: &mut [f32],
+    ) -> f32 {
+        if !self.enabled {
+            self.current_gain_db += Self::ALPHA_BYPASS * (0.0 - self.current_gain_db);
+            if self.current_gain_db.abs() < 0.01 {
+                self.current_gain_db = 0.0;
+            }
+        } else if speech_active_now && pre_agc_rms_db >= Self::MIN_SPEECH_RMS_DB {
+            let desired_db = (Self::TARGET_RMS_DB - pre_agc_rms_db)
+                .clamp(Self::MIN_GAIN_DB, Self::MAX_GAIN_DB);
+            let alpha = if desired_db < self.current_gain_db {
+                Self::ALPHA_DOWN
+            } else {
+                Self::ALPHA_UP
+            };
+            self.current_gain_db += alpha * (desired_db - self.current_gain_db);
+        }
+
+        let target_linear = 10.0_f32.powf(self.current_gain_db / 20.0);
+        if (target_linear - 1.0).abs() < 1e-4 && (self.smoothed_gain_linear - 1.0).abs() < 1e-4 {
+            self.smoothed_gain_linear = 1.0;
+            return 0.0;
+        }
+
+        let step = (target_linear - self.smoothed_gain_linear) / (DFN_HOP_SIZE as f32);
+        let mut g = self.smoothed_gain_linear;
+        for s in enh_480.iter_mut() {
+            g += step;
+            *s *= g;
+        }
+        self.smoothed_gain_linear = target_linear;
+
+        self.current_gain_db
     }
 }
 
@@ -113,8 +302,13 @@ pub struct NoiseProcessor {
     variant: ModelVariant,
     in_frame: Array2<f32>,
     out_frame: Array2<f32>,
+    hpf_scratch: [f32; DFN_HOP_SIZE],
+    hpf: HighPassFilter,
+    agc: VadAgc,
     nc_enabled: bool,
     wet_mix: f32,
+    mic_muted: bool,
+    mute_gain: f32,
     input_gain_linear: f32,
     atten_lim_db: f32,
     pf_beta: f32,
@@ -122,6 +316,7 @@ pub struct NoiseProcessor {
 }
 
 impl NoiseProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         variant: ModelVariant,
         atten_lim_db: f32,
@@ -129,6 +324,8 @@ impl NoiseProcessor {
         min_db_thresh: f32,
         vad_enabled: bool,
         vad_thresh_db: f32,
+        hpf_enabled: bool,
+        agc_enabled: bool,
     ) -> Result<Self> {
         let df_params = match variant {
             ModelVariant::Standard => DfParams::from_bytes(DFN3_STANDARD_BYTES)?,
@@ -139,6 +336,10 @@ impl NoiseProcessor {
         rp.atten_lim_db = atten_lim_db;
         rp.post_filter_beta = pf_beta;
         rp.min_db_thresh = min_db_thresh;
+        // Disable abrupt mid-speech stage skipping (default 20 dB DF / 30 dB ERB cutoffs cause
+        // sudden volume jumps and phase glitches on high-SNR mics whose lsnr reaches 20..35 dB).
+        rp.max_db_erb_thresh = 40.0;
+        rp.max_db_df_thresh = 40.0;
 
         let mut model = DfTract::new(df_params, &rp)?;
         model.set_atten_lim(atten_lim_db);
@@ -155,8 +356,13 @@ impl NoiseProcessor {
             variant,
             in_frame: Array2::<f32>::zeros((1, hop)),
             out_frame: Array2::<f32>::zeros((1, hop)),
+            hpf_scratch: [0.0f32; DFN_HOP_SIZE],
+            hpf: HighPassFilter::new(DFN_SAMPLE_RATE as f64, HPF_CUTOFF_HZ, hpf_enabled),
+            agc: VadAgc::new(agc_enabled),
             nc_enabled: true,
             wet_mix: 1.0,
+            mic_muted: false,
+            mute_gain: 1.0,
             input_gain_linear: 1.0,
             atten_lim_db,
             pf_beta,
@@ -176,6 +382,21 @@ impl NoiseProcessor {
     #[inline]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.nc_enabled = enabled;
+    }
+
+    #[inline]
+    pub fn set_mic_muted(&mut self, muted: bool) {
+        self.mic_muted = muted;
+    }
+
+    #[inline]
+    pub fn set_hpf_enabled(&mut self, enabled: bool) {
+        self.hpf.set_enabled(enabled);
+    }
+
+    #[inline]
+    pub fn set_agc_enabled(&mut self, enabled: bool) {
+        self.agc.set_enabled(enabled);
     }
 
     #[inline]
@@ -210,47 +431,92 @@ impl NoiseProcessor {
     }
 
     /// Processes exactly 480 samples (10ms @ 48kHz) with zero heap allocations.
-    /// Writes gain-adjusted raw signal into `raw_out_480`, always-denoised (+ VAD gated) signal into `enh_out_480`,
-    /// and final output (denoised or bypassed with smooth crossfade) into `final_out_480`.
-    /// Returns `(lsnr_db, vad_speaking)`.
+    /// - `raw_out_480`: gain-adjusted raw signal (for A/B live monitor & NC bypass)
+    /// - `enh_out_480`: HPF -> DFN3 -> VAD-gated AGC -> VAD envelope -> soft-limited signal
+    /// - `final_out_480`: active output (denoised or bypassed) with clickless mic-mute fade
     pub fn process_frame_48k(
         &mut self,
         input_480: &[f32],
         raw_out_480: &mut [f32],
         enh_out_480: &mut [f32],
         final_out_480: &mut [f32],
-    ) -> (f32, bool) {
+    ) -> FrameProcessResult {
         debug_assert_eq!(input_480.len(), DFN_HOP_SIZE);
         debug_assert_eq!(raw_out_480.len(), DFN_HOP_SIZE);
         debug_assert_eq!(enh_out_480.len(), DFN_HOP_SIZE);
         debug_assert_eq!(final_out_480.len(), DFN_HOP_SIZE);
 
         let gain = self.input_gain_linear;
-        let mut in_slice = self.in_frame.row_mut(0);
+        let mut clipped = false;
 
-        for i in 0..DFN_HOP_SIZE {
-            let s = soft_limit(input_480[i] * gain);
-            in_slice[i] = s;
-            raw_out_480[i] = s;
+        // 1. Pre-AI 80Hz Butterworth High-Pass Filter (state continuously ticked for clickless toggle)
+        self.hpf.process_frame(input_480, &mut self.hpf_scratch);
+
+        // 2. Apply manual input gain & detect pre-limiter clipping
+        {
+            let mut in_slice = self.in_frame.row_mut(0);
+            for i in 0..DFN_HOP_SIZE {
+                let raw_scaled = input_480[i] * gain;
+                let hpf_scaled = self.hpf_scratch[i] * gain;
+                if !self.mic_muted {
+                    let active_in = if self.nc_enabled {
+                        hpf_scaled
+                    } else {
+                        raw_scaled
+                    };
+                    if active_in.abs() >= CLIP_DETECT_THRESH {
+                        clipped = true;
+                    }
+                }
+                raw_out_480[i] = soft_limit(raw_scaled);
+                in_slice[i] = soft_limit(hpf_scaled);
+            }
         }
 
+        // 3. DeepFilterNet3 neural inference
         let lsnr = self
             .model
             .process(self.in_frame.view(), self.out_frame.view_mut())
             .unwrap_or(-15.0);
 
-        let enh_slice = self.out_frame.row(0);
-        for i in 0..DFN_HOP_SIZE {
-            enh_out_480[i] = soft_limit(enh_slice[i]);
+        let mut sum_sq = 0.0f32;
+        {
+            let enh_slice = self.out_frame.row(0);
+            for i in 0..DFN_HOP_SIZE {
+                let s = enh_slice[i];
+                let finite = if s.is_finite() { s } else { 0.0 };
+                enh_out_480[i] = finite;
+                sum_sq += finite * finite;
+            }
+        }
+        let pre_agc_rms = (sum_sq / DFN_HOP_SIZE as f32).sqrt();
+        let pre_agc_rms_db = if pre_agc_rms < 1e-6 {
+            -120.0
+        } else {
+            20.0 * pre_agc_rms.log10()
+        };
+
+        // 4. Evaluate VAD BEFORE AGC so AGC gain never causes false gate openings
+        let (speech_active_now, vad_speaking) = self.vad_gate.evaluate(lsnr, pre_agc_rms_db);
+
+        // 5. Apply VAD-gated AGC (updates gain only during confirmed active speech)
+        let agc_gain_db = self
+            .agc
+            .process(speech_active_now, pre_agc_rms_db, enh_out_480);
+
+        // 6. Apply VAD noise gate envelope
+        self.vad_gate.apply_envelope(enh_out_480, self.atten_lim_db);
+
+        // 7. Post-AGC/VAD soft limiter & output clipping detection
+        for s in enh_out_480.iter_mut() {
+            if self.nc_enabled && !self.mic_muted && s.abs() >= CLIP_DETECT_THRESH {
+                clipped = true;
+            }
+            *s = soft_limit(*s);
         }
 
-        // Apply post-DFN VAD Noise Gate to eliminate any residual non-speech artifacts
-        let vad_speaking = self
-            .vad_gate
-            .process(lsnr, enh_out_480, self.atten_lim_db);
-
+        // 8. Smooth NC ON/OFF crossfade
         let target_mix = if self.nc_enabled { 1.0_f32 } else { 0.0_f32 };
-
         if (self.wet_mix - target_mix).abs() < 1e-4 {
             self.wet_mix = target_mix;
             if self.nc_enabled {
@@ -270,7 +536,29 @@ impl NoiseProcessor {
             self.wet_mix = target_mix;
         }
 
-        (lsnr, vad_speaking)
+        // 9. Clickless 10ms microphone mute fade on final outgoing signal
+        let target_mute_gain = if self.mic_muted { 0.0_f32 } else { 1.0_f32 };
+        if (self.mute_gain - target_mute_gain).abs() < 1e-4 {
+            self.mute_gain = target_mute_gain;
+            if self.mic_muted {
+                final_out_480.fill(0.0);
+            }
+        } else {
+            let step = (target_mute_gain - self.mute_gain) / (DFN_HOP_SIZE as f32);
+            let mut g = self.mute_gain;
+            for s in final_out_480.iter_mut() {
+                g = (g + step).clamp(0.0, 1.0);
+                *s *= g;
+            }
+            self.mute_gain = target_mute_gain;
+        }
+
+        FrameProcessResult {
+            lsnr_db: lsnr,
+            vad_speaking,
+            agc_gain_db,
+            clipped,
+        }
     }
 }
 
@@ -293,6 +581,120 @@ pub(crate) fn soft_limit(x: f32) -> f32 {
 mod tests {
     use super::*;
 
+    fn measure_sine_gain_db(freq_hz: f64) -> f64 {
+        let mut hpf = HighPassFilter::new(DFN_SAMPLE_RATE as f64, HPF_CUTOFF_HZ, true);
+        let mut in_buf = [0.0f32; DFN_HOP_SIZE];
+        let mut out_buf = [0.0f32; DFN_HOP_SIZE];
+        let mut in_sq = 0.0f64;
+        let mut out_sq = 0.0f64;
+
+        // Run 60 frames (600ms) so low-frequency filter reaches steady state; measure last 20 frames
+        for frame in 0..60 {
+            for (i, s) in in_buf.iter_mut().enumerate() {
+                let n = (frame * DFN_HOP_SIZE + i) as f64;
+                *s = (2.0 * std::f64::consts::PI * freq_hz * n / DFN_SAMPLE_RATE as f64)
+                    .sin() as f32
+                    * 0.5;
+            }
+            hpf.process_frame(&in_buf, &mut out_buf);
+            if frame >= 40 {
+                for i in 0..DFN_HOP_SIZE {
+                    in_sq += (in_buf[i] as f64).powi(2);
+                    out_sq += (out_buf[i] as f64).powi(2);
+                }
+            }
+        }
+        10.0 * (out_sq / in_sq.max(1e-18)).log10()
+    }
+
+    #[test]
+    fn test_hpf_65hz_attenuates_rumble_and_preserves_voice() {
+        let gain_20hz = measure_sine_gain_db(20.0);
+        let gain_65hz = measure_sine_gain_db(65.0);
+        let gain_120hz = measure_sine_gain_db(120.0);
+        let gain_300hz = measure_sine_gain_db(300.0);
+        let gain_1khz = measure_sine_gain_db(1000.0);
+
+        assert!(
+            gain_20hz < -19.0,
+            "Expected >19 dB attenuation at 20 Hz rumble, got {:.2} dB",
+            gain_20hz
+        );
+        assert!(
+            (gain_65hz - (-3.01)).abs() < 0.25,
+            "Expected -3.01 dB Butterworth cutoff at 65 Hz, got {:.2} dB",
+            gain_65hz
+        );
+        assert!(
+            gain_120hz > -0.5,
+            "Expected low vocal fundamentals at 120 Hz preserved (> -0.5 dB), got {:.2} dB",
+            gain_120hz
+        );
+        assert!(
+            gain_300hz > -0.1,
+            "Expected flat passband at 300 Hz, got {:.2} dB",
+            gain_300hz
+        );
+        assert!(
+            gain_1khz > -0.05,
+            "Expected flat passband at 1 kHz, got {:.2} dB",
+            gain_1khz
+        );
+    }
+
+    #[test]
+    fn test_vad_agc_tracks_speech_and_holds_during_silence() {
+        let mut agc = VadAgc::new(true);
+        let mut frame = [0.0f32; DFN_HOP_SIZE];
+
+        // 1. Non-speech low noise (-40 dBFS) for 200 frames (2s): AGC must NOT boost!
+        for _ in 0..200 {
+            frame.fill(0.01);
+            let gain_db = agc.process(false, -40.0, &mut frame);
+            assert!(
+                gain_db.abs() < 0.01,
+                "AGC must not pump gain during silence/non-speech, got {:.2} dB",
+                gain_db
+            );
+        }
+
+        // 2. Quiet active speech (-32 dBFS) for 300 frames (3s): AGC should boost toward -18 dBFS (+14 dB)
+        let mut last_gain_db = 0.0f32;
+        for _ in 0..300 {
+            frame.fill(0.025);
+            last_gain_db = agc.process(true, -32.0, &mut frame);
+        }
+        assert!(
+            last_gain_db > 10.0 && last_gain_db <= 14.5,
+            "Expected AGC to boost quiet speech toward +14 dB, got {:.2} dB",
+            last_gain_db
+        );
+
+        // 3. Silence returns: AGC must hold steady without pumping further
+        let held_gain = last_gain_db;
+        for _ in 0..100 {
+            frame.fill(0.001);
+            let g = agc.process(false, -60.0, &mut frame);
+            assert!(
+                (g - held_gain).abs() < 1e-4,
+                "AGC should hold gain during silence (expected {:.2}, got {:.2})",
+                held_gain,
+                g
+            );
+        }
+
+        // 4. Loud speech (-6 dBFS) for 80 frames (800ms): AGC should attenuate quickly
+        for _ in 0..80 {
+            frame.fill(0.5);
+            last_gain_db = agc.process(true, -6.0, &mut frame);
+        }
+        assert!(
+            last_gain_db < -8.0,
+            "Expected AGC to attenuate loud speech quickly, got {:.2} dB",
+            last_gain_db
+        );
+    }
+
     #[test]
     fn test_standard_dfn3_and_vad_gate_silence_noise() {
         let mut proc = NoiseProcessor::new(
@@ -302,6 +704,8 @@ mod tests {
             -10.0,
             true,
             -5.0,
+            true,
+            false,
         )
         .expect("Failed to load Standard DeepFilterNet3");
 
@@ -326,8 +730,7 @@ mod tests {
                 let rand_unit = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = rand_unit * 0.15;
             }
-            let (_lsnr, _speaking) =
-                proc.process_frame_48k(&noisy, &mut raw_out, &mut enh_out, &mut clean_out);
+            let _res = proc.process_frame_48k(&noisy, &mut raw_out, &mut enh_out, &mut clean_out);
 
             if frame_idx >= 60 {
                 for i in 0..DFN_HOP_SIZE {
@@ -349,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_low_latency_dfn3_ll_loads_and_runs() {
+    fn test_low_latency_dfn3_ll_clipping_and_mute() {
         let mut proc = NoiseProcessor::new(
             ModelVariant::LowLatency,
             65.0,
@@ -357,13 +760,34 @@ mod tests {
             -10.0,
             false,
             -5.0,
+            true,
+            false,
         )
         .expect("Failed to load LowLatency DeepFilterNet3_ll");
 
         let mut raw_out = [0.0f32; DFN_HOP_SIZE];
         let mut enh_out = [0.0f32; DFN_HOP_SIZE];
-        let mut clean_out = [0.0f32; DFN_HOP_SIZE];
-        let noisy = [0.02f32; DFN_HOP_SIZE];
-        let (_lsnr, _) = proc.process_frame_48k(&noisy, &mut raw_out, &mut enh_out, &mut clean_out);
+        let mut final_out = [0.0f32; DFN_HOP_SIZE];
+
+        // Overdriven 440Hz sine (+12 dB gain on 0.5 amplitude -> peak ~2.0 > 0.92 threshold)
+        proc.set_input_gain_db(12.0);
+        let mut hot = [0.0f32; DFN_HOP_SIZE];
+        for (i, s) in hot.iter_mut().enumerate() {
+            let t = i as f32 / DFN_SAMPLE_RATE as f32;
+            *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+        }
+        let res_hot = proc.process_frame_48k(&hot, &mut raw_out, &mut enh_out, &mut final_out);
+        assert!(res_hot.clipped, "Expected clipping flag on overdriven input");
+        for &s in &final_out {
+            assert!(s.abs() <= 1.0, "Soft limiter must keep samples within [-1, 1]");
+        }
+
+        // Enable mute: frame 1 fades down, frame 2 is completely silent
+        proc.set_mic_muted(true);
+        let _ = proc.process_frame_48k(&hot, &mut raw_out, &mut enh_out, &mut final_out);
+        let res_muted = proc.process_frame_48k(&hot, &mut raw_out, &mut enh_out, &mut final_out);
+        assert!(!res_muted.clipped, "Muted state should not emit clipping alerts");
+        let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+        assert_eq!(max_abs, 0.0, "Muted output must be completely silent");
     }
 }

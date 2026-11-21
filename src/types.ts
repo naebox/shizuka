@@ -16,6 +16,8 @@ export interface DeviceListResponse {
 
 export type ModelVariant = "standard" | "low_latency";
 
+export type ShortcutAction = "toggle_nc" | "toggle_mute";
+
 export interface AppConfig {
   input_device: string | null;
   output_device: string | null;
@@ -28,8 +30,13 @@ export interface AppConfig {
   min_db_thresh: number;
   vad_gate_enabled: boolean;
   vad_threshold_db: number;
+  hpf_enabled: boolean;
+  agc_enabled: boolean;
   monitor_volume: number;
   stream_active: boolean;
+  shortcut_toggle_nc: string | null;
+  shortcut_toggle_mute: string | null;
+  shortcut_sound_enabled: boolean;
 }
 
 export type ConnectionState =
@@ -55,9 +62,16 @@ export interface EngineDeviceStatus {
 export interface AudioTelemetry {
   stream_running: boolean;
   nc_enabled: boolean;
+  mic_muted: boolean;
   model_variant: ModelVariant;
   vad_gate_enabled: boolean;
   vad_speaking: boolean;
+  hpf_enabled: boolean;
+  agc_enabled: boolean;
+  agc_gain_db: number;
+  clipping_active: boolean;
+  clip_count: number;
+  config_revision: number;
   virtual_out_connected: boolean;
   live_monitor_enabled: boolean;
   monitor_clean: boolean;

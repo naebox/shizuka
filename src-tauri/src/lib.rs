@@ -1,8 +1,10 @@
 pub mod audio;
 pub mod config;
 pub mod installer;
+pub mod shortcuts;
 
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -10,35 +12,106 @@ use tauri::{
     AppHandle, Manager, State, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
+use tauri_plugin_global_shortcut::ShortcutState;
 
-use audio::devices::{list_audio_devices, DeviceListResponse};
-use audio::engine::{AudioEngineHandle, AudioTelemetry};
+use audio::cue::{CueKind, CuePlayer};
+use audio::devices::{default_physical_input_name, list_audio_devices, DeviceListResponse};
+use audio::engine::{AudioEngineHandle, AudioTelemetry, DspParams};
 use config::{AppConfig, ModelVariant};
 use installer::{install_virtual_audio_driver, InstallDriverResult};
+use shortcuts::{ShortcutAction, ShortcutRegistry};
 
 const TRAY_ID: &str = "shizuka-tray";
 
 pub struct AppState {
     pub engine: AudioEngineHandle,
-    pub config: Mutex<AppConfig>,
+    pub config: Arc<Mutex<AppConfig>>,
+    pub cue: CuePlayer,
+    pub shortcuts: Mutex<ShortcutRegistry>,
 }
 
-fn update_tray_icon(app: &AppHandle, nc_enabled: bool) {
+fn update_tray_icon(app: &AppHandle, nc_enabled: bool, mic_muted: bool) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let icon_bytes: &[u8] = if nc_enabled {
-            include_bytes!("../icons/tray-on.png")
+        let (icon_bytes, tooltip): (&[u8], &str) = if mic_muted {
+            (
+                include_bytes!("../icons/tray-mute.png"),
+                "Shizuka — マイクミュート中",
+            )
+        } else if nc_enabled {
+            (
+                include_bytes!("../icons/tray-on.png"),
+                "Shizuka — AIノイズ除去: ON",
+            )
         } else {
-            include_bytes!("../icons/tray-off.png")
+            (
+                include_bytes!("../icons/tray-off.png"),
+                "Shizuka — AIノイズ除去: OFF (バイパス中)",
+            )
         };
         if let Ok(img) = Image::from_bytes(icon_bytes) {
             let _ = tray.set_icon(Some(img));
         }
-        let tooltip = if nc_enabled {
-            "Shizuka — AIノイズ除去: ON"
-        } else {
-            "Shizuka — AIノイズ除去: OFF (バイパス中)"
-        };
         let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
+fn resolve_active_mic_name(state: &AppState, cfg: &AppConfig) -> Option<String> {
+    if let Ok(st) = state.engine.shared.status.lock() {
+        if let Some(ref active) = st.active_input_name {
+            if !active.is_empty() {
+                return Some(active.clone());
+            }
+        }
+    }
+    cfg.input_device
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(default_physical_input_name)
+}
+
+fn apply_nc_enabled(app: &AppHandle, enabled: bool, play_cue: bool) {
+    let st = app.state::<AppState>();
+    st.engine.set_nc_enabled(enabled);
+    let (sound_enabled, mon_dev) = if let Ok(mut cfg) = st.config.lock() {
+        cfg.nc_enabled = enabled;
+        let _ = cfg.save();
+        (cfg.shortcut_sound_enabled, cfg.monitor_device.clone())
+    } else {
+        (false, None)
+    };
+    let mic_muted = st.engine.shared.mic_muted.load(Ordering::Relaxed);
+    update_tray_icon(app, enabled, mic_muted);
+    if play_cue && sound_enabled {
+        st.cue.play(
+            if enabled {
+                CueKind::NcOn
+            } else {
+                CueKind::NcOff
+            },
+            mon_dev,
+        );
+    }
+}
+
+fn apply_mic_muted(app: &AppHandle, muted: bool, play_cue: bool) {
+    let st = app.state::<AppState>();
+    st.engine.set_mic_muted(muted);
+    let (sound_enabled, mon_dev) = if let Ok(cfg) = st.config.lock() {
+        (cfg.shortcut_sound_enabled, cfg.monitor_device.clone())
+    } else {
+        (false, None)
+    };
+    let nc_enabled = st.engine.shared.nc_enabled.load(Ordering::Relaxed);
+    update_tray_icon(app, nc_enabled, muted);
+    if play_cue && sound_enabled {
+        st.cue.play(
+            if muted {
+                CueKind::MuteOn
+            } else {
+                CueKind::MuteOff
+            },
+            mon_dev,
+        );
     }
 }
 
@@ -70,17 +143,19 @@ fn get_telemetry(state: State<'_, AppState>) -> AudioTelemetry {
 }
 
 #[tauri::command]
-fn set_nc_enabled(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    state.engine.set_nc_enabled(enabled);
-    if let Ok(mut cfg) = state.config.lock() {
-        cfg.nc_enabled = enabled;
-        let _ = cfg.save();
-    }
-    update_tray_icon(&app, enabled);
+fn set_nc_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    apply_nc_enabled(&app, enabled, false);
     Ok(())
 }
 
 #[tauri::command]
+fn set_mic_muted(app: AppHandle, muted: bool) -> Result<(), String> {
+    apply_mic_muted(&app, muted, false);
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn update_dsp_params(
     state: State<'_, AppState>,
     atten_lim_db: f32,
@@ -89,15 +164,19 @@ fn update_dsp_params(
     min_db_thresh: f32,
     vad_gate_enabled: bool,
     vad_threshold_db: f32,
+    hpf_enabled: bool,
+    agc_enabled: bool,
 ) -> Result<(), String> {
-    state.engine.set_params(
+    state.engine.set_params(DspParams {
         atten_lim_db,
         post_filter_beta,
         input_gain_db,
         min_db_thresh,
         vad_gate_enabled,
         vad_threshold_db,
-    );
+        hpf_enabled,
+        agc_enabled,
+    });
     if let Ok(mut cfg) = state.config.lock() {
         cfg.atten_lim_db = atten_lim_db;
         cfg.post_filter_beta = post_filter_beta;
@@ -105,6 +184,11 @@ fn update_dsp_params(
         cfg.min_db_thresh = min_db_thresh;
         cfg.vad_gate_enabled = vad_gate_enabled;
         cfg.vad_threshold_db = vad_threshold_db;
+        cfg.hpf_enabled = hpf_enabled;
+        cfg.agc_enabled = agc_enabled;
+        if let Some(mic_name) = resolve_active_mic_name(&state, &cfg) {
+            cfg.save_profile_for_mic(&mic_name);
+        }
         let _ = cfg.save();
     }
     Ok(())
@@ -126,39 +210,65 @@ fn select_devices(
     input_device: Option<String>,
     output_device: Option<String>,
     monitor_device: Option<String>,
-) -> Result<(), String> {
+) -> Result<AppConfig, String> {
     let clean_in = input_device.filter(|s| !s.is_empty());
     let clean_out = output_device.filter(|s| !s.is_empty());
     let clean_mon = monitor_device.filter(|s| !s.is_empty());
 
-    let (should_run, main_devices_changed, monitor_changed) =
+    let prev_active_mic = state
+        .engine
+        .shared
+        .status
+        .lock()
+        .ok()
+        .and_then(|s| s.active_input_name.clone());
+
+    let (should_run, main_devices_changed, monitor_changed, profile_applied, updated_cfg) =
         if let Ok(mut cfg) = state.config.lock() {
-            let main_changed =
-                cfg.input_device != clean_in || cfg.output_device != clean_out;
+            let input_changed = cfg.input_device != clean_in;
+            let main_changed = input_changed || cfg.output_device != clean_out;
             let mon_changed = cfg.monitor_device != clean_mon;
+
+            let mut applied_now = false;
+            if input_changed {
+                let prev_mic = prev_active_mic.or_else(|| cfg.input_device.clone());
+                let next_mic = clean_in.clone().or_else(default_physical_input_name);
+                if let Some(ref target_mic) = next_mic {
+                    let _ = cfg.switch_to_mic_profile(prev_mic.as_deref(), target_mic);
+                    state.engine.shared.apply_config_dsp(&cfg);
+                    applied_now = true;
+                }
+            }
+
             cfg.input_device = clean_in.clone();
             cfg.output_device = clean_out.clone();
             cfg.monitor_device = clean_mon.clone();
             let _ = cfg.save();
-            (cfg.stream_active, main_changed, mon_changed)
+            (
+                cfg.stream_active,
+                main_changed,
+                mon_changed,
+                applied_now,
+                cfg.clone(),
+            )
         } else {
-            (true, true, true)
+            (true, true, true, false, AppConfig::default())
         };
 
     let mon_active = state
         .engine
         .shared
         .live_monitor_enabled
-        .load(std::sync::atomic::Ordering::Relaxed);
+        .load(Ordering::Relaxed);
 
     if should_run && main_devices_changed {
         state
             .engine
-            .start_or_restart(clean_in, clean_out, clean_mon);
+            .start_or_restart(clean_in, clean_out, clean_mon, profile_applied);
     } else if monitor_changed && mon_active {
         state.engine.set_live_monitor(true, clean_mon);
     }
-    Ok(())
+    Ok(updated_cfg)
 }
 
 #[tauri::command]
@@ -176,7 +286,9 @@ fn set_stream_active(state: State<'_, AppState>, active: bool) -> Result<(), Str
     };
 
     if active {
-        state.engine.start_or_restart(in_dev, out_dev, mon_dev);
+        state
+            .engine
+            .start_or_restart(in_dev, out_dev, mon_dev, false);
     } else {
         state.engine.stop();
     }
@@ -212,6 +324,64 @@ fn set_monitor_volume(state: State<'_, AppState>, volume: f32) -> Result<(), Str
 }
 
 #[tauri::command]
+fn set_shortcut(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    action: ShortcutAction,
+    accelerator: Option<String>,
+) -> Result<AppConfig, String> {
+    let normalized = {
+        let mut reg = state
+            .shortcuts
+            .lock()
+            .map_err(|_| "ショートカット管理のロック取得に失敗しました".to_string())?;
+        reg.update_binding(&app, action, accelerator.as_deref())?
+    };
+
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+    match action {
+        ShortcutAction::ToggleNc => cfg.shortcut_toggle_nc = normalized,
+        ShortcutAction::ToggleMute => cfg.shortcut_toggle_mute = normalized,
+    }
+    let _ = cfg.save();
+    Ok(cfg.clone())
+}
+
+#[tauri::command]
+fn set_shortcuts_paused(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    paused: bool,
+) -> Result<(), String> {
+    let mut reg = state
+        .shortcuts
+        .lock()
+        .map_err(|_| "ショートカット管理のロック取得に失敗しました".to_string())?;
+    reg.set_paused(&app, paused)
+}
+
+#[tauri::command]
+fn set_shortcut_sound_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.shortcut_sound_enabled = enabled;
+        let _ = cfg.save();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_shortcut_warning(state: State<'_, AppState>) -> Option<String> {
+    state
+        .shortcuts
+        .lock()
+        .ok()
+        .and_then(|reg| reg.startup_warning())
+}
+
+#[tauri::command]
 async fn install_virtual_driver(state: State<'_, AppState>) -> Result<InstallDriverResult, String> {
     let result = tauri::async_runtime::spawn_blocking(install_virtual_audio_driver)
         .await
@@ -235,7 +405,7 @@ async fn install_virtual_driver(state: State<'_, AppState>) -> Result<InstallDri
             if should_run {
                 state
                     .engine
-                    .start_or_restart(in_dev, Some(virt_out.clone()), mon_dev);
+                    .start_or_restart(in_dev, Some(virt_out.clone()), mon_dev, true);
             }
         }
     }
@@ -291,11 +461,12 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
     ));
     out.push_str(&format!("Autostart: {}\n", autostart));
     out.push_str(&format!(
-        "Connection State: {:?} (running={}, virtual_out={}, monitor={})\n",
+        "Connection State: {:?} (running={}, virtual_out={}, monitor={}, muted={})\n",
         telem.status.connection_state,
         telem.stream_running,
         telem.virtual_out_connected,
-        telem.live_monitor_enabled
+        telem.live_monitor_enabled,
+        telem.mic_muted
     ));
     out.push_str(&format!(
         "Active Input: {:?} ({} Hz)\n",
@@ -313,23 +484,34 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
         out.push_str(&format!("Waiting Device: {}\n", waiting));
     }
     out.push_str(&format!(
-        "Configured: in={:?}, out={:?}, mon={:?}\n",
-        cfg.input_device, cfg.output_device, cfg.monitor_device
+        "Configured: in={:?}, out={:?}, mon={:?}, saved_mic_profiles={}\n",
+        cfg.input_device,
+        cfg.output_device,
+        cfg.monitor_device,
+        cfg.mic_profiles.len()
     ));
     out.push_str(&format!(
-        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, vad={} ({} dB)\n",
+        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, hpf={}, agc={} ({:+.1} dB), vad={} ({} dB)\n",
         telem.nc_enabled,
         telem.model_variant,
         cfg.atten_lim_db,
         cfg.input_gain_db,
+        cfg.hpf_enabled,
+        cfg.agc_enabled,
+        telem.agc_gain_db,
         cfg.vad_gate_enabled,
         cfg.vad_threshold_db
     ));
     out.push_str(&format!(
-        "Metrics: cpu={:.1}%, latency={:.1} ms, drift={:+.1} ppm, reconnects={}, drops={}, underruns={}\n",
+        "Shortcuts: nc={:?}, mute={:?}, sound={}\n",
+        cfg.shortcut_toggle_nc, cfg.shortcut_toggle_mute, cfg.shortcut_sound_enabled
+    ));
+    out.push_str(&format!(
+        "Metrics: cpu={:.1}%, latency={:.1} ms, drift={:+.1} ppm, clips={}, reconnects={}, drops={}, underruns={}\n",
         telem.cpu_load_pct,
         telem.latency_ms,
         telem.drift_ppm,
+        telem.clip_count,
         telem.status.reconnect_count,
         telem.status.input_drop_count,
         telem.status.output_underrun_count
@@ -404,11 +586,61 @@ pub fn run() {
         .setup(move |app| {
             let initial_cfg = AppConfig::load();
             let init_nc = initial_cfg.nc_enabled;
-            let engine = AudioEngineHandle::spawn(&initial_cfg);
+            let init_sc_nc = initial_cfg.shortcut_toggle_nc.clone();
+            let init_sc_mute = initial_cfg.shortcut_toggle_mute.clone();
+
+            let shared_cfg = Arc::new(Mutex::new(initial_cfg));
+            let engine = AudioEngineHandle::spawn(Arc::clone(&shared_cfg));
+            let cue = CuePlayer::spawn();
+
             app.manage(AppState {
                 engine,
-                config: Mutex::new(initial_cfg),
+                config: shared_cfg,
+                cue,
+                shortcuts: Mutex::new(ShortcutRegistry::default()),
             });
+
+            // Initialize global shortcuts plugin & register user-configured bindings (default: none)
+            app.handle().plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_handler(|app_handle, shortcut, event| {
+                        if event.state() != ShortcutState::Pressed {
+                            return;
+                        }
+                        let action = {
+                            let st = app_handle.state::<AppState>();
+                            st.shortcuts
+                                .lock()
+                                .ok()
+                                .and_then(|mut reg| reg.match_triggered(shortcut))
+                        };
+                        match action {
+                            Some(ShortcutAction::ToggleNc) => {
+                                let st = app_handle.state::<AppState>();
+                                let cur = st.engine.shared.nc_enabled.load(Ordering::Relaxed);
+                                apply_nc_enabled(app_handle, !cur, true);
+                            }
+                            Some(ShortcutAction::ToggleMute) => {
+                                let st = app_handle.state::<AppState>();
+                                let cur = st.engine.shared.mic_muted.load(Ordering::Relaxed);
+                                apply_mic_muted(app_handle, !cur, true);
+                            }
+                            None => {}
+                        }
+                    })
+                    .build(),
+            )?;
+
+            {
+                let st = app.state::<AppState>();
+                if let Ok(mut reg) = st.shortcuts.lock() {
+                    reg.register_initial(
+                        app.handle(),
+                        init_sc_nc.as_deref(),
+                        init_sc_mute.as_deref(),
+                    );
+                };
+            }
 
             let show_item =
                 MenuItem::with_id(app, "show", "Shizuka を開く", true, None::<&str>)?;
@@ -419,10 +651,20 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let mute_item = MenuItem::with_id(
+                app,
+                "toggle_mute",
+                "マイクミュート ON / OFF 切替",
+                true,
+                None::<&str>,
+            )?;
             let sep = PredefinedMenuItem::separator(app)?;
             let quit_item = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show_item, &toggle_item, &sep, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[&show_item, &toggle_item, &mute_item, &sep, &quit_item],
+            )?;
 
             let icon_bytes: &[u8] = if init_nc {
                 include_bytes!("../icons/tray-on.png")
@@ -446,18 +688,13 @@ pub fn run() {
                     }
                     "toggle_nc" => {
                         let st = app_handle.state::<AppState>();
-                        let cur = st
-                            .engine
-                            .shared
-                            .nc_enabled
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let next = !cur;
-                        st.engine.set_nc_enabled(next);
-                        if let Ok(mut cfg) = st.config.lock() {
-                            cfg.nc_enabled = next;
-                            let _ = cfg.save();
-                        }
-                        update_tray_icon(app_handle, next);
+                        let cur = st.engine.shared.nc_enabled.load(Ordering::Relaxed);
+                        apply_nc_enabled(app_handle, !cur, true);
+                    }
+                    "toggle_mute" => {
+                        let st = app_handle.state::<AppState>();
+                        let cur = st.engine.shared.mic_muted.load(Ordering::Relaxed);
+                        apply_mic_muted(app_handle, !cur, true);
                     }
                     "quit" => {
                         let st = app_handle.state::<AppState>();
@@ -497,6 +734,7 @@ pub fn run() {
             get_config,
             get_telemetry,
             set_nc_enabled,
+            set_mic_muted,
             update_dsp_params,
             set_model_variant,
             select_devices,
@@ -504,6 +742,10 @@ pub fn run() {
             set_live_monitor,
             set_monitor_mode,
             set_monitor_volume,
+            set_shortcut,
+            set_shortcuts_paused,
+            set_shortcut_sound_enabled,
+            get_shortcut_warning,
             install_virtual_driver,
             set_window_theme,
             get_autostart_enabled,
