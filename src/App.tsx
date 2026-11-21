@@ -73,29 +73,31 @@ function ShizukaMark({ active }: { active: boolean }) {
   return (
     <svg
       className={`brand-mark ${active ? "active" : ""}`}
-      viewBox="0 0 100 100"
+      viewBox="0 0 24 24"
+      width="24"
+      height="24"
       aria-hidden="true"
     >
       <rect
         className="mark-tile"
-        x="4"
-        y="4"
-        width="92"
-        height="92"
-        rx="24"
-        strokeWidth="3"
+        x="0.75"
+        y="0.75"
+        width="22.5"
+        height="22.5"
+        rx="6"
+        strokeWidth="1.25"
       />
       <path
         className="mark-stroke"
-        d="M 61.8 81.4 A 33.5 33.5 0 1 1 81.4 61.8"
+        d="M 14.34 19.65 A 8 8 0 1 1 19.65 14.34"
         fill="none"
-        strokeWidth="7.4"
+        strokeWidth="1.9"
         strokeLinecap="round"
       />
-      <circle className="mark-led" cx="73.7" cy="73.7" r="6.2" />
-      <rect className="mark-bars" x="32.2" y="39" width="8.2" height="22" rx="4.1" />
-      <rect className="mark-bars" x="45.9" y="31" width="8.2" height="38" rx="4.1" />
-      <rect className="mark-bars" x="59.6" y="39" width="8.2" height="22" rx="4.1" />
+      <circle className="mark-led" cx="17.66" cy="17.66" r="1.7" />
+      <rect className="mark-bars" x="7" y="9.5" width="2" height="5" rx="1" />
+      <rect className="mark-bars" x="11" y="7.5" width="2" height="9" rx="1" />
+      <rect className="mark-bars" x="15" y="9.5" width="2" height="5" rx="1" />
     </svg>
   );
 }
