@@ -53,4 +53,31 @@ opt-level = 3
 debug-assertions = false
 
 [profile.release]
+opt-level = 2
 strip = true
+
+# Keep real-time AI inference & DSP crates at maximum optimization (-O3)
+[profile.release.package.deep_filter]
+opt-level = 3
+[profile.release.package.tract-core]
+opt-level = 3
+[profile.release.package.tract-linalg]
+opt-level = 3
+[profile.release.package.tract-nnef]
+opt-level = 3
+[profile.release.package.tract-hir]
+opt-level = 3
+[profile.release.package.tract-onnx]
+opt-level = 3
+[profile.release.package.tract-onnx-opl]
+opt-level = 3
+[profile.release.package.tract-pulse]
+opt-level = 3
+[profile.release.package.tract-pulse-opl]
+opt-level = 3
+[profile.release.package.rubato]
+opt-level = 3
+[profile.release.package.realfft]
+opt-level = 3
+[profile.release.package.ndarray]
+opt-level = 3
