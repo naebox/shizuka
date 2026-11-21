@@ -37,7 +37,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.label }})
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 35
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -46,10 +46,12 @@ jobs:
             platform: windows-latest
             os_kind: windows
             rustflags: "-C linker=rust-lld.exe -C linker-flavor=lld-link"
+            cache_key: "Windows x64-lld"
           - label: "macOS"
             platform: macos-latest
             os_kind: macos
             rustflags: ""
+            cache_key: "ci-macOS-release"
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
@@ -74,26 +76,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: ci-${{ matrix.label }}-fast
-
-      - name: Configure fast CI Cargo profile overrides (without modifying Cargo.toml)
-        shell: bash
-        run: |
-          cat > "${RUNNER_TEMP}/ci-cargo.toml" <<'EOF'
-          [profile.dev]
-          debug = 0
-          [profile.dev.build-override]
-          opt-level = 0
-          [profile.dev.package."*"]
-          opt-level = 1
-
-          [profile.test]
-          debug = 0
-          [profile.test.build-override]
-          opt-level = 0
-          [profile.test.package."*"]
-          opt-level = 1
-          EOF
+          key: ${{ matrix.cache_key }}
 
       - name: Ensure frontend dist placeholder for Tauri compile-time macro
         shell: bash
@@ -108,8 +91,8 @@ jobs:
 
       - name: Run cargo clippy
         shell: bash
-        run: cargo --config "${RUNNER_TEMP}/ci-cargo.toml" clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --release --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust unit tests
         shell: bash
-        run: cargo --config "${RUNNER_TEMP}/ci-cargo.toml" test --manifest-path src-tauri/Cargo.toml --lib
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib

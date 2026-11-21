@@ -281,6 +281,7 @@ jobs:
       - name: Generate latest.json & SHA256SUMS.txt and upload to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare-release.outputs.tag }}
           VERSION: ${{ needs.prepare-release.outputs.version }}
           REPO: ${{ github.repository }}
