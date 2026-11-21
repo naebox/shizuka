@@ -54,14 +54,10 @@ pub fn is_portable_windows_dir(exe_dir: &Path) -> bool {
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    if norm.contains("/program files/")
+    !(norm.contains("/program files/")
         || norm.contains("/program files (x86)/")
         || norm.contains("/appdata/local/programs/shizuka")
-        || norm.contains("/appdata/local/shizuka")
-    {
-        return false;
-    }
-    true
+        || norm.contains("/appdata/local/shizuka"))
 }
 
 pub fn is_current_build_portable() -> bool {

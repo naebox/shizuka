@@ -1624,7 +1624,7 @@ where
                     }
                 }
                 2 => {
-                    for frame in data.chunks_exact(2) {
+                    for frame in data.as_chunks::<2>().0 {
                         let l = f32::from_sample(frame[0]);
                         let r = f32::from_sample(frame[1]);
                         mono_scratch[count] = stereo_dm.process(l, r);
