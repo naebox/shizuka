@@ -15,7 +15,7 @@
 
 ## ダウンロード（ビルド済みアプリ）
 
-最新版のインストーラ／実行ファイルは **[GitHub Releases](https://github.com/seedling-nae/shizuka/releases/latest)** からそのままダウンロードできます。
+最新版のインストーラ／実行ファイルは **[GitHub Releases](https://github.com/naebox/shizuka/releases/latest)** からそのままダウンロードできます。
 
 | OS | ファイル | 説明 |
 | --- | --- | --- |
@@ -78,7 +78,7 @@
 
 ```bash
 # リポジトリの取得
-git clone https://github.com/seedling-nae/shizuka.git
+git clone https://github.com/naebox/shizuka.git
 cd shizuka
 
 # 1. フロントエンド依存パッケージのインストール

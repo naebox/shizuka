@@ -11,7 +11,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-pub const RELEASES_PAGE_URL: &str = "https://github.com/seedling-nae/shizuka/releases/latest";
+pub const RELEASES_PAGE_URL: &str = "https://github.com/naebox/shizuka/releases/latest";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCheckResult {

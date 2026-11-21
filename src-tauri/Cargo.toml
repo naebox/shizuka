@@ -2,7 +2,7 @@
 name = "shizuka"
 version = "0.4.0"
 description = "Shizuka — Local Real-Time AI Microphone Noise Cancellation powered by DeepFilterNet3 + Neural VAD Gate"
-authors = ["seedling-nae"]
+authors = ["naebox"]
 edition = "2021"
 
 [lib]
