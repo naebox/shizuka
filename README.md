@@ -93,7 +93,7 @@ npm run tauri build
 
 ## ロードマップ
 
-`v0.1.0-beta` から `v1.0.0` 正式版までの段階リリース計画・進捗は **[ROADMAP.md](./ROADMAP.md)** をご覧ください。
+現在の継続改善フェーズ（`v0.x`）から将来の `v1.0.0` 正式版までの段階リリース計画・進捗は **[ROADMAP.md](./ROADMAP.md)** をご覧ください。
 
 ## ライセンス
 [MIT License](./LICENSE)
