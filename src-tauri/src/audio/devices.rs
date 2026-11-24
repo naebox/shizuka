@@ -61,9 +61,50 @@ fn should_hide_device(name: &str) -> bool {
     lower.contains("cable in 16ch") || lower.contains("cable out 16ch")
 }
 
-/// Returns the human-readable audio device name using cpal 0.17's non-deprecated `description()` API.
+/// Extracts the full display name from a `cpal::DeviceDescription`.
+///
+/// On Windows WASAPI, `cpal 0.17` sets `description().name()` to the generic endpoint
+/// `DEVPKEY_Device_DeviceDesc` (e.g. `"マイク"`, `"CABLE Input"`) and places the full
+/// Windows `DEVPKEY_Device_FriendlyName` (e.g. `"マイク (Shure MV7)"`,
+/// `"CABLE Input (VB-Audio Virtual Cable)"`) in `description().extended()[0]`.
+/// Preferring `extended()[0]` on Windows restores unique hardware names and preserves
+/// 100% compatibility with existing `settings.json` device selections and `mic_profiles`.
+fn resolve_device_display_name(name: &str, extended: &[String], prefer_extended: bool) -> String {
+    if prefer_extended {
+        if let Some(friendly) = extended.first().filter(|s| !s.trim().is_empty()) {
+            return friendly.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// Returns the full human-readable audio device name.
 pub fn device_name(dev: &cpal::Device) -> Option<String> {
-    dev.description().ok().map(|d| d.name().to_string())
+    let desc = dev.description().ok()?;
+    Some(resolve_device_display_name(
+        desc.name(),
+        desc.extended(),
+        cfg!(target_os = "windows"),
+    ))
+}
+
+fn find_matching_device(
+    devs: impl Iterator<Item = cpal::Device>,
+    target: &str,
+) -> Option<cpal::Device> {
+    let mut fallback_short_match: Option<cpal::Device> = None;
+    for dev in devs {
+        if device_name(&dev).as_deref() == Some(target) {
+            return Some(dev);
+        }
+        // Backward compatibility if a v0.4.2/v0.4.3 Windows config saved the short DeviceDesc name
+        if fallback_short_match.is_none()
+            && dev.description().ok().map(|d| d.name() == target).unwrap_or(false)
+        {
+            fallback_short_match = Some(dev);
+        }
+    }
+    fallback_short_match
 }
 
 pub fn list_audio_devices() -> DeviceListResponse {
@@ -176,8 +217,8 @@ pub fn default_physical_input_name() -> Option<String> {
 pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
     let host = cpal::default_host();
     if let Some(target) = preferred_name.filter(|s| !s.is_empty()) {
-        if let Ok(mut devs) = host.input_devices() {
-            return devs.find(|d| device_name(d).as_deref() == Some(target));
+        if let Ok(devs) = host.input_devices() {
+            return find_matching_device(devs, target);
         }
         return None;
     }
@@ -202,8 +243,8 @@ pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: boo
     let host = cpal::default_host();
     if let Some(target) = preferred_name {
         if !target.is_empty() {
-            if let Ok(mut devs) = host.output_devices() {
-                if let Some(found) = devs.find(|d| device_name(d).as_deref() == Some(target)) {
+            if let Ok(devs) = host.output_devices() {
+                if let Some(found) = find_matching_device(devs, target) {
                     return Some(found);
                 }
             }
@@ -255,5 +296,27 @@ mod tests {
                 > virtual_output_priority("VoiceMeeter Input")
         );
         assert_eq!(virtual_output_priority("Realtek High Definition Audio"), 0);
+
+        // Windows WASAPI cpal 0.17 puts full FriendlyName in extended[0] and generic DeviceDesc in name
+        assert_eq!(
+            resolve_device_display_name(
+                "マイク",
+                &["マイク (Shure MV7)".to_string()],
+                true
+            ),
+            "マイク (Shure MV7)"
+        );
+        assert_eq!(
+            resolve_device_display_name(
+                "CABLE Input",
+                &["CABLE Input (VB-Audio Virtual Cable)".to_string()],
+                true
+            ),
+            "CABLE Input (VB-Audio Virtual Cable)"
+        );
+        assert_eq!(
+            resolve_device_display_name("Shure MV7", &[], false),
+            "Shure MV7"
+        );
     }
 }
