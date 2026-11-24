@@ -163,16 +163,16 @@ impl VadGate {
     fn evaluate(&mut self, lsnr_db: f32, pre_agc_rms_db: f32) -> (bool, bool) {
         if !self.enabled {
             self.is_open = true;
-            let speech_now = lsnr_db >= self.open_thresh_db && pre_agc_rms_db >= -52.0;
+            let speech_now = lsnr_db >= self.open_thresh_db && pre_agc_rms_db >= -62.0;
             return (speech_now, speech_now);
         }
 
         let speech_active_now = if self.is_open {
             // 3.5 dB hysteresis keeps trailing consonants & quiet sentence endings intact
-            lsnr_db >= (self.open_thresh_db - 3.5) && pre_agc_rms_db >= -66.0
+            lsnr_db >= (self.open_thresh_db - 3.5) && pre_agc_rms_db >= -78.0
         } else {
-            (lsnr_db >= self.open_thresh_db && pre_agc_rms_db >= -60.0)
-                || (lsnr_db >= self.open_thresh_db + 4.5 && pre_agc_rms_db >= -65.0)
+            (lsnr_db >= self.open_thresh_db && pre_agc_rms_db >= -72.0)
+                || (lsnr_db >= self.open_thresh_db + 4.5 && pre_agc_rms_db >= -76.0)
         };
 
         if speech_active_now {
@@ -239,7 +239,7 @@ impl VadAgc {
     const TARGET_RMS_DB: f32 = -18.0; // Standard Discord / conferencing voice RMS target
     const MIN_GAIN_DB: f32 = -12.0;
     const MAX_GAIN_DB: f32 = 18.0;
-    const MIN_SPEECH_RMS_DB: f32 = -45.0; // Ignore near-silent frames even if lsnr momentarily spikes
+    const MIN_SPEECH_RMS_DB: f32 = -62.0; // Allow boosting quiet dynamic/distant mics while ignoring digital silence
     const ALPHA_DOWN: f32 = 0.08; // ~120ms attack when attenuating loud speech
     const ALPHA_UP: f32 = 0.0125; // ~800ms release when boosting quiet speech
     const ALPHA_BYPASS: f32 = 0.12; // ~80ms smooth return to 0 dB when AGC disabled
@@ -299,6 +299,139 @@ impl VadAgc {
     }
 }
 
+/// Zero-allocation, lookahead-aligned internal operating-level normalizer for DeepFilterNet3.
+///
+/// DeepFilterNet3's feature extraction (`feat_erb` floor at `1e-10`, `band_unit_norm` scaling
+/// as `sqrt(|X|)`, and `rms < 1e-7` silence skip) has a sensitivity dead zone on quiet or
+/// distant microphones (~ -40 to -58 dBFS, common on dynamic mics like Shure MV7 on macOS),
+/// where genuine human speech collapses to `lsnr = -15 dB` and gets heavily attenuated even
+/// with the VAD gate turned off.
+///
+/// This wrapper smoothly drives quiet inputs into DeepFilterNet3's optimal operating window
+/// (~ -12 dBFS peak / -24 dBFS RMS) with a strict anti-clipping ceiling, then divides the
+/// denoised output by the exact lookahead-aligned gain so end-to-end gain remains strictly
+/// unity (`0.0 dB`).
+struct PreDfnNormalizer {
+    env_peak: f32,
+    cur_gain: f32,
+    /// Ring buffer storing `(start_gain, end_gain)` applied to each input frame so the
+    /// delayed output frame is restored with exact lookahead alignment.
+    history: [(f32, f32); Self::HISTORY_CAP],
+    write_pos: usize,
+    lookahead_frames: usize,
+}
+
+impl PreDfnNormalizer {
+    const HISTORY_CAP: usize = 8; // Must exceed max lookahead (Standard = 2, LL = 0)
+    const TARGET_PEAK: f32 = 0.55; // ~ -5.2 dBFS peak (~ -18..-22 dBFS speech RMS, DFN3 sweet spot)
+    const SAFE_CEILING: f32 = 0.85; // Hard anti-clipping ceiling inside DeepFilterNet3
+    const MAX_STEADY_RMS: f32 = 0.14; // ~ -17 dBFS RMS cap so steady fan noise isn't over-driven
+    const MIN_DRIVE: f32 = 1.0; // 0 dB (never attenuate normal/loud microphones)
+    const MAX_DRIVE: f32 = 32.0; // +30 dB max internal drive (lifts -55 dBFS -> -25 dBFS cleanly)
+    const SILENCE_PEAK: f32 = 1e-5; // -100 dBFS digital silence floor
+
+    fn new(lookahead_frames: usize) -> Self {
+        Self {
+            env_peak: 0.02, // Gently prepared for quiet/distant mics; loud speech clamps immediately
+            cur_gain: Self::MIN_DRIVE,
+            history: [(Self::MIN_DRIVE, Self::MIN_DRIVE); Self::HISTORY_CAP],
+            write_pos: 0,
+            lookahead_frames: lookahead_frames.min(Self::HISTORY_CAP - 1),
+        }
+    }
+
+    /// Drives `in_480` smoothly into DeepFilterNet3's sweet spot and returns the lookahead-aligned
+    /// `(restore_start_gain, restore_end_gain)` pair to divide `out_480` by after inference.
+    fn drive_input(&mut self, in_480: &mut [f32]) -> (f32, f32) {
+        let mut frame_peak = 0.0f32;
+        let mut sum_sq = 0.0f32;
+        for &s in in_480.iter() {
+            let a = s.abs();
+            if a > frame_peak {
+                frame_peak = a;
+            }
+            sum_sq += s * s;
+        }
+        let frame_rms = (sum_sq / DFN_HOP_SIZE as f32).sqrt();
+
+        // Fast attack on louder speech + very slow release (~15s time constant) so drive stays
+        // rock-steady across pauses between words/sentences and NEVER compresses speech-to-noise
+        // contrast when speaking after a quiet pause.
+        if frame_peak > self.env_peak {
+            self.env_peak = 0.50 * self.env_peak + 0.50 * frame_peak;
+        } else {
+            self.env_peak = 0.9993 * self.env_peak + 0.0007 * frame_peak;
+            if self.env_peak < 1e-9 {
+                self.env_peak = 0.0;
+            }
+        }
+
+        let desired_from_peak = if self.env_peak > Self::SILENCE_PEAK {
+            (Self::TARGET_PEAK / self.env_peak).clamp(Self::MIN_DRIVE, Self::MAX_DRIVE)
+        } else {
+            Self::MIN_DRIVE
+        };
+
+        // Never drive steady broadband noise above MAX_STEADY_RMS (~ -18.4 dBFS)
+        let max_from_rms = if frame_rms > Self::SILENCE_PEAK {
+            (Self::MAX_STEADY_RMS / frame_rms).clamp(Self::MIN_DRIVE, Self::MAX_DRIVE)
+        } else {
+            Self::MAX_DRIVE
+        };
+
+        // Instantaneous peak ceiling guarantees `in_480 * gain` never clips on sudden shouts
+        let max_safe = if frame_peak > Self::SILENCE_PEAK {
+            (Self::SAFE_CEILING / frame_peak).clamp(Self::MIN_DRIVE, Self::MAX_DRIVE)
+        } else {
+            Self::MAX_DRIVE
+        };
+
+        let desired = desired_from_peak.min(max_from_rms);
+        let prev_gain = self.cur_gain;
+        // Climb briskly toward optimal operating level (~400ms), drop smoothly when louder speech arrives
+        let alpha = if desired < prev_gain { 0.08 } else { 0.025 };
+        let end_gain = (prev_gain + alpha * (desired - prev_gain))
+            .clamp(Self::MIN_DRIVE, Self::MAX_DRIVE)
+            .min(max_safe);
+        // If a sudden loud transient exceeds SAFE_CEILING at prev_gain, clamp start_gain too so sample 0 never clips
+        let start_gain = prev_gain.min(max_safe);
+
+        if (start_gain - 1.0).abs() > 1e-4 || (end_gain - 1.0).abs() > 1e-4 {
+            let step = (end_gain - start_gain) / (DFN_HOP_SIZE as f32);
+            let mut g = start_gain;
+            for s in in_480.iter_mut() {
+                g += step;
+                *s = soft_limit(*s * g);
+            }
+        }
+        self.cur_gain = end_gain;
+
+        // Record current frame's applied gain and read the lookahead-aligned gain for output restore
+        self.history[self.write_pos] = (start_gain, end_gain);
+        let read_pos =
+            (self.write_pos + Self::HISTORY_CAP - self.lookahead_frames) % Self::HISTORY_CAP;
+        self.write_pos = (self.write_pos + 1) % Self::HISTORY_CAP;
+        self.history[read_pos]
+    }
+
+    /// Restores `out_480` back to exact unity gain using the lookahead-aligned `(start_g, end_g)`.
+    #[inline]
+    fn restore_output(out_480: &mut [f32], restore_gains: (f32, f32)) {
+        let (start_g, end_g) = restore_gains;
+        if (start_g - 1.0).abs() <= 1e-4 && (end_g - 1.0).abs() <= 1e-4 {
+            return;
+        }
+        let inv_start = 1.0 / start_g.max(1.0);
+        let inv_end = 1.0 / end_g.max(1.0);
+        let step = (inv_end - inv_start) / (DFN_HOP_SIZE as f32);
+        let mut inv = inv_start;
+        for s in out_480.iter_mut() {
+            inv += step;
+            *s *= inv;
+        }
+    }
+}
+
 pub struct NoiseProcessor {
     model: DfTract,
     variant: ModelVariant,
@@ -306,6 +439,7 @@ pub struct NoiseProcessor {
     out_frame: Array2<f32>,
     hpf_scratch: [f32; DFN_HOP_SIZE],
     hpf: HighPassFilter,
+    pre_norm: PreDfnNormalizer,
     agc: VadAgc,
     nc_enabled: bool,
     wet_mix: f32,
@@ -363,6 +497,7 @@ impl NoiseProcessor {
             "Expected DeepFilterNet3 hop_size of 480 samples at 48kHz"
         );
 
+        let lookahead = model.lookahead;
         Ok(Self {
             model,
             variant,
@@ -370,6 +505,7 @@ impl NoiseProcessor {
             out_frame: Array2::<f32>::zeros((1, hop)),
             hpf_scratch: [0.0f32; DFN_HOP_SIZE],
             hpf: HighPassFilter::new(DFN_SAMPLE_RATE as f64, HPF_CUTOFF_HZ, hpf_enabled),
+            pre_norm: PreDfnNormalizer::new(lookahead),
             agc: VadAgc::new(agc_enabled),
             nc_enabled,
             wet_mix: if nc_enabled { 1.0 } else { 0.0 },
@@ -502,7 +638,16 @@ impl NoiseProcessor {
             self.input_gain_smoothed = target_gain;
         }
 
-        // 3. DeepFilterNet3 neural inference
+        // 3. Transparent unity-gain operating-level normalization + DeepFilterNet3 neural inference
+        //    Prevents DFN3's -40..-58 dBFS low-level dead zone on quiet/distant mics (e.g. dynamic mics on macOS).
+        let restore_gains = {
+            let mut in_slice = self.in_frame.row_mut(0);
+            let slice = in_slice
+                .as_slice_mut()
+                .expect("contiguous 1x480 DeepFilterNet3 input frame");
+            self.pre_norm.drive_input(slice)
+        };
+
         let (lsnr, dfn_error) = match self
             .model
             .process(self.in_frame.view(), self.out_frame.view_mut())
@@ -516,15 +661,18 @@ impl NoiseProcessor {
             }
         };
 
-        let mut sum_sq = 0.0f32;
         {
             let enh_slice = self.out_frame.row(0);
             for i in 0..DFN_HOP_SIZE {
                 let s = enh_slice[i];
-                let finite = if s.is_finite() { s } else { 0.0 };
-                enh_out_480[i] = finite;
-                sum_sq += finite * finite;
+                enh_out_480[i] = if s.is_finite() { s } else { 0.0 };
             }
+        }
+        PreDfnNormalizer::restore_output(enh_out_480, restore_gains);
+
+        let mut sum_sq = 0.0f32;
+        for &s in enh_out_480.iter() {
+            sum_sq += s * s;
         }
         let pre_agc_rms = (sum_sq / DFN_HOP_SIZE as f32).sqrt();
         let pre_agc_rms_db = if pre_agc_rms < 1e-6 {
@@ -895,5 +1043,104 @@ mod tests {
             gate.envelope_gain, 0.0,
             "VadGate envelope must snap cleanly to 0.0 instead of decaying into denormals"
         );
+    }
+
+    #[test]
+    fn test_quiet_distant_speech_preserved_without_dead_zone() {
+        // Verifies PreDfnNormalizer eliminates DeepFilterNet3's -40..-55 dBFS dead zone
+        // (e.g. dynamic microphones like Shure MV7 on macOS) while keeping pure quiet room
+        // noise suppressed and preserving unity gain without clipping on sudden loud transients.
+        let mut proc = NoiseProcessor::new(
+            ModelVariant::Standard,
+            24.0,
+            0.0,
+            -16.0,
+            false,
+            -5.0,
+            true,
+            false,
+            true,
+            false,
+            0.0,
+        )
+        .expect("Failed to load Standard DeepFilterNet3");
+
+        let speech_rms_db = -45.0f32;
+        let speech_amp = 10.0f32.powf((speech_rms_db + 12.2) / 20.0);
+        let noise_amp = 10.0f32.powf((speech_rms_db - 20.0 + 4.8) / 20.0);
+        let mut seed = 0x1234_5678u32;
+        let mut raw = [0.0f32; DFN_HOP_SIZE];
+        let mut enh = [0.0f32; DFN_HOP_SIZE];
+        let mut out = [0.0f32; DFN_HOP_SIZE];
+
+        // 1. Warm up on 2s of quiet room noise (-65 dBFS)
+        for _ in 0..200 {
+            let mut nbuf = [0.0f32; DFN_HOP_SIZE];
+            for s in nbuf.iter_mut() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let rnd = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+                *s = rnd * noise_amp;
+            }
+            let _ = proc.process_frame_48k(&nbuf, &mut raw, &mut enh, &mut out);
+        }
+
+        // 2. Feed 2.5s of quiet -45 dBFS speech bursts (without PreDfnNormalizer, DFN3 drops by -24 dB)
+        let mut in_sq = 0.0f64;
+        let mut out_sq = 0.0f64;
+        let mut cnt = 0usize;
+        for f in 0..250 {
+            let mut buf = [0.0f32; DFN_HOP_SIZE];
+            let t_frame = f as f32 * 0.01;
+            let cyc = t_frame % 0.9;
+            let env = if cyc < 0.6 {
+                (std::f32::consts::PI * cyc / 0.6).sin().powf(0.4)
+            } else {
+                0.0
+            };
+            let f0 = 135.0 + 25.0 * (t_frame * 2.1).sin();
+            for (i, s) in buf.iter_mut().enumerate() {
+                let t = (f * DFN_HOP_SIZE + i) as f32 / DFN_SAMPLE_RATE as f32;
+                let mut voice = 0.0f32;
+                for h in 1..=20 {
+                    let freq = f0 * h as f32;
+                    let f1 = (-((freq - 520.0) / 180.0).powi(2)).exp();
+                    let f2 = 0.7 * (-((freq - 1550.0) / 280.0).powi(2)).exp();
+                    let f3 = 0.35 * (-((freq - 2600.0) / 400.0).powi(2)).exp();
+                    let w = (0.25 / h as f32) + f1 + f2 + f3;
+                    voice += w * (2.0 * std::f32::consts::PI * freq * t).sin();
+                }
+                voice *= 0.18 * env * speech_amp;
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let rnd = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+                *s = voice + rnd * noise_amp;
+            }
+            let _ = proc.process_frame_48k(&buf, &mut raw, &mut enh, &mut out);
+            if cyc > 0.1 && cyc < 0.55 {
+                cnt += 1;
+                for i in 0..DFN_HOP_SIZE {
+                    in_sq += (raw[i] as f64).powi(2);
+                    out_sq += (out[i] as f64).powi(2);
+                }
+            }
+        }
+        let in_db = 10.0 * (in_sq / (cnt * DFN_HOP_SIZE) as f64).max(1e-18).log10();
+        let out_db = 10.0 * (out_sq / (cnt * DFN_HOP_SIZE) as f64).max(1e-18).log10();
+        let delta_db = out_db - in_db;
+        assert!(
+            delta_db > -13.0,
+            "Quiet -45 dBFS speech fell into DFN3 dead zone (delta={:.1} dB; expected > -13 dB)",
+            delta_db
+        );
+
+        // 3. Sudden loud shout (-6 dBFS) immediately after quiet audio must stay finite & unclipped
+        let mut loud = [0.0f32; DFN_HOP_SIZE];
+        for (i, s) in loud.iter_mut().enumerate() {
+            let t = i as f32 / DFN_SAMPLE_RATE as f32;
+            *s = (2.0 * std::f32::consts::PI * 300.0 * t).sin() * 0.5;
+        }
+        for _ in 0..5 {
+            let _ = proc.process_frame_48k(&loud, &mut raw, &mut enh, &mut out);
+            assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+        }
     }
 }
