@@ -12,7 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::devices::{
-    default_physical_input_name, find_input_device, find_output_device, list_audio_devices,
+    default_physical_input_name, device_name, find_input_device, find_output_device,
+    list_audio_devices,
 };
 use crate::audio::processor::{soft_limit, NoiseProcessor, DFN_HOP_SIZE, DFN_SAMPLE_RATE};
 use crate::audio::resampler::{AdaptiveOutputResampler, DriftController, InputResampler48k};
@@ -341,6 +342,12 @@ struct RunningPipeline {
 
 impl RunningPipeline {
     fn stop_inner(&mut self) {
+        // Explicitly pause OS audio streams before dropping (belt-and-suspenders against
+        // CoreAudio/WASAPI callbacks firing during teardown)
+        let _ = self._input_stream.pause();
+        if let Some(ref virt) = self._virtual_output_stream {
+            let _ = virt.pause();
+        }
         let _ = self.mon_tx.send(None);
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(jh) = self.worker_join.take() {
@@ -385,6 +392,12 @@ impl Drop for WorkerInitGuard {
 
 struct MonitorPipeline {
     _stream: Stream,
+}
+
+impl Drop for MonitorPipeline {
+    fn drop(&mut self) {
+        let _ = self._stream.pause();
+    }
 }
 
 impl AudioEngineHandle {
@@ -490,6 +503,15 @@ impl StreamErrorNotifier {
     }
 
     fn notify(&self, err: cpal::StreamError) {
+        // Transient xrun notifications in cpal 0.17 should not tear down and restart the pipeline
+        if matches!(err, cpal::StreamError::BufferUnderrun) {
+            log::warn!(
+                "Audio {:?} transient buffer underrun/overrun (gen {})",
+                self.kind,
+                self.generation
+            );
+            return;
+        }
         log::error!(
             "Audio {:?} stream error (gen {}): {}",
             self.kind,
@@ -1176,15 +1198,13 @@ fn build_live_monitor_stream(
             anyhow!("マイクテスト用のスピーカー／ヘッドホンが見つかりません")
         }
     })?;
-    let actual_mon_name = mon_dev
-        .name()
-        .unwrap_or_else(|_| "Default Output".to_string());
+    let actual_mon_name = device_name(&mon_dev).unwrap_or_else(|| "Default Output".to_string());
     let supported_mon = mon_dev
         .default_output_config()
         .with_context(|| format!("再生デバイス「{}」のフォーマット取得に失敗しました", actual_mon_name))?;
     let mon_fmt = supported_mon.sample_format();
     let mon_cfg: StreamConfig = supported_mon.into();
-    let sr_mon = mon_cfg.sample_rate.0;
+    let sr_mon = mon_cfg.sample_rate;
     let ch_mon = mon_cfg.channels as usize;
 
     let mon_target = ((sr_mon as usize) * 30) / 1000;
@@ -1235,7 +1255,7 @@ fn build_main_pipeline(
     let in_dev = find_input_device(in_name).ok_or_else(|| {
         PipelineStartError::WaitingForDevice(in_name.filter(|s| !s.is_empty()).map(String::from))
     })?;
-    let actual_in_name = in_dev.name().unwrap_or_else(|_| "Unknown Mic".into());
+    let actual_in_name = device_name(&in_dev).unwrap_or_else(|| "Unknown Mic".into());
 
     // Restore per-microphone profile automatically on startup, OS default mic switch, or reconnect
     // (runs on the non-RT control thread before launching the real-time DSP worker).
@@ -1258,7 +1278,7 @@ fn build_main_pipeline(
     let mut in_cfg: StreamConfig = supported_in.into();
     // Request a low-latency buffer (~10ms) when supported by WASAPI/CoreAudio
     in_cfg.buffer_size = cpal::BufferSize::Default;
-    let sr_in = in_cfg.sample_rate.0;
+    let sr_in = in_cfg.sample_rate;
     let ch_in = in_cfg.channels as usize;
 
     // Optional virtual output device (e.g., CABLE Input on Windows, Shizuka Virtual Mic on macOS)
@@ -1279,12 +1299,11 @@ fn build_main_pipeline(
         match find_output_device(Some(target_out), false) {
             Some(out_dev) => match out_dev.default_output_config() {
                 Ok(supported_out) => {
-                    let resolved_out_name = out_dev
-                        .name()
-                        .unwrap_or_else(|_| target_out.to_string());
+                    let resolved_out_name =
+                        device_name(&out_dev).unwrap_or_else(|| target_out.to_string());
                     let out_fmt = supported_out.sample_format();
                     let out_cfg: StreamConfig = supported_out.into();
-                    sr_out = out_cfg.sample_rate.0;
+                    sr_out = out_cfg.sample_rate;
                     let ch_out = out_cfg.channels as usize;
 
                     // Target 30ms occupancy in output ring buffer to absorb OS callback jitter cleanly
@@ -1415,6 +1434,7 @@ fn build_main_pipeline(
             let mut smooth_in_db = -85.0f32;
             let mut smooth_enh_db = -85.0f32;
             let mut smooth_out_db = -85.0f32;
+            let mut smooth_proc_us: f32 = 0.0;
             let mut clip_hold_frames: u32 = 0;
 
             let mut mon_clean_mix = if shared_worker.monitor_clean.load(Ordering::Relaxed) {
@@ -1431,7 +1451,9 @@ fn build_main_pipeline(
                     if !in_cons.write_is_held() {
                         break;
                     }
-                    thread::park_timeout(Duration::from_millis(4));
+                    // Input callback unparks immediately when audio arrives; 50ms timeout avoids
+                    // spurious 250 Hz timer wakeups while keeping stop_worker responsive.
+                    thread::park_timeout(Duration::from_millis(50));
                     continue;
                 }
 
@@ -1639,10 +1661,15 @@ fn build_main_pipeline(
                     store_f32(&shared_worker.monitor_rms_db_bits, mon_db);
                     store_f32(&shared_worker.lsnr_db_bits, lsnr);
 
-                    let elapsed_us = t0.elapsed().as_micros() as u32;
+                    let elapsed_us = t0.elapsed().as_micros() as f32;
+                    smooth_proc_us = if smooth_proc_us <= 0.0 {
+                        elapsed_us
+                    } else {
+                        0.85 * smooth_proc_us + 0.15 * elapsed_us
+                    };
                     shared_worker
                         .process_time_us
-                        .store(elapsed_us, Ordering::Relaxed);
+                        .store(smooth_proc_us.round() as u32, Ordering::Relaxed);
                 }
             }
 
@@ -1766,6 +1793,24 @@ fn build_input_stream_to_rb(
             shared,
             err_notifier,
         ),
+        SampleFormat::I8 => build_input_typed::<i8>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::U8 => build_input_typed::<u8>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
         SampleFormat::I16 => build_input_typed::<i16>(
             device,
             config,
@@ -1776,6 +1821,24 @@ fn build_input_stream_to_rb(
             err_notifier,
         ),
         SampleFormat::U16 => build_input_typed::<u16>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::I24 => build_input_typed::<cpal::I24>(
+            device,
+            config,
+            channels,
+            prod,
+            worker_thread,
+            shared,
+            err_notifier,
+        ),
+        SampleFormat::U24 => build_input_typed::<cpal::U24>(
             device,
             config,
             channels,
@@ -2047,6 +2110,22 @@ fn build_output_stream_from_rb(
             underrun_shared,
             err_notifier,
         ),
+        SampleFormat::I8 => build_output_typed::<i8>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::U8 => build_output_typed::<u8>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
         SampleFormat::I16 => build_output_typed::<i16>(
             device,
             config,
@@ -2056,6 +2135,22 @@ fn build_output_stream_from_rb(
             err_notifier,
         ),
         SampleFormat::U16 => build_output_typed::<u16>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::I24 => build_output_typed::<cpal::I24>(
+            device,
+            config,
+            channels,
+            cons,
+            underrun_shared,
+            err_notifier,
+        ),
+        SampleFormat::U24 => build_output_typed::<cpal::U24>(
             device,
             config,
             channels,
@@ -2318,6 +2413,9 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let notifier = StreamErrorNotifier::new(tx, 7, StreamKind::Input);
+        // Transient buffer underrun must NOT trigger a full pipeline teardown/reconnect
+        notifier.notify(cpal::StreamError::BufferUnderrun);
+        assert!(rx.try_recv().is_err());
         notifier.notify(cpal::StreamError::DeviceNotAvailable);
         notifier.notify(cpal::StreamError::DeviceNotAvailable);
         assert!(rx.try_recv().is_ok());

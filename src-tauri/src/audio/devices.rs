@@ -61,27 +61,28 @@ fn should_hide_device(name: &str) -> bool {
     lower.contains("cable in 16ch") || lower.contains("cable out 16ch")
 }
 
+/// Returns the human-readable audio device name using cpal 0.17's non-deprecated `description()` API.
+pub fn device_name(dev: &cpal::Device) -> Option<String> {
+    dev.description().ok().map(|d| d.name().to_string())
+}
+
 pub fn list_audio_devices() -> DeviceListResponse {
     let host = cpal::default_host();
 
-    let default_in_name = host
-        .default_input_device()
-        .and_then(|d| d.name().ok());
-    let default_out_name = host
-        .default_output_device()
-        .and_then(|d| d.name().ok());
+    let default_in_name = host.default_input_device().and_then(|d| device_name(&d));
+    let default_out_name = host.default_output_device().and_then(|d| device_name(&d));
 
     let mut inputs = Vec::new();
     if let Ok(devs) = host.input_devices() {
         for dev in devs {
-            if let Ok(name) = dev.name() {
+            if let Some(name) = device_name(&dev) {
                 if should_hide_device(&name) {
                     continue;
                 }
                 // Skip virtual cable outputs in physical microphone list? Keep them marked so user sees clearly
                 let (sr, ch) = dev
                     .default_input_config()
-                    .map(|c| (c.sample_rate().0, c.channels()))
+                    .map(|c| (c.sample_rate(), c.channels()))
                     .unwrap_or((48_000, 1));
                 let is_def = default_in_name.as_deref() == Some(name.as_str());
                 let is_virt = is_virtual_audio_device(&name);
@@ -101,13 +102,13 @@ pub fn list_audio_devices() -> DeviceListResponse {
 
     if let Ok(devs) = host.output_devices() {
         for dev in devs {
-            if let Ok(name) = dev.name() {
+            if let Some(name) = device_name(&dev) {
                 if should_hide_device(&name) {
                     continue;
                 }
                 let (sr, ch) = dev
                     .default_output_config()
-                    .map(|c| (c.sample_rate().0, c.channels()))
+                    .map(|c| (c.sample_rate(), c.channels()))
                     .unwrap_or((48_000, 2));
                 let is_def = default_out_name.as_deref() == Some(name.as_str());
                 let is_virt = is_virtual_audio_device(&name);
@@ -157,7 +158,7 @@ pub fn list_audio_devices() -> DeviceListResponse {
 pub fn default_physical_input_name() -> Option<String> {
     let host = cpal::default_host();
     if let Some(def) = host.default_input_device() {
-        if let Ok(name) = def.name() {
+        if let Some(name) = device_name(&def) {
             if !is_virtual_audio_device(&name) {
                 return Some(name);
             }
@@ -165,7 +166,7 @@ pub fn default_physical_input_name() -> Option<String> {
     }
     host.input_devices()
         .ok()?
-        .filter_map(|d| d.name().ok())
+        .filter_map(|d| device_name(&d))
         .find(|n| !should_hide_device(n) && !is_virtual_audio_device(n))
 }
 
@@ -176,13 +177,13 @@ pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
     let host = cpal::default_host();
     if let Some(target) = preferred_name.filter(|s| !s.is_empty()) {
         if let Ok(mut devs) = host.input_devices() {
-            return devs.find(|d| d.name().ok().as_deref() == Some(target));
+            return devs.find(|d| device_name(d).as_deref() == Some(target));
         }
         return None;
     }
     // Auto mode: prefer non-virtual OS default input device
     if let Some(def) = host.default_input_device() {
-        if let Ok(name) = def.name() {
+        if let Some(name) = device_name(&def) {
             if !is_virtual_audio_device(&name) {
                 return Some(def);
             }
@@ -191,7 +192,7 @@ pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
         }
     }
     host.input_devices().ok()?.find(|d| {
-        d.name()
+        device_name(d)
             .map(|n| !should_hide_device(&n) && !is_virtual_audio_device(&n))
             .unwrap_or(true)
     })
@@ -202,7 +203,7 @@ pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: boo
     if let Some(target) = preferred_name {
         if !target.is_empty() {
             if let Ok(mut devs) = host.output_devices() {
-                if let Some(found) = devs.find(|d| d.name().ok().as_deref() == Some(target)) {
+                if let Some(found) = devs.find(|d| device_name(d).as_deref() == Some(target)) {
                     return Some(found);
                 }
             }
@@ -211,7 +212,7 @@ pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: boo
     if fallback_to_default {
         // Prefer a non-virtual physical speaker when used as monitor fallback
         if let Some(def) = host.default_output_device() {
-            if let Ok(name) = def.name() {
+            if let Some(name) = device_name(&def) {
                 if !is_virtual_audio_device(&name) {
                     return Some(def);
                 }
@@ -221,7 +222,7 @@ pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: boo
         }
         host.output_devices()
             .ok()?
-            .find(|d| d.name().map(|n| !is_virtual_audio_device(&n)).unwrap_or(true))
+            .find(|d| device_name(d).map(|n| !is_virtual_audio_device(&n)).unwrap_or(true))
     } else {
         None
     }

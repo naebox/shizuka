@@ -438,7 +438,7 @@ fn play_cue_blocking(kind: CueKind, monitor_device: Option<&str>) -> anyhow::Res
     let supported = dev.default_output_config()?;
     let fmt = supported.sample_format();
     let cfg: StreamConfig = supported.into();
-    let sr = cfg.sample_rate.0;
+    let sr = cfg.sample_rate;
     let ch = cfg.channels as usize;
 
     let frames = Arc::new(synthesize_cue_stereo(kind, sr));
@@ -463,6 +463,7 @@ fn play_cue_blocking(kind: CueKind, monitor_device: Option<&str>) -> anyhow::Res
     }
     // Drain wait so WASAPI / USB / wireless output buffers finish playing the reverb tail cleanly
     thread::sleep(Duration::from_millis(80));
+    let _ = stream.pause();
     drop(stream);
     Ok(())
 }
@@ -483,11 +484,23 @@ fn build_cue_stream(
         SampleFormat::F64 => {
             build_cue_typed::<f64>(device, config, channels, frames_buf, cursor, done)
         }
+        SampleFormat::I8 => {
+            build_cue_typed::<i8>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::U8 => {
+            build_cue_typed::<u8>(device, config, channels, frames_buf, cursor, done)
+        }
         SampleFormat::I16 => {
             build_cue_typed::<i16>(device, config, channels, frames_buf, cursor, done)
         }
         SampleFormat::U16 => {
             build_cue_typed::<u16>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::I24 => {
+            build_cue_typed::<cpal::I24>(device, config, channels, frames_buf, cursor, done)
+        }
+        SampleFormat::U24 => {
+            build_cue_typed::<cpal::U24>(device, config, channels, frames_buf, cursor, done)
         }
         SampleFormat::I32 => {
             build_cue_typed::<i32>(device, config, channels, frames_buf, cursor, done)

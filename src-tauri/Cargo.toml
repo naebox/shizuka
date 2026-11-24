@@ -1,6 +1,6 @@
 [package]
 name = "shizuka"
-version = "0.4.1"
+version = "0.4.2"
 description = "Shizuka — Local Real-Time AI Microphone Noise Cancellation powered by DeepFilterNet3 + Neural VAD Gate"
 authors = ["naebox"]
 edition = "2021"
@@ -26,7 +26,7 @@ env_logger = "0.11"
 dirs = "5"
 
 # Cross-platform low-latency audio & lock-free buffers
-cpal = "0.15"
+cpal = "0.17"
 ringbuf = "0.4"
 rubato = "0.16"
 audio_thread_priority = "0.34"
@@ -55,7 +55,8 @@ opt-level = 3
 debug-assertions = false
 
 [profile.release]
-opt-level = 2
+opt-level = 3
+lto = "thin"
 strip = true
 
 # Keep real-time 10ms audio inference & DSP hot-path crates at maximum optimization (-O3)
@@ -63,11 +64,15 @@ strip = true
 opt-level = 3
 [profile.release.package.tract-core]
 opt-level = 3
+[profile.release.package.tract-data]
+opt-level = 3
 [profile.release.package.tract-linalg]
 opt-level = 3
 [profile.release.package.rubato]
 opt-level = 3
 [profile.release.package.realfft]
+opt-level = 3
+[profile.release.package.rustfft]
 opt-level = 3
 [profile.release.package.ndarray]
 opt-level = 3

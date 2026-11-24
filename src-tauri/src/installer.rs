@@ -67,16 +67,49 @@ pub fn escape_applescript_string(raw: &str) -> String {
 
 /// Builds the full AppleScript `do shell script "..." with administrator privileges` command
 /// with proper two-layer escaping (POSIX single quotes first, then AppleScript double quotes).
+///
+/// Uses `killall -9 coreaudiod` (auto-respawned by `launchd`) instead of requiring
+/// `launchctl kickstart -kp system/com.apple.audio.coreaudiod`, which fails with
+/// `1: Operation not permitted` on macOS Sonoma 14.4+ / Sequoia / newer.
 pub fn build_macos_hal_applescript(bundle_path: &Path) -> String {
     let escaped_path = escape_posix_single_quoted(&bundle_path.to_string_lossy());
     let shell_cmd = format!(
-        "rm -rf '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && cp -R '{}' '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && (xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' 2>/dev/null || true) && chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' && launchctl kickstart -kp system/com.apple.audio.coreaudiod",
+        "mkdir -p '/Library/Audio/Plug-Ins/HAL' \
+         && rm -rf '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' \
+         && cp -R '{}' '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' \
+         && (xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' 2>/dev/null || true) \
+         && (xattr -cr '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' 2>/dev/null || true) \
+         && chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' \
+         && chmod -R u+rwX,go+rX '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver' \
+         && (killall -9 coreaudiod 2>/dev/null || killall coreaudiod 2>/dev/null || launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || true)",
         escaped_path
     );
     format!(
         "do shell script \"{}\" with administrator privileges",
         escape_applescript_string(&shell_cmd)
     )
+}
+
+/// Formats a user-facing error message for a failed macOS `osascript` privilege escalation step,
+/// distinguishing explicit user cancellation (`-128`) from shell/system errors.
+pub fn format_macos_osascript_error(exit_code: Option<i32>, stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    let lower = trimmed.to_lowercase();
+    if trimmed.contains("(-128)") || lower.contains("user canceled") || lower.contains("user cancelled") {
+        return "管理者認証がキャンセルされました。".to_string();
+    }
+    if trimmed.is_empty() {
+        match exit_code {
+            Some(code) => format!("ドライバの配置に失敗しました（終了コード: {}）。", code),
+            None => "ドライバの配置に失敗しました。".to_string(),
+        }
+    } else {
+        let single_line = trimmed.lines().collect::<Vec<_>>().join(" / ");
+        match exit_code {
+            Some(code) => format!("ドライバの配置に失敗しました（終了コード: {}）: {}", code, single_line),
+            None => format!("ドライバの配置に失敗しました: {}", single_line),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,13 +459,26 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
     drop(work_guard);
 
     if !osa_out.status.success() {
-        return Err(anyhow!("ドライバの配置がキャンセルされたか失敗しました。"));
+        let stderr = String::from_utf8_lossy(&osa_out.stderr);
+        let msg = format_macos_osascript_error(osa_out.status.code(), &stderr);
+        diagnostics::error(format!(
+            "macOS HAL driver osascript failed (code={:?}): {}",
+            osa_out.status.code(),
+            stderr.trim()
+        ));
+        return Err(anyhow!(msg));
     }
 
-    for _ in 0..5 {
+    diagnostics::info("macOS HAL driver installed; waiting for coreaudiod reload");
+
+    for _ in 0..10 {
         thread::sleep(Duration::from_millis(500));
         let devs = list_audio_devices();
         if devs.has_virtual_cable {
+            diagnostics::info(format!(
+                "Detected macOS virtual audio device: {:?}",
+                devs.recommended_virtual_output
+            ));
             return Ok(InstallDriverResult {
                 success: true,
                 device_detected_now: true,
@@ -489,5 +535,29 @@ mod tests {
         assert!(script.starts_with("do shell script \""));
         assert!(script.ends_with("\" with administrator privileges"));
         assert!(script.contains(r#"a'\\''b\"c\\d"#));
+        // Ensure target HAL directory is created, permissions are safe for _coreaudiod,
+        // and coreaudiod restart uses killall -9 (macOS 14.4+ blocks launchctl kickstart)
+        assert!(script.contains("mkdir -p '/Library/Audio/Plug-Ins/HAL'"));
+        assert!(script.contains("chmod -R u+rwX,go+rX '/Library/Audio/Plug-Ins/HAL/ShizukaAudio.driver'"));
+        assert!(script.contains("killall -9 coreaudiod"));
+        assert!(!script.contains("&& launchctl kickstart"));
+    }
+
+    #[test]
+    fn test_format_macos_osascript_error() {
+        assert_eq!(
+            format_macos_osascript_error(Some(1), "36:45: execution error: User canceled. (-128)\n"),
+            "管理者認証がキャンセルされました。"
+        );
+        let detail = format_macos_osascript_error(
+            Some(1),
+            "Could not kickstart service: 1: Operation not permitted\n",
+        );
+        assert!(detail.contains("終了コード: 1"));
+        assert!(detail.contains("Operation not permitted"));
+        assert_eq!(
+            format_macos_osascript_error(Some(2), "   "),
+            "ドライバの配置に失敗しました（終了コード: 2）。"
+        );
     }
 }
