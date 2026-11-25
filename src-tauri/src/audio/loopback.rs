@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
+#[cfg(not(target_os = "macos"))]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -338,12 +340,12 @@ mod macos_tap {
         kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey,
         kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamFormat,
         kAudioEndPointDeviceIsPrivateKey, kAudioHardwarePropertyTranslatePIDToProcessObject,
-        kAudioObjectPropertyElementMain, kAudioObjectPropertyElementMaster,
-        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
-        kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, AudioHardwareCreateAggregateDevice,
-        AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-        AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectID,
-        AudioObjectPropertyAddress, CATapDescription, CATapMuteBehavior,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioSubTapDriftCompensationKey,
+        kAudioSubTapUIDKey, AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+        AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
+        AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
+        CATapMuteBehavior,
     };
     use objc2_core_audio_types::{
         kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM, AudioBuffer,
@@ -352,7 +354,7 @@ mod macos_tap {
     use objc2_core_foundation::{
         kCFAllocatorDefault, kCFTypeArrayCallBacks, kCFTypeDictionaryKeyCallBacks,
         kCFTypeDictionaryValueCallBacks, CFArray, CFDictionary, CFMutableDictionary, CFRetained,
-        CFString, CFStringCreateWithCString,
+        CFString,
     };
     use objc2_foundation::{
         ns_string, NSArray, NSNumber, NSOperatingSystemVersion, NSProcessInfo, NSString,
@@ -400,10 +402,7 @@ mod macos_tap {
     }
 
     fn to_cfstring(cstr: &'static CStr) -> CFRetained<CFString> {
-        unsafe {
-            CFStringCreateWithCString(kCFAllocatorDefault, cstr.as_ptr(), 0x08000100 /* UTF8 */)
-        }
-        .expect("valid static CStr for CFString")
+        CFString::from_str(cstr.to_str().unwrap_or_default())
     }
 
     /// Translates Shizuka's own PID into a CoreAudio `AudioObjectID` so our own Live Monitor
@@ -419,7 +418,7 @@ mod macos_tap {
         let mut data_size = mem::size_of::<AudioObjectID>() as u32;
         let status = unsafe {
             AudioObjectGetPropertyData(
-                kAudioObjectSystemObject,
+                kAudioObjectSystemObject as AudioObjectID,
                 NonNull::from(&prop),
                 mem::size_of::<i32>() as u32,
                 (&pid as *const i32).cast(),
@@ -443,7 +442,7 @@ mod macos_tap {
         let sr_prop = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
         let sr_status = unsafe {
             AudioObjectGetPropertyData(
@@ -466,7 +465,7 @@ mod macos_tap {
         let fmt_prop = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyStreamFormat,
             mScope: kAudioObjectPropertyScopeInput,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
         let fmt_status = unsafe {
             AudioObjectGetPropertyData(
