@@ -1284,6 +1284,57 @@
     flex-shrink: 0;
   }
 
+  .aec-toggle-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  .aec-live-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    padding: 0.12rem 0.44rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: 0.64rem;
+    font-weight: 600;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+
+    &.is-active {
+      color: var(--color-text-green);
+      border-color: color-mix(
+        in oklab,
+        var(--color-led-green) 45%,
+        var(--border-subtle)
+      );
+
+      & .vad-live-dot {
+        background: var(--color-led-green);
+        border-color: var(--color-led-green);
+        box-shadow: var(--led-glow);
+
+        @media (forced-colors: active) {
+          forced-color-adjust: none;
+        }
+      }
+    }
+  }
+
+  .aec-ref-subpanel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.45rem 0.55rem;
+    border-radius: 0.5rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
   /* VAD Noise Gate Section inside Disclosure Body */
   .vad-section {
     margin-block-start: 0.65rem;
@@ -1326,7 +1377,7 @@
     align-items: center;
     justify-content: center;
     gap: 0.28rem;
-    min-inline-size: 4.35rem;
+    min-inline-size: 3.9rem;
     padding: 0.16rem 0.45rem;
     border-radius: 999px;
     border: 1px solid var(--border-subtle);

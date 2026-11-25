@@ -108,6 +108,8 @@ flowchart LR
 - [x] **`v0.4.1` リリース公開**: SH-1 新アイコン・`naebox/shizuka` URL・上記ハードニング一式・アトミックリリース実証
 - [x] **`v0.4.2` リリース公開**: macOS HAL 導入修正、`cpal` 0.17 移行＆ゾンビストリーム防止、DSP リリースビルド LTO 最適化、Windows アイコンキャッシュ更新フック ([installer.rs](./src-tauri/src/installer.rs), [engine.rs](./src-tauri/src/audio/engine.rs), [Cargo.toml](./src-tauri/Cargo.toml), [hooks.nsh](./src-tauri/windows/hooks.nsh))
 - [x] **`v0.4.3` リリース公開**: 小音量／遠距離マイクでの DeepFilterNet3 低レベル不感帯（デッドゾーン）を解消する先読み整合正規化（`PreDfnNormalizer`）＆ VAD / AGC 低レベル閾値調整 ([processor.rs](./src-tauri/src/audio/processor.rs))
+- [x] **`v0.4.4` リリース公開**: Windows WASAPI (`cpal 0.17`) でのデバイスフレンドリー名解決＆「マイク再接続待ち」誤遷移を修正 ([devices.rs](./src-tauri/src/audio/devices.rs))
+- [x] **`v0.5.0` 機能追加＆安定化**: スピーカー通話向け **エコー除去（WebRTC AEC3）**（`sonora` 純 Rust 実装、Windows WASAPI Loopback / macOS 14.2+ CoreAudio Process Tap 対応、マイクテスト時自動バイパス、マイク別プロファイル記憶）、UI・README の平易な日本語表現への刷新、および `DriftController` の過渡変動抑制（`ζ ≈ 0.88`）を実装 ([aec.rs](./src-tauri/src/audio/aec.rs), [loopback.rs](./src-tauri/src/audio/loopback.rs), [resampler.rs](./src-tauri/src/audio/resampler.rs), [engine.rs](./src-tauri/src/audio/engine.rs), [App.tsx](./src/App.tsx))
 
 ### 継続中の改善・ドッグフーディング
 

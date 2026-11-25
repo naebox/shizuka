@@ -123,6 +123,35 @@ export function AgcLiveBadge() {
   );
 }
 
+export function AecLiveBadge({
+  liveMonitorEnabled,
+}: {
+  liveMonitorEnabled: boolean;
+}) {
+  const telemetry = useLiveTelemetry();
+  const aecActive = telemetry?.aec_active ?? false;
+  const erleDb = telemetry?.aec_erle_db ?? 0;
+  const label = liveMonitorEnabled
+    ? "テスト中停止"
+    : aecActive
+    ? erleDb >= 2.0
+      ? `稼働中 · -${erleDb.toFixed(0)} dB`
+      : "稼働中"
+    : "待機中";
+
+  return (
+    <span
+      className={`aec-live-pill ${
+        aecActive && !liveMonitorEnabled ? "is-active" : ""
+      }`}
+      aria-hidden="true"
+    >
+      <span className="vad-live-dot" />
+      <span>{label}</span>
+    </span>
+  );
+}
+
 export function VadLiveBadge({
   vadGateEnabled,
   ncEnabled,
@@ -146,8 +175,8 @@ export function VadLiveBadge({
           : !ncEnabled
           ? "待機"
           : vadSpeaking
-          ? "発話中"
-          : "無音遮断"}
+          ? "話し中"
+          : "消音中"}
       </span>
     </span>
   );

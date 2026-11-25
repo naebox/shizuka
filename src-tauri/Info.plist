@@ -4,6 +4,8 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Shizuka はマイク音声にリアルタイム AI ノイズ除去を適用するため、マイクへのアクセスが必要です。音声は外部サーバーへ送信されず、すべてローカルで処理されます。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Shizuka はエコー除去有効時に、スピーカーから出る音をマイクが拾わないようにするためシステム音声へのアクセスを使用します。音声は外部サーバーへ送信されず、すべてローカルで処理されます。</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 naebox. Licensed under the MIT License.</string>
 </dict>

@@ -73,7 +73,7 @@ jobs:
         shell: bash
         run: |
           NOTES=$(cat <<'EOF'
-          ## Shizuka — ローカル完結・リアルタイム AI マイクノイズキャンセリング
+          ## Shizuka — 周囲を静かに、声だけをクリアに。
 
           ### ダウンロード
           - **Windows（推奨・インストーラ）**: `Shizuka_*_x64-setup.exe`

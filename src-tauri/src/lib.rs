@@ -247,6 +247,7 @@ fn update_dsp_params(
     vad_threshold_db: f32,
     hpf_enabled: bool,
     agc_enabled: bool,
+    aec_enabled: bool,
 ) -> Result<(), String> {
     let atten_lim_db = if atten_lim_db.is_finite() {
         atten_lim_db.clamp(6.0, 100.0)
@@ -274,6 +275,8 @@ fn update_dsp_params(
         -5.0
     };
 
+    let prev_aec = state.engine.shared.aec_enabled.load(Ordering::Relaxed);
+
     // Update real-time DSP atomics immediately (zero lock / zero disk I/O)
     state.engine.set_params(DspParams {
         atten_lim_db,
@@ -284,10 +287,11 @@ fn update_dsp_params(
         vad_threshold_db,
         hpf_enabled,
         agc_enabled,
+        aec_enabled,
     });
 
     // Debounce disk persistence on background thread so slider drags never trigger fsync storms
-    let snapshot_cfg = if let Ok(mut cfg) = state.config.lock() {
+    let (aec_ref_dev, snapshot_cfg) = if let Ok(mut cfg) = state.config.lock() {
         cfg.atten_lim_db = atten_lim_db;
         cfg.post_filter_beta = post_filter_beta;
         cfg.input_gain_db = input_gain_db;
@@ -296,17 +300,38 @@ fn update_dsp_params(
         cfg.vad_threshold_db = vad_threshold_db;
         cfg.hpf_enabled = hpf_enabled;
         cfg.agc_enabled = agc_enabled;
+        cfg.aec_enabled = aec_enabled;
         if let Some(mic_name) = resolve_active_mic_name(&state, &cfg) {
             cfg.save_profile_for_mic(&mic_name);
         }
-        Some(cfg.clone())
+        (cfg.aec_reference_device.clone(), Some(cfg.clone()))
     } else {
-        None
+        (None, None)
     };
+    if prev_aec != aec_enabled {
+        state.engine.set_aec_config(aec_enabled, aec_ref_dev);
+    }
     if let Some(cfg) = snapshot_cfg {
         state.config_saver.schedule(cfg);
     }
     Ok(())
+}
+
+#[tauri::command]
+fn set_aec_reference_device(
+    state: State<'_, AppState>,
+    reference_device: Option<String>,
+) -> Result<AppConfig, String> {
+    let clean_ref = reference_device.filter(|s| !s.is_empty());
+    let (aec_enabled, updated_cfg) = if let Ok(mut cfg) = state.config.lock() {
+        cfg.aec_reference_device = clean_ref.clone();
+        (cfg.aec_enabled, cfg.clone())
+    } else {
+        (false, AppConfig::default())
+    };
+    state.config_saver.flush_async(updated_cfg.clone());
+    state.engine.set_aec_config(aec_enabled, clean_ref);
+    Ok(updated_cfg)
 }
 
 #[tauri::command]
@@ -717,18 +742,23 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
         "Active Monitor: {:?}\n",
         telem.status.active_monitor_name
     ));
+    out.push_str(&format!(
+        "Active AEC Reference: {:?}\n",
+        telem.status.active_aec_ref_name
+    ));
     if let Some(ref waiting) = telem.status.waiting_device_name {
         out.push_str(&format!("Waiting Device: {}\n", waiting));
     }
     out.push_str(&format!(
-        "Configured: in={:?}, out={:?}, mon={:?}, saved_mic_profiles={}\n",
+        "Configured: in={:?}, out={:?}, mon={:?}, aec_ref={:?}, saved_mic_profiles={}\n",
         cfg.input_device,
         cfg.output_device,
         cfg.monitor_device,
+        cfg.aec_reference_device,
         cfg.mic_profiles.len()
     ));
     out.push_str(&format!(
-        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, hpf={}, agc={} ({:+.1} dB), vad={} ({} dB)\n",
+        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, hpf={}, agc={} ({:+.1} dB), aec={} (active={}, erle={:.1} dB), vad={} ({} dB)\n",
         telem.nc_enabled,
         telem.model_variant,
         cfg.atten_lim_db,
@@ -736,6 +766,9 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
         cfg.hpf_enabled,
         cfg.agc_enabled,
         telem.agc_gain_db,
+        cfg.aec_enabled,
+        telem.aec_active,
+        telem.aec_erle_db,
         cfg.vad_gate_enabled,
         cfg.vad_threshold_db
     ));
@@ -1029,6 +1062,7 @@ pub fn run() {
             set_nc_enabled,
             set_mic_muted,
             update_dsp_params,
+            set_aec_reference_device,
             set_model_variant,
             select_devices,
             set_stream_active,

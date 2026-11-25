@@ -22,6 +22,7 @@ export interface AppConfig {
   input_device: string | null;
   output_device: string | null;
   monitor_device: string | null;
+  aec_reference_device: string | null;
   nc_enabled: boolean;
   model_variant: ModelVariant;
   atten_lim_db: number;
@@ -32,6 +33,7 @@ export interface AppConfig {
   vad_threshold_db: number;
   hpf_enabled: boolean;
   agc_enabled: boolean;
+  aec_enabled: boolean;
   monitor_volume: number;
   stream_active: boolean;
   shortcut_toggle_nc: string | null;
@@ -51,6 +53,7 @@ export interface EngineDeviceStatus {
   active_input_name: string | null;
   active_output_name: string | null;
   active_monitor_name: string | null;
+  active_aec_ref_name: string | null;
   input_sample_rate: number;
   output_sample_rate: number;
   reconnect_count: number;
@@ -69,6 +72,9 @@ export interface AudioTelemetry {
   hpf_enabled: boolean;
   agc_enabled: boolean;
   agc_gain_db: number;
+  aec_enabled: boolean;
+  aec_active: boolean;
+  aec_erle_db: number;
   clipping_active: boolean;
   clip_count: number;
   config_revision: number;

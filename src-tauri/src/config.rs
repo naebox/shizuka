@@ -31,6 +31,7 @@ pub struct MicProfile {
     pub vad_threshold_db: f32,
     pub hpf_enabled: bool,
     pub agc_enabled: bool,
+    pub aec_enabled: bool,
 }
 
 impl Default for MicProfile {
@@ -44,6 +45,7 @@ impl Default for MicProfile {
             vad_threshold_db: -5.0,
             hpf_enabled: true,
             agc_enabled: false,
+            aec_enabled: false,
         }
     }
 }
@@ -54,6 +56,7 @@ pub struct AppConfig {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub monitor_device: Option<String>,
+    pub aec_reference_device: Option<String>,
     pub nc_enabled: bool,
     pub model_variant: ModelVariant,
     pub atten_lim_db: f32,
@@ -64,6 +67,7 @@ pub struct AppConfig {
     pub vad_threshold_db: f32,
     pub hpf_enabled: bool,
     pub agc_enabled: bool,
+    pub aec_enabled: bool,
     pub monitor_volume: f32,
     pub stream_active: bool,
     pub mic_profiles: BTreeMap<String, MicProfile>,
@@ -79,6 +83,7 @@ impl Default for AppConfig {
             input_device: None,
             output_device: None,
             monitor_device: None,
+            aec_reference_device: None,
             nc_enabled: true,
             model_variant: ModelVariant::Standard,
             atten_lim_db: def_prof.atten_lim_db,
@@ -89,6 +94,7 @@ impl Default for AppConfig {
             vad_threshold_db: def_prof.vad_threshold_db,
             hpf_enabled: def_prof.hpf_enabled,
             agc_enabled: def_prof.agc_enabled,
+            aec_enabled: def_prof.aec_enabled,
             monitor_volume: 0.8,
             stream_active: true,
             mic_profiles: BTreeMap::new(),
@@ -120,6 +126,7 @@ impl AppConfig {
             vad_threshold_db: self.vad_threshold_db,
             hpf_enabled: self.hpf_enabled,
             agc_enabled: self.agc_enabled,
+            aec_enabled: self.aec_enabled,
         }
     }
 
@@ -132,6 +139,7 @@ impl AppConfig {
         self.vad_threshold_db = profile.vad_threshold_db;
         self.hpf_enabled = profile.hpf_enabled;
         self.agc_enabled = profile.agc_enabled;
+        self.aec_enabled = profile.aec_enabled;
     }
 
     pub fn save_profile_for_mic(&mut self, mic_name: &str) {
@@ -171,9 +179,19 @@ impl AppConfig {
             let changed = self.to_mic_profile() != existing;
             self.apply_mic_profile(&existing);
             changed
-        } else if is_mic_change && self.input_gain_db.abs() > f32::EPSILON {
-            self.input_gain_db = 0.0;
-            true
+        } else if is_mic_change {
+            let mut changed = false;
+            if self.input_gain_db.abs() > f32::EPSILON {
+                self.input_gain_db = 0.0;
+                changed = true;
+            }
+            // Default unseen microphones (e.g. headsets) to AEC OFF while keeping previous
+            // speaker-call microphone's AEC=ON safely stored in `mic_profiles`.
+            if self.aec_enabled {
+                self.aec_enabled = false;
+                changed = true;
+            }
+            changed
         } else {
             false
         }
@@ -508,21 +526,23 @@ mod tests {
             vad_threshold_db: -2.0,
             hpf_enabled: true,
             agc_enabled: true,
+            aec_enabled: true,
             ..Default::default()
         };
 
-        // Switching from Mic A (unsaved yet) to unseen Mic B:
-        // snapshots Mic A, keeps suppression/VAD/HPF/AGC, resets input_gain_db to 0.0
+        // Switching from Mic A (unsaved yet, speaker-call AEC=true) to unseen Mic B (headset):
+        // snapshots Mic A (with aec_enabled=true), keeps suppression/VAD/HPF/AGC, resets input_gain_db=0.0 & aec_enabled=false
         let changed = cfg.switch_to_mic_profile(Some("Dynamic XLR Mic"), "USB Headset");
         assert!(changed);
         assert_eq!(cfg.input_gain_db, 0.0);
+        assert!(!cfg.aec_enabled);
         assert_eq!(cfg.atten_lim_db, 95.0);
         assert!(cfg.agc_enabled);
         assert_eq!(
             cfg.mic_profiles
                 .get("Dynamic XLR Mic")
-                .map(|p| p.input_gain_db),
-            Some(9.5)
+                .map(|p| (p.input_gain_db, p.aec_enabled)),
+            Some((9.5, true))
         );
 
         // Customize Mic B and save
@@ -530,15 +550,17 @@ mod tests {
         cfg.input_gain_db = -3.0;
         cfg.hpf_enabled = false;
         cfg.agc_enabled = false;
+        cfg.aec_enabled = false;
         cfg.save_profile_for_mic("USB Headset");
 
-        // Switch back to Mic A -> restores Mic A's full profile
+        // Switch back to Mic A -> restores Mic A's full profile including aec_enabled=true
         let restored = cfg.switch_to_mic_profile(Some("USB Headset"), "Dynamic XLR Mic");
         assert!(restored);
         assert_eq!(cfg.atten_lim_db, 95.0);
         assert_eq!(cfg.input_gain_db, 9.5);
         assert!(cfg.hpf_enabled);
         assert!(cfg.agc_enabled);
+        assert!(cfg.aec_enabled);
 
         // Switch back to Mic B -> restores Mic B's full profile
         let restored_b = cfg.switch_to_mic_profile(Some("Dynamic XLR Mic"), "USB Headset");

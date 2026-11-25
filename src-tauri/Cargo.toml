@@ -1,6 +1,6 @@
 [package]
 name = "shizuka"
-version = "0.4.4"
+version = "0.5.0"
 description = "Shizuka — Local Real-Time AI Microphone Noise Cancellation powered by DeepFilterNet3 + Neural VAD Gate"
 authors = ["naebox"]
 edition = "2021"
@@ -30,6 +30,7 @@ cpal = "0.17"
 ringbuf = "0.4"
 rubato = "0.16"
 audio_thread_priority = "0.34"
+sonora = "0.3"
 
 # DeepFilterNet3 native Rust engine (Low-Latency 0-lookahead model bundled)
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", package = "deep_filter", default-features = false, features = ["tract", "default-model-ll"] }
@@ -42,6 +43,15 @@ tract-data = "=0.21.4"
 tract-linalg = "=0.21.4"
 tract-onnx-opl = "=0.21.4"
 ndarray = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = { version = "0.14", default-features = false, features = ["core_audio", "audio_toolbox"] }
+objc2 = "0.6"
+objc2-audio-toolbox = { version = "0.3", default-features = false, features = ["std", "AUComponent", "AudioUnitProperties"] }
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "AudioHardware", "AudioHardwareDeprecated", "objc2", "objc2-foundation"] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
 
 # Important: build dependencies (tract / rubato / deep_filter) with opt-level = 3 and debug-assertions = false
 # so real-time 10ms budget never glitches AND tract-core 0.21.4 does not trip its debug-only duplicate const name
@@ -75,6 +85,16 @@ opt-level = 3
 [profile.release.package.rustfft]
 opt-level = 3
 [profile.release.package.ndarray]
+opt-level = 3
+[profile.release.package.sonora]
+opt-level = 3
+[profile.release.package.sonora-aec3]
+opt-level = 3
+[profile.release.package.sonora-common-audio]
+opt-level = 3
+[profile.release.package.sonora-fft]
+opt-level = 3
+[profile.release.package.sonora-simd]
 opt-level = 3
 
 # Startup-only ONNX/NNEF graph loaders (run once at launch, never in the 10ms audio loop)

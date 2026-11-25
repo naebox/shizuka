@@ -2,6 +2,7 @@ use anyhow::Result;
 use deep_filter::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::Array2;
 
+use crate::audio::aec::AecProcessor;
 use crate::config::ModelVariant;
 
 pub const DFN_SAMPLE_RATE: usize = 48_000;
@@ -19,6 +20,8 @@ pub struct FrameProcessResult {
     pub lsnr_db: f32,
     pub vad_speaking: bool,
     pub agc_gain_db: f32,
+    pub aec_active: bool,
+    pub aec_erle_db: f32,
     pub clipped: bool,
     pub dfn_error: bool,
 }
@@ -439,6 +442,7 @@ pub struct NoiseProcessor {
     out_frame: Array2<f32>,
     hpf_scratch: [f32; DFN_HOP_SIZE],
     hpf: HighPassFilter,
+    aec: AecProcessor,
     pre_norm: PreDfnNormalizer,
     agc: VadAgc,
     nc_enabled: bool,
@@ -463,6 +467,7 @@ impl NoiseProcessor {
         vad_thresh_db: f32,
         hpf_enabled: bool,
         agc_enabled: bool,
+        aec_enabled: bool,
         nc_enabled: bool,
         mic_muted: bool,
         input_gain_db: f32,
@@ -505,6 +510,7 @@ impl NoiseProcessor {
             out_frame: Array2::<f32>::zeros((1, hop)),
             hpf_scratch: [0.0f32; DFN_HOP_SIZE],
             hpf: HighPassFilter::new(DFN_SAMPLE_RATE as f64, HPF_CUTOFF_HZ, hpf_enabled),
+            aec: AecProcessor::new(aec_enabled),
             pre_norm: PreDfnNormalizer::new(lookahead),
             agc: VadAgc::new(agc_enabled),
             nc_enabled,
@@ -523,9 +529,10 @@ impl NoiseProcessor {
         self.variant
     }
 
-    /// Algorithmic latency in ms: 10ms hop + lookahead frames (30ms for Standard, 10ms for LowLatency).
+    /// Algorithmic latency in ms: 10ms hop + lookahead frames (30ms for Standard, 10ms for LowLatency)
+    /// + 8ms causal margin only when AEC is actively engaged.
     pub fn algorithmic_latency_ms(&self) -> f32 {
-        (1 + self.model.lookahead) as f32 * 10.0
+        (1 + self.model.lookahead) as f32 * 10.0 + self.aec.active_latency_ms()
     }
 
     #[inline]
@@ -546,6 +553,16 @@ impl NoiseProcessor {
     #[inline]
     pub fn set_agc_enabled(&mut self, enabled: bool) {
         self.agc.set_enabled(enabled);
+    }
+
+    #[inline]
+    pub fn set_aec_enabled(&mut self, enabled: bool) {
+        self.aec.set_enabled(enabled);
+    }
+
+    #[inline]
+    pub fn set_aec_monitor_bypass(&mut self, bypass: bool) {
+        self.aec.set_monitor_bypass(bypass);
     }
 
     #[inline]
@@ -580,12 +597,14 @@ impl NoiseProcessor {
     }
 
     /// Processes exactly 480 samples (10ms @ 48kHz) with zero heap allocations.
+    /// - `aec_ref_480`: optional 48 kHz mono speaker loopback reference frame for WebRTC AEC3
     /// - `raw_out_480`: gain-adjusted raw signal (for A/B live monitor & NC bypass)
-    /// - `enh_out_480`: HPF -> DFN3 -> VAD-gated AGC -> VAD envelope -> soft-limited signal
+    /// - `enh_out_480`: HPF -> AEC3 -> PreDfnNormalizer -> DFN3 -> VAD-gated AGC -> VAD envelope -> soft-limited signal
     /// - `final_out_480`: active output (denoised or bypassed) with clickless mic-mute fade
     pub fn process_frame_48k(
         &mut self,
         input_480: &[f32],
+        aec_ref_480: Option<&[f32]>,
         raw_out_480: &mut [f32],
         enh_out_480: &mut [f32],
         final_out_480: &mut [f32],
@@ -637,6 +656,16 @@ impl NoiseProcessor {
             }
             self.input_gain_smoothed = target_gain;
         }
+
+        // 2b. Pre-DFN3 WebRTC AEC3 (removes far-end speaker bleed while linear acoustic phase
+        //     coherence is still intact, preventing DFN3 / VAD from opening on speaker voices).
+        let aec_metrics = {
+            let mut in_slice = self.in_frame.row_mut(0);
+            let slice = in_slice
+                .as_slice_mut()
+                .expect("contiguous 1x480 DeepFilterNet3 input frame");
+            self.aec.process_frame_48k(aec_ref_480, slice)
+        };
 
         // 3. Transparent unity-gain operating-level normalization + DeepFilterNet3 neural inference
         //    Prevents DFN3's -40..-58 dBFS low-level dead zone on quiet/distant mics (e.g. dynamic mics on macOS).
@@ -742,6 +771,8 @@ impl NoiseProcessor {
             lsnr_db: lsnr,
             vad_speaking,
             agc_gain_db,
+            aec_active: aec_metrics.active,
+            aec_erle_db: aec_metrics.erle_db,
             clipped,
             dfn_error,
         }
@@ -892,6 +923,7 @@ mod tests {
             -5.0,
             true,
             false,
+            false,
             true,
             false,
             0.0,
@@ -919,7 +951,8 @@ mod tests {
                 let rand_unit = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = rand_unit * 0.15;
             }
-            let _res = proc.process_frame_48k(&noisy, &mut raw_out, &mut enh_out, &mut clean_out);
+            let _res =
+                proc.process_frame_48k(&noisy, None, &mut raw_out, &mut enh_out, &mut clean_out);
 
             if frame_idx >= 60 {
                 for i in 0..DFN_HOP_SIZE {
@@ -951,6 +984,7 @@ mod tests {
             -5.0,
             true,
             false,
+            false,
             true,
             false,
             0.0,
@@ -968,7 +1002,8 @@ mod tests {
             let t = i as f32 / DFN_SAMPLE_RATE as f32;
             *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
         }
-        let res_hot = proc.process_frame_48k(&hot, &mut raw_out, &mut enh_out, &mut final_out);
+        let res_hot =
+            proc.process_frame_48k(&hot, None, &mut raw_out, &mut enh_out, &mut final_out);
         assert!(res_hot.clipped, "Expected clipping flag on overdriven input");
         for &s in &final_out {
             assert!(s.abs() <= 1.0, "Soft limiter must keep samples within [-1, 1]");
@@ -976,8 +1011,9 @@ mod tests {
 
         // Enable mute: frame 1 fades down, frame 2 is completely silent
         proc.set_mic_muted(true);
-        let _ = proc.process_frame_48k(&hot, &mut raw_out, &mut enh_out, &mut final_out);
-        let res_muted = proc.process_frame_48k(&hot, &mut raw_out, &mut enh_out, &mut final_out);
+        let _ = proc.process_frame_48k(&hot, None, &mut raw_out, &mut enh_out, &mut final_out);
+        let res_muted =
+            proc.process_frame_48k(&hot, None, &mut raw_out, &mut enh_out, &mut final_out);
         assert!(!res_muted.clipped, "Muted state should not emit clipping alerts");
         let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
         assert_eq!(max_abs, 0.0, "Muted output must be completely silent");
@@ -993,6 +1029,7 @@ mod tests {
             true,
             -5.0,
             true,
+            false,
             false,
             true,
             true, // Start muted!
@@ -1010,7 +1047,7 @@ mod tests {
             let t = i as f32 / DFN_SAMPLE_RATE as f32;
             *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.6;
         }
-        let res1 = proc.process_frame_48k(&loud, &mut raw_out, &mut enh_out, &mut final_out);
+        let res1 = proc.process_frame_48k(&loud, None, &mut raw_out, &mut enh_out, &mut final_out);
         assert!(!res1.clipped);
         let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
         assert_eq!(
@@ -1024,7 +1061,7 @@ mod tests {
         bad[0] = f32::NAN;
         bad[1] = f32::INFINITY;
         bad[2] = f32::NEG_INFINITY;
-        let _ = proc.process_frame_48k(&bad, &mut raw_out, &mut enh_out, &mut final_out);
+        let _ = proc.process_frame_48k(&bad, None, &mut raw_out, &mut enh_out, &mut final_out);
         for &s in &final_out {
             assert!(s.is_finite() && s.abs() <= 1.0);
         }
@@ -1059,6 +1096,7 @@ mod tests {
             -5.0,
             true,
             false,
+            false,
             true,
             false,
             0.0,
@@ -1081,7 +1119,7 @@ mod tests {
                 let rnd = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = rnd * noise_amp;
             }
-            let _ = proc.process_frame_48k(&nbuf, &mut raw, &mut enh, &mut out);
+            let _ = proc.process_frame_48k(&nbuf, None, &mut raw, &mut enh, &mut out);
         }
 
         // 2. Feed 2.5s of quiet -45 dBFS speech bursts (without PreDfnNormalizer, DFN3 drops by -24 dB)
@@ -1114,7 +1152,7 @@ mod tests {
                 let rnd = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = voice + rnd * noise_amp;
             }
-            let _ = proc.process_frame_48k(&buf, &mut raw, &mut enh, &mut out);
+            let _ = proc.process_frame_48k(&buf, None, &mut raw, &mut enh, &mut out);
             if cyc > 0.1 && cyc < 0.55 {
                 cnt += 1;
                 for i in 0..DFN_HOP_SIZE {
@@ -1139,7 +1177,7 @@ mod tests {
             *s = (2.0 * std::f32::consts::PI * 300.0 * t).sin() * 0.5;
         }
         for _ in 0..5 {
-            let _ = proc.process_frame_48k(&loud, &mut raw, &mut enh, &mut out);
+            let _ = proc.process_frame_48k(&loud, None, &mut raw, &mut enh, &mut out);
             assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
         }
     }

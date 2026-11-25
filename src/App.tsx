@@ -33,6 +33,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  AecLiveBadge,
   AgcLiveBadge,
   HeroLiveMeters,
   MicTestLiveMeter,
@@ -361,6 +362,10 @@ export function App() {
   const hpfHintId = `${uid}-hpf-hint`;
   const agcSwitchId = `${uid}-agc-switch`;
   const agcHintId = `${uid}-agc-hint`;
+  const aecSwitchId = `${uid}-aec-switch`;
+  const aecHintId = `${uid}-aec-hint`;
+  const aecRefSelectId = `${uid}-aec-ref-select`;
+  const aecRefHintId = `${uid}-aec-ref-hint`;
   const vadSwitchId = `${uid}-vad-switch`;
   const vadSliderId = `${uid}-vad-slider`;
   const vadHintId = `${uid}-vad-hint`;
@@ -901,7 +906,8 @@ export function App() {
     vadGateEnabled: boolean,
     vadThresholdDb: number,
     hpfEnabled: boolean,
-    agcEnabled: boolean
+    agcEnabled: boolean,
+    aecEnabled: boolean
   ) => {
     const cur = configRef.current;
     if (!cur) return;
@@ -919,6 +925,7 @@ export function App() {
             vad_threshold_db: vadThresholdDb,
             hpf_enabled: hpfEnabled,
             agc_enabled: agcEnabled,
+            aec_enabled: aecEnabled,
           }
         : prev
     );
@@ -932,6 +939,7 @@ export function App() {
         vadThresholdDb,
         hpfEnabled,
         agcEnabled,
+        aecEnabled,
       });
     } catch (err) {
       if (seq === paramSeqRef.current) {
@@ -940,6 +948,31 @@ export function App() {
           .then(setConfig)
           .catch(() => {});
       }
+    }
+  };
+
+  const handleAecReferenceChange = async (nextRef: string | null) => {
+    setActionError(null);
+    const seq = ++deviceSeqRef.current;
+    const prevSnapshot = configRef.current;
+    setConfig((prev) =>
+      prev ? { ...prev, aec_reference_device: nextRef } : prev
+    );
+    try {
+      const synced = await invoke<AppConfig>("set_aec_reference_device", {
+        referenceDevice: nextRef,
+      });
+      if (seq === deviceSeqRef.current) {
+        setConfig(synced);
+      }
+      refreshTelemetryNow();
+    } catch (err) {
+      if (seq === deviceSeqRef.current && prevSnapshot) {
+        setConfig(prevSnapshot);
+      }
+      setActionError(
+        `スピーカーの切替に失敗しました: ${formatIpcError(err)}`
+      );
     }
   };
 
@@ -1149,6 +1182,7 @@ export function App() {
   const vadThreshDb = config?.vad_threshold_db ?? -5;
   const hpfEnabled = config?.hpf_enabled ?? telemetry?.hpf_enabled ?? true;
   const agcEnabled = config?.agc_enabled ?? telemetry?.agc_enabled ?? false;
+  const aecEnabled = config?.aec_enabled ?? telemetry?.aec_enabled ?? false;
   const liveMonitorEnabled = telemetry?.live_monitor_enabled ?? false;
   const monVolPct = Math.round(
     (config?.monitor_volume ?? telemetry?.monitor_volume ?? 0.8) * 100
@@ -1187,6 +1221,11 @@ export function App() {
     config?.monitor_device &&
       devices &&
       !physicalOutputs.some((d) => d.name === config.monitor_device)
+  );
+  const configuredAecRefMissing = Boolean(
+    config?.aec_reference_device &&
+      devices &&
+      !physicalOutputs.some((d) => d.name === config.aec_reference_device)
   );
 
   return (
@@ -1591,7 +1630,8 @@ export function App() {
                         vadGateEnabled,
                         vadThreshDb,
                         hpfEnabled,
-                        agcEnabled
+                        agcEnabled,
+                        aecEnabled
                       )
                     }
                   />
@@ -1617,7 +1657,8 @@ export function App() {
                         vadGateEnabled,
                         vadThreshDb,
                         hpfEnabled,
-                        agcEnabled
+                        agcEnabled,
+                        aecEnabled
                       )
                     }
                   />
@@ -1643,7 +1684,8 @@ export function App() {
                         vadGateEnabled,
                         vadThreshDb,
                         hpfEnabled,
-                        agcEnabled
+                        agcEnabled,
+                        aecEnabled
                       )
                     }
                   />
@@ -1676,7 +1718,8 @@ export function App() {
                     vadGateEnabled,
                     vadThreshDb,
                     hpfEnabled,
-                    agcEnabled
+                    agcEnabled,
+                    aecEnabled
                   )
                 }
               />
@@ -1706,21 +1749,22 @@ export function App() {
                     vadGateEnabled,
                     vadThreshDb,
                     hpfEnabled,
-                    agcEnabled
+                    agcEnabled,
+                    aecEnabled
                   )
                 }
               />
             </div>
 
-            {/* Voice Conditioning Toggles: HPF 65Hz & VAD-Gated AGC */}
+            {/* Voice Conditioning Toggles: Low-Cut Filter, Auto Volume & Echo Cancellation */}
             <div className="dsp-toggle-section">
               <div className="dsp-toggle-row">
                 <div className="dsp-toggle-copy">
                   <label htmlFor={hpfSwitchId} className="vad-title">
-                    ハイパスフィルタ (HPF 65Hz)
+                    低音ノイズカット
                   </label>
                   <span id={hpfHintId} className="field-hint">
-                    机の振動・アーム衝撃・吹かれ音などの超低域ノイズをカット
+                    机やアームの振動、息が当たる音などの低い雑音を軽減
                   </span>
                 </div>
                 <input
@@ -1739,7 +1783,8 @@ export function App() {
                       vadGateEnabled,
                       vadThreshDb,
                       e.currentTarget.checked,
-                      agcEnabled
+                      agcEnabled,
+                      aecEnabled
                     )
                   }
                   {...({ switch: "" } as Record<string, string>)}
@@ -1750,12 +1795,12 @@ export function App() {
                 <div className="dsp-toggle-copy">
                   <div className="vad-title-group">
                     <label htmlFor={agcSwitchId} className="vad-title">
-                      オートゲイン (AGC)
+                      音量の自動調整
                     </label>
                     {agcEnabled && <AgcLiveBadge />}
                   </div>
                   <span id={agcHintId} className="field-hint">
-                    発話区間のみで声の音量を自動均一化（無音時のノイズ増幅を防止）
+                    話している間だけ、声の大きさを聞き取りやすい音量にそろえます
                   </span>
                 </div>
                 <input
@@ -1774,11 +1819,99 @@ export function App() {
                       vadGateEnabled,
                       vadThreshDb,
                       hpfEnabled,
-                      e.currentTarget.checked
+                      e.currentTarget.checked,
+                      aecEnabled
                     )
                   }
                   {...({ switch: "" } as Record<string, string>)}
                 />
+              </div>
+
+              <div className="aec-toggle-block">
+                <div className="dsp-toggle-row">
+                  <div className="dsp-toggle-copy">
+                    <div className="vad-title-group">
+                      <label htmlFor={aecSwitchId} className="vad-title">
+                        エコー除去
+                      </label>
+                      {aecEnabled && (
+                        <AecLiveBadge liveMonitorEnabled={liveMonitorEnabled} />
+                      )}
+                    </div>
+                    <span id={aecHintId} className="field-hint">
+                      スピーカーから聞こえる声や音をマイクが拾うのを防止
+                    </span>
+                  </div>
+                  <input
+                    id={aecSwitchId}
+                    name="aec_enabled"
+                    type="checkbox"
+                    role={supportsNativeSwitch ? undefined : "switch"}
+                    className="nc-toggle compact"
+                    checked={aecEnabled}
+                    aria-describedby={aecHintId}
+                    onChange={(e) =>
+                      void handleParamChange(
+                        attenDb,
+                        pfBeta,
+                        gainDb,
+                        vadGateEnabled,
+                        vadThreshDb,
+                        hpfEnabled,
+                        agcEnabled,
+                        e.currentTarget.checked
+                      )
+                    }
+                    {...({ switch: "" } as Record<string, string>)}
+                  />
+                </div>
+
+                {aecEnabled && (
+                  <div className="aec-ref-subpanel">
+                    <label htmlFor={aecRefSelectId} className="field-label">
+                      使用中のスピーカー
+                    </label>
+                    <div className="select-with-icon">
+                      <Volume2
+                        size={14}
+                        className="select-leading-icon"
+                        aria-hidden="true"
+                      />
+                      <select
+                        id={aecRefSelectId}
+                        name="aec_reference_device"
+                        className="brand-select has-leading-icon"
+                        value={config?.aec_reference_device ?? ""}
+                        aria-describedby={isMac ? aecRefHintId : undefined}
+                        onChange={(e) =>
+                          void handleAecReferenceChange(e.target.value || null)
+                        }
+                      >
+                        <option value="">
+                          システム既定のスピーカー (自動選択)
+                        </option>
+                        {configuredAecRefMissing &&
+                          config?.aec_reference_device && (
+                            <option value={config.aec_reference_device}>
+                              {config.aec_reference_device} (未接続)
+                            </option>
+                          )}
+                        {physicalOutputs.map((d) => (
+                          <option key={d.name} value={d.name}>
+                            {d.is_default ? "★ " : ""}
+                            {d.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    {isMac && (
+                      <span id={aecRefHintId} className="field-hint">
+                        初回有効化時のみ macOS のシステム音声録音の許可が必要です（macOS
+                        14.2+）
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1786,7 +1919,7 @@ export function App() {
               <div className="vad-header">
                 <div className="vad-title-group">
                   <label htmlFor={vadSwitchId} className="vad-title">
-                    無音時ノイズゲート (VAD)
+                    話していない時は自動ミュート
                   </label>
                   <VadLiveBadge
                     vadGateEnabled={vadGateEnabled}
@@ -1808,7 +1941,8 @@ export function App() {
                       e.currentTarget.checked,
                       vadThreshDb,
                       hpfEnabled,
-                      agcEnabled
+                      agcEnabled,
+                      aecEnabled
                     )
                   }
                   {...({ switch: "" } as Record<string, string>)}
@@ -1817,13 +1951,11 @@ export function App() {
 
               <div className="slider-row">
                 <div className="slider-top">
-                  <label htmlFor={vadSliderId}>
-                    VAD ゲート感度 (声の判定閾値)
-                  </label>
+                  <label htmlFor={vadSliderId}>消音の厳しさ</label>
                   <span className="slider-val">{vadValueText}</span>
                 </div>
                 <span id={vadHintId} className="field-hint">
-                  高くするほど非発話時の打鍵音・環境音を厳しく完全ミュートします
+                  上げるほど、話していない時のキーボード音や周囲の音をしっかり消します
                 </span>
                 <input
                   id={vadSliderId}
@@ -1846,7 +1978,8 @@ export function App() {
                       vadGateEnabled,
                       Number(e.target.value),
                       hpfEnabled,
-                      agcEnabled
+                      agcEnabled,
+                      aecEnabled
                     )
                   }
                 />

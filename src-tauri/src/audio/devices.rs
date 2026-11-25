@@ -239,6 +239,47 @@ pub fn find_input_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
     })
 }
 
+/// Returns the current OS default physical (non-virtual) speaker/output device name, if any.
+pub fn default_physical_output_name() -> Option<String> {
+    let host = cpal::default_host();
+    if let Some(def) = host.default_output_device() {
+        if let Some(name) = device_name(&def) {
+            if !should_hide_device(&name) && !is_virtual_audio_device(&name) {
+                return Some(name);
+            }
+        }
+    }
+    host.output_devices()
+        .ok()?
+        .filter_map(|d| device_name(&d))
+        .find(|n| !should_hide_device(n) && !is_virtual_audio_device(n))
+}
+
+/// Finds a physical speaker/output device for AEC loopback reference capture.
+/// - Never selects virtual audio cables (`Shizuka Virtual Mic`, `CABLE Input`, `BlackHole`, etc.)
+///   so Shizuka can never accidentally feed its own virtual mic output into AEC as far-end reference.
+/// - When `preferred_name` is `Some` (explicit speaker selection), requires an exact match so
+///   unplugging that speaker cleanly pauses AEC reference until reconnected instead of silently
+///   tapping an unrelated audio output.
+/// - When `preferred_name` is `None` ("auto"), selects the OS default physical speaker.
+pub fn find_aec_reference_device(preferred_name: Option<&str>) -> Option<cpal::Device> {
+    if let Some(target) = preferred_name.filter(|s| !s.is_empty()) {
+        if should_hide_device(target) || is_virtual_audio_device(target) {
+            return None;
+        }
+        return find_output_device(Some(target), false).filter(|dev| {
+            device_name(dev)
+                .map(|n| !should_hide_device(&n) && !is_virtual_audio_device(&n))
+                .unwrap_or(false)
+        });
+    }
+    find_output_device(None, true).filter(|dev| {
+        device_name(dev)
+            .map(|n| !should_hide_device(&n) && !is_virtual_audio_device(&n))
+            .unwrap_or(true)
+    })
+}
+
 pub fn find_output_device(preferred_name: Option<&str>, fallback_to_default: bool) -> Option<cpal::Device> {
     let host = cpal::default_host();
     if let Some(target) = preferred_name {

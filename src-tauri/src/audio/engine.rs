@@ -11,10 +11,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::audio::aec::AecRefSink;
 use crate::audio::devices::{
-    default_physical_input_name, device_name, find_input_device, find_output_device,
-    list_audio_devices,
+    default_physical_input_name, default_physical_output_name, device_name, find_input_device,
+    find_output_device, list_audio_devices,
 };
+use crate::audio::loopback::{build_aec_loopback_stream, LoopbackPipeline};
 use crate::audio::processor::{soft_limit, NoiseProcessor, DFN_HOP_SIZE, DFN_SAMPLE_RATE};
 use crate::audio::resampler::{AdaptiveOutputResampler, DriftController, InputResampler48k};
 use crate::config::{AppConfig, ModelVariant};
@@ -47,6 +49,7 @@ pub struct EngineDeviceStatus {
     pub active_input_name: Option<String>,
     pub active_output_name: Option<String>,
     pub active_monitor_name: Option<String>,
+    pub active_aec_ref_name: Option<String>,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
     pub reconnect_count: u32,
@@ -65,6 +68,7 @@ pub struct DspParams {
     pub vad_threshold_db: f32,
     pub hpf_enabled: bool,
     pub agc_enabled: bool,
+    pub aec_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +82,9 @@ pub struct AudioTelemetry {
     pub hpf_enabled: bool,
     pub agc_enabled: bool,
     pub agc_gain_db: f32,
+    pub aec_enabled: bool,
+    pub aec_active: bool,
+    pub aec_erle_db: f32,
     pub clipping_active: bool,
     pub clip_count: u64,
     pub config_revision: u64,
@@ -110,6 +117,9 @@ pub struct SharedAudioState {
     pub hpf_enabled: AtomicBool,
     pub agc_enabled: AtomicBool,
     pub agc_gain_db_bits: AtomicU32,
+    pub aec_enabled: AtomicBool,
+    pub aec_active: AtomicBool,
+    pub aec_erle_db_bits: AtomicU32,
     pub clipping_active: AtomicBool,
     pub clip_count: AtomicU64,
     pub config_revision: AtomicU64,
@@ -172,6 +182,9 @@ impl SharedAudioState {
             hpf_enabled: AtomicBool::new(cfg.hpf_enabled),
             agc_enabled: AtomicBool::new(cfg.agc_enabled),
             agc_gain_db_bits: AtomicU32::new(0.0f32.to_bits()),
+            aec_enabled: AtomicBool::new(cfg.aec_enabled),
+            aec_active: AtomicBool::new(false),
+            aec_erle_db_bits: AtomicU32::new(0.0f32.to_bits()),
             clipping_active: AtomicBool::new(false),
             clip_count: AtomicU64::new(0),
             config_revision: AtomicU64::new(0),
@@ -217,6 +230,8 @@ impl SharedAudioState {
             .store(params.hpf_enabled, Ordering::Relaxed);
         self.agc_enabled
             .store(params.agc_enabled, Ordering::Relaxed);
+        self.aec_enabled
+            .store(params.aec_enabled, Ordering::Relaxed);
     }
 
     pub fn apply_config_dsp(&self, cfg: &AppConfig) {
@@ -229,6 +244,7 @@ impl SharedAudioState {
             vad_threshold_db: cfg.vad_threshold_db,
             hpf_enabled: cfg.hpf_enabled,
             agc_enabled: cfg.agc_enabled,
+            aec_enabled: cfg.aec_enabled,
         });
     }
 
@@ -264,6 +280,9 @@ impl SharedAudioState {
             hpf_enabled: self.hpf_enabled.load(Ordering::Relaxed),
             agc_enabled: self.agc_enabled.load(Ordering::Relaxed),
             agc_gain_db: load_f32(&self.agc_gain_db_bits),
+            aec_enabled: self.aec_enabled.load(Ordering::Relaxed),
+            aec_active: self.aec_active.load(Ordering::Relaxed),
+            aec_erle_db: load_f32(&self.aec_erle_db_bits),
             clipping_active: self.clipping_active.load(Ordering::Relaxed),
             clip_count: self.clip_count.load(Ordering::Relaxed),
             config_revision: self.config_revision.load(Ordering::Relaxed),
@@ -285,10 +304,11 @@ impl SharedAudioState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamKind {
+pub(crate) enum StreamKind {
     Input,
     VirtualOutput,
     Monitor,
+    AecLoopback,
 }
 
 enum PipelineStartError {
@@ -309,6 +329,10 @@ enum EngineCommand {
     SetLiveMonitor {
         enabled: bool,
         monitor_device: Option<String>,
+    },
+    SetAecConfig {
+        enabled: bool,
+        reference_device: Option<String>,
     },
     StreamError {
         generation: u64,
@@ -335,6 +359,7 @@ struct RunningPipeline {
     stop_flag: Arc<AtomicBool>,
     worker_join: Option<JoinHandle<()>>,
     mon_tx: mpsc::Sender<Option<MonitorSink>>,
+    aec_tx: mpsc::Sender<Option<AecRefSink>>,
     active_input_name: String,
     _input_stream: Stream,
     _virtual_output_stream: Option<Stream>,
@@ -349,6 +374,7 @@ impl RunningPipeline {
             let _ = virt.pause();
         }
         let _ = self.mon_tx.send(None);
+        let _ = self.aec_tx.send(None);
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(jh) = self.worker_join.take() {
             jh.thread().unpark();
@@ -482,10 +508,18 @@ impl AudioEngineHandle {
     pub fn set_monitor_volume(&self, volume: f32) {
         store_f32(&self.shared.monitor_volume_bits, volume.clamp(0.0, 1.0));
     }
+
+    pub fn set_aec_config(&self, enabled: bool, reference_device: Option<String>) {
+        self.shared.aec_enabled.store(enabled, Ordering::Relaxed);
+        let _ = self.cmd_tx.send(EngineCommand::SetAecConfig {
+            enabled,
+            reference_device,
+        });
+    }
 }
 
 #[derive(Clone)]
-struct StreamErrorNotifier {
+pub(crate) struct StreamErrorNotifier {
     tx: mpsc::Sender<EngineCommand>,
     generation: u64,
     kind: StreamKind,
@@ -502,7 +536,7 @@ impl StreamErrorNotifier {
         }
     }
 
-    fn notify(&self, err: cpal::StreamError) {
+    pub(crate) fn notify(&self, err: cpal::StreamError) {
         // Transient xrun notifications in cpal 0.17 should not tear down and restart the pipeline
         if matches!(err, cpal::StreamError::BufferUnderrun) {
             log::warn!(
@@ -552,6 +586,8 @@ struct WatchdogState {
     next_retry_at: Option<Instant>,
     virt_reattach_attempt: u32,
     next_virt_reattach_at: Option<Instant>,
+    aec_reattach_attempt: u32,
+    next_aec_reattach_at: Option<Instant>,
     pipe_started_at: Instant,
     last_seen_in_frames: u64,
     last_seen_out_frames: u64,
@@ -567,6 +603,8 @@ impl WatchdogState {
             next_retry_at: None,
             virt_reattach_attempt: 0,
             next_virt_reattach_at: None,
+            aec_reattach_attempt: 0,
+            next_aec_reattach_at: None,
             pipe_started_at: Instant::now(),
             last_seen_in_frames: 0,
             last_seen_out_frames: 0,
@@ -582,6 +620,8 @@ fn reset_audio_meters(shared: &SharedAudioState) {
     store_f32(&shared.output_rms_db_bits, -90.0);
     store_f32(&shared.monitor_rms_db_bits, -90.0);
     store_f32(&shared.agc_gain_db_bits, 0.0);
+    store_f32(&shared.aec_erle_db_bits, 0.0);
+    shared.aec_active.store(false, Ordering::Relaxed);
     shared.vad_speaking.store(false, Ordering::Relaxed);
     shared.clipping_active.store(false, Ordering::Relaxed);
 }
@@ -595,16 +635,19 @@ fn audio_control_loop(
 ) {
     let mut main_pipe: Option<RunningPipeline> = None;
     let mut live_mon_pipe: Option<MonitorPipeline> = None;
+    let mut aec_loop_pipe: Option<LoopbackPipeline> = None;
 
     let mut cur_in_dev = init_cfg.input_device.clone();
     let mut cur_out_dev = init_cfg.output_device.clone();
     let mut cur_mon_dev = init_cfg.monitor_device.clone();
+    let mut cur_aec_ref_dev = init_cfg.aec_reference_device.clone();
     let mut want_running = init_cfg.stream_active;
     let mut want_mon = false;
     let mut last_profile_mic: Option<String> = None;
 
     let mut main_gen: u64 = 0;
     let mut mon_gen: u64 = 0;
+    let mut aec_gen: u64 = 0;
     let mut wd = WatchdogState::new();
     let mut watchdog_ticks: u32 = 0;
 
@@ -673,23 +716,121 @@ fn audio_control_loop(
     };
 
     #[allow(clippy::too_many_arguments)]
+    let sync_aec_loopback = |force_reopen: bool,
+                             want_running: bool,
+                             want_mon: bool,
+                             aec_ref_name: Option<String>,
+                             aec_gen: &mut u64,
+                             wd: &mut WatchdogState,
+                             main_pipe: &Option<RunningPipeline>,
+                             aec_loop_pipe: &mut Option<LoopbackPipeline>| {
+        let want_aec = shared.aec_enabled.load(Ordering::Relaxed);
+        let should_open = want_running && main_pipe.is_some() && want_aec && !want_mon;
+
+        if !should_open {
+            if aec_loop_pipe.is_some() {
+                *aec_gen = aec_gen.wrapping_add(1);
+                if let Some(pipe) = main_pipe.as_ref() {
+                    let _ = pipe.aec_tx.send(None);
+                }
+                let _ = aec_loop_pipe.take();
+            }
+            shared.aec_active.store(false, Ordering::Relaxed);
+            store_f32(&shared.aec_erle_db_bits, 0.0);
+            wd.aec_reattach_attempt = 0;
+            wd.next_aec_reattach_at = None;
+            if let Ok(mut st) = shared.status.lock() {
+                st.active_aec_ref_name = None;
+                if !want_aec
+                    && st
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("エコー除去"))
+                {
+                    st.last_error = None;
+                }
+            }
+            return;
+        }
+
+        if aec_loop_pipe.is_some() && !force_reopen {
+            return;
+        }
+
+        *aec_gen = aec_gen.wrapping_add(1);
+        if let Some(pipe) = main_pipe.as_ref() {
+            let _ = pipe.aec_tx.send(None);
+        }
+        let _ = aec_loop_pipe.take();
+
+        if let Some(pipe) = main_pipe.as_ref() {
+            let notifier =
+                StreamErrorNotifier::new(cmd_tx.clone(), *aec_gen, StreamKind::AecLoopback);
+            match build_aec_loopback_stream(aec_ref_name.as_deref(), notifier) {
+                Ok((lp, sink, actual_ref_name)) => {
+                    let _ = pipe.aec_tx.send(Some(sink));
+                    *aec_loop_pipe = Some(lp);
+                    wd.aec_reattach_attempt = 0;
+                    wd.next_aec_reattach_at = None;
+                    diagnostics::info(format!(
+                        "AEC speaker reference attached: '{}'",
+                        actual_ref_name
+                    ));
+                    if let Ok(mut st) = shared.status.lock() {
+                        st.active_aec_ref_name = Some(actual_ref_name);
+                        if st
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("エコー除去"))
+                        {
+                            st.last_error = None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if wd.aec_reattach_attempt == 0 {
+                        diagnostics::warn(format!("AEC reference stream unavailable: {:#}", e));
+                    }
+                    shared.aec_active.store(false, Ordering::Relaxed);
+                    store_f32(&shared.aec_erle_db_bits, 0.0);
+                    if let Ok(mut st) = shared.status.lock() {
+                        st.active_aec_ref_name = None;
+                        if wd.aec_reattach_attempt == 0 {
+                            st.last_error = Some(format!("{:#}", e));
+                        }
+                    }
+                    wd.next_aec_reattach_at = Some(
+                        Instant::now() + virtual_reattach_backoff_duration(wd.aec_reattach_attempt),
+                    );
+                    wd.aec_reattach_attempt = wd.aec_reattach_attempt.saturating_add(1);
+                }
+            }
+        }
+    };
+
+    #[allow(clippy::too_many_arguments)]
     let start_main = |in_name: Option<String>,
                       out_name: Option<String>,
                       mon_name: Option<String>,
+                      aec_ref_name: Option<String>,
                       profile_already_applied: bool,
                       last_profile_mic: &mut Option<String>,
                       want_mon: &mut bool,
                       main_gen: &mut u64,
                       mon_gen: &mut u64,
+                      aec_gen: &mut u64,
                       wd: &mut WatchdogState,
                       main_pipe: &mut Option<RunningPipeline>,
-                      live_mon_pipe: &mut Option<MonitorPipeline>| {
+                      live_mon_pipe: &mut Option<MonitorPipeline>,
+                      aec_loop_pipe: &mut Option<LoopbackPipeline>| {
         *main_gen = main_gen.wrapping_add(1);
+        *aec_gen = aec_gen.wrapping_add(1);
         let current_gen = *main_gen;
         if let Some(old) = main_pipe.take() {
             old.stop();
         }
         let _ = live_mon_pipe.take();
+        let _ = aec_loop_pipe.take();
 
         match build_main_pipeline(
             &shared,
@@ -728,6 +869,18 @@ fn audio_control_loop(
                 if *want_mon {
                     *want_mon = apply_live_monitor(true, mon_name, mon_gen, main_pipe, live_mon_pipe);
                 }
+                wd.aec_reattach_attempt = 0;
+                wd.next_aec_reattach_at = None;
+                sync_aec_loopback(
+                    true,
+                    true,
+                    *want_mon,
+                    aec_ref_name,
+                    aec_gen,
+                    wd,
+                    main_pipe,
+                    aec_loop_pipe,
+                );
             }
             Err(PipelineStartError::WaitingForDevice(missing_name)) => {
                 if wd.retry_attempt == 0 {
@@ -747,6 +900,7 @@ fn audio_control_loop(
                     st.active_input_name = None;
                     st.active_output_name = None;
                     st.active_monitor_name = None;
+                    st.active_aec_ref_name = None;
                     st.last_error = None;
                 }
                 wd.next_retry_at = Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
@@ -769,6 +923,7 @@ fn audio_control_loop(
                     st.connection_state = ConnectionState::Reconnecting;
                     st.waiting_device_name = in_name;
                     st.active_monitor_name = None;
+                    st.active_aec_ref_name = None;
                     st.last_error = Some(format!("{:#}", e));
                 }
                 wd.next_retry_at = Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
@@ -782,14 +937,17 @@ fn audio_control_loop(
             cur_in_dev.clone(),
             cur_out_dev.clone(),
             cur_mon_dev.clone(),
+            cur_aec_ref_dev.clone(),
             false,
             &mut last_profile_mic,
             &mut want_mon,
             &mut main_gen,
             &mut mon_gen,
+            &mut aec_gen,
             &mut wd,
             &mut main_pipe,
             &mut live_mon_pipe,
+            &mut aec_loop_pipe,
         );
     } else if let Ok(mut st) = shared.status.lock() {
         st.connection_state = ConnectionState::Stopped;
@@ -811,18 +969,23 @@ fn audio_control_loop(
                     wd.retry_attempt = 0;
                     wd.virt_reattach_attempt = 0;
                     wd.next_virt_reattach_at = None;
+                    wd.aec_reattach_attempt = 0;
+                    wd.next_aec_reattach_at = None;
                     start_main(
                         cur_in_dev.clone(),
                         cur_out_dev.clone(),
                         cur_mon_dev.clone(),
+                        cur_aec_ref_dev.clone(),
                         profile_already_applied,
                         &mut last_profile_mic,
                         &mut want_mon,
                         &mut main_gen,
                         &mut mon_gen,
+                        &mut aec_gen,
                         &mut wd,
                         &mut main_pipe,
                         &mut live_mon_pipe,
+                        &mut aec_loop_pipe,
                     );
                 }
                 EngineCommand::SetModelVariant(variant) => {
@@ -837,14 +1000,17 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            cur_aec_ref_dev.clone(),
                             true,
                             &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
+                            &mut aec_gen,
                             &mut wd,
                             &mut main_pipe,
                             &mut live_mon_pipe,
+                            &mut aec_loop_pipe,
                         );
                     }
                 }
@@ -857,14 +1023,18 @@ fn audio_control_loop(
                     want_mon = false;
                     main_gen = main_gen.wrapping_add(1);
                     mon_gen = mon_gen.wrapping_add(1);
+                    aec_gen = aec_gen.wrapping_add(1);
                     wd.next_retry_at = None;
                     wd.retry_attempt = 0;
                     wd.virt_reattach_attempt = 0;
                     wd.next_virt_reattach_at = None;
+                    wd.aec_reattach_attempt = 0;
+                    wd.next_aec_reattach_at = None;
                     if let Some(old) = main_pipe.take() {
                         old.stop();
                     }
                     let _ = live_mon_pipe.take();
+                    let _ = aec_loop_pipe.take();
                     shared.stream_running.store(false, Ordering::Relaxed);
                     shared.virtual_out_connected.store(false, Ordering::Relaxed);
                     shared.live_monitor_enabled.store(false, Ordering::Relaxed);
@@ -874,6 +1044,7 @@ fn audio_control_loop(
                         st.connection_state = ConnectionState::Stopped;
                         st.waiting_device_name = None;
                         st.active_monitor_name = None;
+                        st.active_aec_ref_name = None;
                     }
                     if let Some(tx) = ack {
                         let _ = tx.send(());
@@ -893,14 +1064,17 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            cur_aec_ref_dev.clone(),
                             false,
                             &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
+                            &mut aec_gen,
                             &mut wd,
                             &mut main_pipe,
                             &mut live_mon_pipe,
+                            &mut aec_loop_pipe,
                         );
                     } else {
                         want_mon = apply_live_monitor(
@@ -910,13 +1084,69 @@ fn audio_control_loop(
                             &mut main_pipe,
                             &mut live_mon_pipe,
                         );
+                        // Automatically detach AEC loopback while Live Monitor is active,
+                        // and reattach cleanly once Live Monitor stops.
+                        wd.aec_reattach_attempt = 0;
+                        wd.next_aec_reattach_at = None;
+                        sync_aec_loopback(
+                            false,
+                            want_running,
+                            want_mon,
+                            cur_aec_ref_dev.clone(),
+                            &mut aec_gen,
+                            &mut wd,
+                            &main_pipe,
+                            &mut aec_loop_pipe,
+                        );
                     }
+                }
+                EngineCommand::SetAecConfig {
+                    enabled,
+                    reference_device,
+                } => {
+                    let ref_changed = cur_aec_ref_dev != reference_device;
+                    cur_aec_ref_dev = reference_device;
+                    shared.aec_enabled.store(enabled, Ordering::Relaxed);
+                    wd.aec_reattach_attempt = 0;
+                    wd.next_aec_reattach_at = None;
+                    sync_aec_loopback(
+                        ref_changed,
+                        want_running,
+                        want_mon,
+                        cur_aec_ref_dev.clone(),
+                        &mut aec_gen,
+                        &mut wd,
+                        &main_pipe,
+                        &mut aec_loop_pipe,
+                    );
                 }
                 EngineCommand::StreamError {
                     generation,
                     kind,
                     message,
                 } => match kind {
+                    StreamKind::AecLoopback => {
+                        if generation == aec_gen && want_running {
+                            diagnostics::warn(format!(
+                                "AEC speaker reference interrupted ({}); detaching cleanly without dropping mic",
+                                message
+                            ));
+                            aec_gen = aec_gen.wrapping_add(1);
+                            if let Some(pipe) = main_pipe.as_ref() {
+                                let _ = pipe.aec_tx.send(None);
+                            }
+                            let _ = aec_loop_pipe.take();
+                            shared.aec_active.store(false, Ordering::Relaxed);
+                            store_f32(&shared.aec_erle_db_bits, 0.0);
+                            if let Ok(mut st) = shared.status.lock() {
+                                st.active_aec_ref_name = None;
+                            }
+                            wd.next_aec_reattach_at = Some(
+                                Instant::now() + reconnect_backoff_duration(wd.aec_reattach_attempt),
+                            );
+                            wd.aec_reattach_attempt = wd.aec_reattach_attempt.saturating_add(1);
+                        }
+                    }
                     StreamKind::Monitor => {
                         if generation == mon_gen && want_mon {
                             let can_retry = wd
@@ -953,6 +1183,20 @@ fn audio_control_loop(
                                         message
                                     ));
                                 }
+                                if !want_mon {
+                                    wd.aec_reattach_attempt = 0;
+                                    wd.next_aec_reattach_at = None;
+                                    sync_aec_loopback(
+                                        false,
+                                        want_running,
+                                        want_mon,
+                                        cur_aec_ref_dev.clone(),
+                                        &mut aec_gen,
+                                        &mut wd,
+                                        &main_pipe,
+                                        &mut aec_loop_pipe,
+                                    );
+                                }
                             }
                         }
                     }
@@ -963,10 +1207,12 @@ fn audio_control_loop(
                                 kind, message
                             ));
                             main_gen = main_gen.wrapping_add(1);
+                            aec_gen = aec_gen.wrapping_add(1);
                             if let Some(old) = main_pipe.take() {
                                 old.stop();
                             }
                             let _ = live_mon_pipe.take();
+                            let _ = aec_loop_pipe.take();
                             shared.stream_running.store(false, Ordering::Relaxed);
                             shared.virtual_out_connected.store(false, Ordering::Relaxed);
                             shared.live_monitor_enabled.store(false, Ordering::Relaxed);
@@ -979,6 +1225,7 @@ fn audio_control_loop(
                                 st.active_input_name = None;
                                 st.active_output_name = None;
                                 st.active_monitor_name = None;
+                                st.active_aec_ref_name = None;
                                 if input_missing {
                                     st.connection_state = ConnectionState::WaitingDevice;
                                     st.waiting_device_name = cur_in_dev.clone();
@@ -1021,14 +1268,17 @@ fn audio_control_loop(
                                     cur_in_dev.clone(),
                                     cur_out_dev.clone(),
                                     cur_mon_dev.clone(),
+                                    cur_aec_ref_dev.clone(),
                                     false,
                                     &mut last_profile_mic,
                                     &mut want_mon,
                                     &mut main_gen,
                                     &mut mon_gen,
+                                    &mut aec_gen,
                                     &mut wd,
                                     &mut main_pipe,
                                     &mut live_mon_pipe,
+                                    &mut aec_loop_pipe,
                                 );
                                 continue;
                             }
@@ -1051,14 +1301,17 @@ fn audio_control_loop(
                                         cur_in_dev.clone(),
                                         cur_out_dev.clone(),
                                         cur_mon_dev.clone(),
+                                        cur_aec_ref_dev.clone(),
                                         true,
                                         &mut last_profile_mic,
                                         &mut want_mon,
                                         &mut main_gen,
                                         &mut mon_gen,
+                                        &mut aec_gen,
                                         &mut wd,
                                         &mut main_pipe,
                                         &mut live_mon_pipe,
+                                        &mut aec_loop_pipe,
                                     );
                                     continue;
                                 }
@@ -1095,18 +1348,80 @@ fn audio_control_loop(
                                     cur_in_dev.clone(),
                                     cur_out_dev.clone(),
                                     cur_mon_dev.clone(),
+                                    cur_aec_ref_dev.clone(),
                                     false,
                                     &mut last_profile_mic,
                                     &mut want_mon,
                                     &mut main_gen,
                                     &mut mon_gen,
+                                    &mut aec_gen,
                                     &mut wd,
                                     &mut main_pipe,
                                     &mut live_mon_pipe,
+                                    &mut aec_loop_pipe,
                                 );
                                 continue;
                             }
                         }
+                    }
+
+                    // 2b. Follow OS default speaker changes (~every 2s) when AEC is ON in auto mode,
+                    //     or retry reattaching an unplugged AEC speaker without disturbing the microphone.
+                    if shared.aec_enabled.load(Ordering::Relaxed) && !want_mon {
+                        if cur_aec_ref_dev.is_none()
+                            && aec_loop_pipe.is_some()
+                            && watchdog_ticks.is_multiple_of(4)
+                        {
+                            if let Some(os_def_spk) = default_physical_output_name() {
+                                let cur_active_spk = shared
+                                    .status
+                                    .lock()
+                                    .ok()
+                                    .and_then(|s| s.active_aec_ref_name.clone());
+                                if cur_active_spk.as_deref() != Some(os_def_spk.as_str()) {
+                                    diagnostics::info(format!(
+                                        "OS default speaker changed to '{}'; switching AEC reference",
+                                        os_def_spk
+                                    ));
+                                    wd.aec_reattach_attempt = 0;
+                                    wd.next_aec_reattach_at = None;
+                                    sync_aec_loopback(
+                                        true,
+                                        want_running,
+                                        want_mon,
+                                        cur_aec_ref_dev.clone(),
+                                        &mut aec_gen,
+                                        &mut wd,
+                                        &main_pipe,
+                                        &mut aec_loop_pipe,
+                                    );
+                                }
+                            }
+                        } else if aec_loop_pipe.is_none()
+                            && wd.next_aec_reattach_at.is_none_or(|t| Instant::now() >= t)
+                        {
+                            sync_aec_loopback(
+                                false,
+                                want_running,
+                                want_mon,
+                                cur_aec_ref_dev.clone(),
+                                &mut aec_gen,
+                                &mut wd,
+                                &main_pipe,
+                                &mut aec_loop_pipe,
+                            );
+                        }
+                    } else if aec_loop_pipe.is_some() {
+                        sync_aec_loopback(
+                            false,
+                            want_running,
+                            want_mon,
+                            cur_aec_ref_dev.clone(),
+                            &mut aec_gen,
+                            &mut wd,
+                            &main_pipe,
+                            &mut aec_loop_pipe,
+                        );
                     }
 
                     // 3. Reattach virtual output automatically with exponential backoff (3s -> 60s)
@@ -1124,14 +1439,17 @@ fn audio_control_loop(
                                 cur_in_dev.clone(),
                                 cur_out_dev.clone(),
                                 cur_mon_dev.clone(),
+                                cur_aec_ref_dev.clone(),
                                 true,
                                 &mut last_profile_mic,
                                 &mut want_mon,
                                 &mut main_gen,
                                 &mut mon_gen,
+                                &mut aec_gen,
                                 &mut wd,
                                 &mut main_pipe,
                                 &mut live_mon_pipe,
+                                &mut aec_loop_pipe,
                             );
                         } else {
                             wd.next_virt_reattach_at = Some(
@@ -1149,14 +1467,17 @@ fn audio_control_loop(
                             cur_in_dev.clone(),
                             cur_out_dev.clone(),
                             cur_mon_dev.clone(),
+                            cur_aec_ref_dev.clone(),
                             false,
                             &mut last_profile_mic,
                             &mut want_mon,
                             &mut main_gen,
                             &mut mon_gen,
+                            &mut aec_gen,
                             &mut wd,
                             &mut main_pipe,
                             &mut live_mon_pipe,
+                            &mut aec_loop_pipe,
                         );
                     } else {
                         if let Ok(mut st) = shared.status.lock() {
@@ -1174,6 +1495,7 @@ fn audio_control_loop(
                     old.stop();
                 }
                 let _ = live_mon_pipe.take();
+                let _ = aec_loop_pipe.take();
                 break;
             }
         }
@@ -1372,6 +1694,7 @@ fn build_main_pipeline(
     let init_vad_thresh = load_f32(&shared.vad_threshold_bits);
     let init_hpf_en = shared.hpf_enabled.load(Ordering::Relaxed);
     let init_agc_en = shared.agc_enabled.load(Ordering::Relaxed);
+    let init_aec_en = shared.aec_enabled.load(Ordering::Relaxed);
     let init_nc_en = shared.nc_enabled.load(Ordering::Relaxed);
     let init_mic_muted = shared.mic_muted.load(Ordering::Relaxed);
     let init_gain_db = load_f32(&shared.input_gain_bits);
@@ -1382,6 +1705,7 @@ fn build_main_pipeline(
     let mut drift_ctrl = DriftController::new(target_out_frames, sr_out);
 
     let (mon_tx, mon_rx) = mpsc::channel::<Option<MonitorSink>>();
+    let (aec_tx, aec_rx) = mpsc::channel::<Option<AecRefSink>>();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_worker = Arc::clone(&stop_flag);
     let shared_worker = Arc::clone(shared);
@@ -1400,6 +1724,7 @@ fn build_main_pipeline(
                 init_vad_thresh,
                 init_hpf_en,
                 init_agc_en,
+                init_aec_en,
                 init_nc_en,
                 init_mic_muted,
                 init_gain_db,
@@ -1413,7 +1738,6 @@ fn build_main_pipeline(
                     return;
                 }
             };
-            let alg_latency_ms = processor.algorithmic_latency_ms();
 
             // Promote worker thread to OS real-time audio priority (Windows MMCSS Pro Audio / macOS CoreAudio RT)
             let rt_handle =
@@ -1425,11 +1749,13 @@ fn build_main_pipeline(
 
             let mut in_chunk_scratch = vec![0.0f32; 4_096];
             let mut frame_48k_in = [0.0f32; DFN_HOP_SIZE];
+            let mut frame_48k_ref = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_raw = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_enh = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_out = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_mon = [0.0f32; DFN_HOP_SIZE];
             let mut mon_sink_opt: Option<MonitorSink> = None;
+            let mut aec_sink_opt: Option<AecRefSink> = None;
 
             let mut smooth_in_db = -85.0f32;
             let mut smooth_enh_db = -85.0f32;
@@ -1473,11 +1799,23 @@ fn build_main_pipeline(
 
                     let t0 = Instant::now();
 
+                    // Drain any live-monitor or AEC speaker-reference attach/detach updates without blocking
+                    while let Ok(next_sink) = mon_rx.try_recv() {
+                        mon_sink_opt = next_sink;
+                    }
+                    while let Ok(next_aec) = aec_rx.try_recv() {
+                        aec_sink_opt = next_aec;
+                    }
+
                     // Sync lock-free parameters from UI / shortcuts
+                    let want_aec = shared_worker.aec_enabled.load(Ordering::Relaxed);
+                    let mon_active = mon_sink_opt.is_some();
                     processor.set_enabled(shared_worker.nc_enabled.load(Ordering::Relaxed));
                     processor.set_mic_muted(shared_worker.mic_muted.load(Ordering::Relaxed));
                     processor.set_hpf_enabled(shared_worker.hpf_enabled.load(Ordering::Relaxed));
                     processor.set_agc_enabled(shared_worker.agc_enabled.load(Ordering::Relaxed));
+                    processor.set_aec_enabled(want_aec);
+                    processor.set_aec_monitor_bypass(mon_active);
                     processor.set_attenuation_limit(load_f32(&shared_worker.atten_lim_bits));
                     processor.set_post_filter_beta(load_f32(&shared_worker.pf_beta_bits));
                     processor.set_input_gain_db(load_f32(&shared_worker.input_gain_bits));
@@ -1486,6 +1824,7 @@ fn build_main_pipeline(
                         shared_worker.vad_gate_enabled.load(Ordering::Relaxed),
                         load_f32(&shared_worker.vad_threshold_bits),
                     );
+                    let alg_latency_ms = processor.algorithmic_latency_ms();
 
                     if in_resampler
                         .process(&in_chunk_scratch[..needed], &mut frame_48k_in)
@@ -1497,8 +1836,28 @@ fn build_main_pipeline(
                         continue;
                     }
 
+                    let has_aec_ref = if want_aec && !mon_active {
+                        if let Some(ref mut aec_sink) = aec_sink_opt {
+                            let _ = aec_sink.pull_frame_48k(&mut frame_48k_ref);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        if let Some(ref mut aec_sink) = aec_sink_opt {
+                            aec_sink.discard_backlog();
+                        }
+                        false
+                    };
+                    let aec_ref_slice = if has_aec_ref {
+                        Some(&frame_48k_ref[..])
+                    } else {
+                        None
+                    };
+
                     let res = processor.process_frame_48k(
                         &frame_48k_in,
+                        aec_ref_slice,
                         &mut frame_48k_raw,
                         &mut frame_48k_enh,
                         &mut frame_48k_out,
@@ -1511,7 +1870,11 @@ fn build_main_pipeline(
                     shared_worker
                         .vad_speaking
                         .store(res.vad_speaking, Ordering::Relaxed);
+                    shared_worker
+                        .aec_active
+                        .store(res.aec_active, Ordering::Relaxed);
                     store_f32(&shared_worker.agc_gain_db_bits, res.agc_gain_db);
+                    store_f32(&shared_worker.aec_erle_db_bits, res.aec_erle_db);
 
                     // Hold clipping warning for 1.5s (150 x 10ms frames) so 50ms UI polling never misses peaks
                     if res.clipped {
@@ -1589,11 +1952,6 @@ fn build_main_pipeline(
                     } else {
                         store_f32(&shared_worker.drift_ppm_bits, 0.0);
                         store_f32(&shared_worker.latency_ms_bits, alg_latency_ms);
-                    }
-
-                    // Drain any live-monitor attach/detach updates without blocking
-                    while let Ok(next_sink) = mon_rx.try_recv() {
-                        mon_sink_opt = next_sink;
                     }
 
                     // Push to Discord-style Live Mic Test Monitor with smooth A/B crossfade & volume gain
@@ -1757,6 +2115,7 @@ fn build_main_pipeline(
         stop_flag,
         worker_join: worker_guard.disarm(),
         mon_tx,
+        aec_tx,
         active_input_name: actual_in_name,
         _input_stream: input_stream,
         _virtual_output_stream: virtual_stream_opt,
