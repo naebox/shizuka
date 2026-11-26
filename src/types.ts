@@ -34,6 +34,10 @@ export interface AppConfig {
   hpf_enabled: boolean;
   agc_enabled: boolean;
   aec_enabled: boolean;
+  voice_gate_enabled: boolean;
+  voice_gate_threshold: number;
+  voice_profile: number[] | null;
+  voice_fbank_tilt?: number[] | null;
   monitor_volume: number;
   stream_active: boolean;
   shortcut_toggle_nc: string | null;
@@ -75,6 +79,11 @@ export interface AudioTelemetry {
   aec_enabled: boolean;
   aec_active: boolean;
   aec_erle_db: number;
+  voice_gate_enabled: boolean;
+  has_voice_profile: boolean;
+  voice_gate_blocking: boolean;
+  voice_gate_similarity: number;
+  voice_learn_progress: number;
   clipping_active: boolean;
   clip_count: number;
   config_revision: number;

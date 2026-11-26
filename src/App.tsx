@@ -40,6 +40,8 @@ import {
   SettingsDiagGrid,
   TopBarStatPills,
   VadLiveBadge,
+  VoiceAutoLearnProgress,
+  VoiceGateLiveBadge,
 } from "./components/LiveTelemetryWidgets";
 import {
   refreshTelemetryNow,
@@ -369,6 +371,11 @@ export function App() {
   const vadSwitchId = `${uid}-vad-switch`;
   const vadSliderId = `${uid}-vad-slider`;
   const vadHintId = `${uid}-vad-hint`;
+  const voiceGateSwitchId = `${uid}-vgate-switch`;
+  const voiceGateHintId = `${uid}-vgate-hint`;
+  const voiceGateSliderId = `${uid}-vgate-slider`;
+  const voiceGateSliderHintId = `${uid}-vgate-slider-hint`;
+  const voiceEnrollProgressId = `${uid}-venroll-progress`;
   const inputMeterId = `${uid}-in-meter`;
   const outputMeterId = `${uid}-out-meter`;
   const monMeterId = `${uid}-mon-meter`;
@@ -976,6 +983,52 @@ export function App() {
     }
   };
 
+  const handleVoiceGateChange = async (
+    nextEnabled: boolean,
+    nextThreshold: number
+  ) => {
+    setActionError(null);
+    const seq = ++paramSeqRef.current;
+    const prevSnapshot = configRef.current;
+    setConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            voice_gate_enabled: nextEnabled,
+            voice_gate_threshold: nextThreshold,
+          }
+        : prev
+    );
+    try {
+      const synced = await invoke<AppConfig>("set_voice_gate_config", {
+        enabled: nextEnabled,
+        threshold: nextThreshold,
+      });
+      if (seq === paramSeqRef.current) {
+        setConfig(synced);
+      }
+      refreshTelemetryNow();
+    } catch (err) {
+      if (seq === paramSeqRef.current && prevSnapshot) {
+        setConfig(prevSnapshot);
+      }
+      setActionError(
+        `周囲の話し声カットの反映に失敗しました: ${formatIpcError(err)}`
+      );
+    }
+  };
+
+  const handleResetVoiceProfile = async () => {
+    setActionError(null);
+    try {
+      const synced = await invoke<AppConfig>("reset_voice_profile");
+      setConfig(synced);
+      refreshTelemetryNow();
+    } catch (err) {
+      setActionError(`声の記憶のリセットに失敗しました: ${formatIpcError(err)}`);
+    }
+  };
+
   const handleClearShortcut = async (action: ShortcutAction) => {
     setShortcutError(null);
     await stopShortcutRecording();
@@ -1183,6 +1236,21 @@ export function App() {
   const hpfEnabled = config?.hpf_enabled ?? telemetry?.hpf_enabled ?? true;
   const agcEnabled = config?.agc_enabled ?? telemetry?.agc_enabled ?? false;
   const aecEnabled = config?.aec_enabled ?? telemetry?.aec_enabled ?? false;
+  const hasVoiceProfile =
+    telemetry?.has_voice_profile ?? Boolean(config?.voice_profile?.length);
+  const voiceGateEnabled =
+    config?.voice_gate_enabled ?? telemetry?.voice_gate_enabled ?? false;
+  const voiceGateThresh = Math.max(
+    0.16,
+    Math.min(0.40, config?.voice_gate_threshold ?? 0.28)
+  );
+  const voiceStrictPct = Math.round(((voiceGateThresh - 0.16) / 0.24) * 100);
+  const voiceGateValueText =
+    voiceStrictPct < 35
+      ? `ゆるめ (${voiceStrictPct}%)`
+      : voiceStrictPct > 65
+      ? `厳しめ (${voiceStrictPct}%)`
+      : `標準 (${voiceStrictPct}%)`;
   const liveMonitorEnabled = telemetry?.live_monitor_enabled ?? false;
   const monVolPct = Math.round(
     (config?.monitor_volume ?? telemetry?.monitor_volume ?? 0.8) * 100
@@ -1984,6 +2052,103 @@ export function App() {
                   }
                 />
               </div>
+            </div>
+
+            <div className="vad-section voice-gate-section">
+              <div className="dsp-toggle-row">
+                <div className="dsp-toggle-copy">
+                  <div className="vad-title-group">
+                    <label htmlFor={voiceGateSwitchId} className="vad-title">
+                      周囲の話し声カット
+                    </label>
+                    <VoiceGateLiveBadge
+                      voiceGateEnabled={voiceGateEnabled}
+                      hasVoiceProfile={hasVoiceProfile}
+                      ncEnabled={ncEnabled}
+                    />
+                  </div>
+                  <span id={voiceGateHintId} className="field-hint">
+                    普段の会話からあなたの声を自動で覚え、家族の声やテレビの話し声を消音します
+                  </span>
+                </div>
+                <input
+                  id={voiceGateSwitchId}
+                  name="voice_gate_enabled"
+                  type="checkbox"
+                  role={supportsNativeSwitch ? undefined : "switch"}
+                  className="nc-toggle compact"
+                  checked={voiceGateEnabled}
+                  aria-describedby={voiceGateHintId}
+                  onChange={(e) =>
+                    void handleVoiceGateChange(
+                      e.currentTarget.checked,
+                      voiceGateThresh
+                    )
+                  }
+                  {...({ switch: "" } as Record<string, string>)}
+                />
+              </div>
+
+              {(voiceGateEnabled || hasVoiceProfile) && (
+                <div className="voice-enroll-box">
+                  {hasVoiceProfile ? (
+                    <div className="voice-enroll-registered">
+                      <div className="voice-enroll-status">
+                        <CheckCircle2
+                          size={13}
+                          className="voice-enroll-check"
+                          aria-hidden="true"
+                        />
+                        <span role="status">あなたの声を記憶済み</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="shortcut-record-btn"
+                        onClick={() => void handleResetVoiceProfile()}
+                      >
+                        <RefreshCw size={12} aria-hidden="true" />
+                        <span>覚え直す</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <VoiceAutoLearnProgress
+                      progressId={voiceEnrollProgressId}
+                    />
+                  )}
+                </div>
+              )}
+
+              {hasVoiceProfile && (
+                <div className="slider-row">
+                  <div className="slider-top">
+                    <label htmlFor={voiceGateSliderId}>カットの厳しさ</label>
+                    <span className="slider-val">{voiceGateValueText}</span>
+                  </div>
+                  <span id={voiceGateSliderHintId} className="field-hint">
+                    かすれ声などで自分の声が途切れる時は下げ、周囲の話し声をより強く消したい時は上げます
+                  </span>
+                  <input
+                    id={voiceGateSliderId}
+                    name="voice_gate_threshold"
+                    type="range"
+                    className="range-control"
+                    min={0.16}
+                    max={0.40}
+                    step={0.01}
+                    value={voiceGateThresh}
+                    disabled={!voiceGateEnabled}
+                    aria-valuetext={voiceGateValueText}
+                    aria-describedby={voiceGateSliderHintId}
+                    style={sliderCssVars(voiceGateThresh, 0.16, 0.40)}
+                    onChange={(e) =>
+                      void handleVoiceGateChange(
+                        voiceGateEnabled,
+                        Number(e.target.value)
+                      )
+                    }
+                  />
+                </div>
+              )}
             </div>
           </div>
         </details>

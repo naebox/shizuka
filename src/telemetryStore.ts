@@ -17,6 +17,8 @@ export interface DiscreteTelemetry {
   agc_enabled: boolean;
   aec_enabled: boolean;
   aec_active: boolean;
+  voice_gate_enabled: boolean;
+  has_voice_profile: boolean;
   config_revision: number;
   virtual_out_connected: boolean;
   live_monitor_enabled: boolean;
@@ -53,6 +55,8 @@ function toDiscrete(snap: AudioTelemetry): DiscreteTelemetry {
     agc_enabled: snap.agc_enabled,
     aec_enabled: snap.aec_enabled,
     aec_active: snap.aec_active,
+    voice_gate_enabled: snap.voice_gate_enabled,
+    has_voice_profile: snap.has_voice_profile,
     config_revision: snap.config_revision,
     virtual_out_connected: snap.virtual_out_connected,
     live_monitor_enabled: snap.live_monitor_enabled,
@@ -79,6 +83,8 @@ function discreteEqual(
     a.agc_enabled === b.agc_enabled &&
     a.aec_enabled === b.aec_enabled &&
     a.aec_active === b.aec_active &&
+    a.voice_gate_enabled === b.voice_gate_enabled &&
+    a.has_voice_profile === b.has_voice_profile &&
     a.config_revision === b.config_revision &&
     a.virtual_out_connected === b.virtual_out_connected &&
     a.live_monitor_enabled === b.live_monitor_enabled &&

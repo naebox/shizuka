@@ -18,7 +18,9 @@ const DFN3_STANDARD_BYTES: &[u8] = include_bytes!("../../models/DeepFilterNet3_o
 #[derive(Debug, Clone, Copy)]
 pub struct FrameProcessResult {
     pub lsnr_db: f32,
+    pub speech_active_now: bool,
     pub vad_speaking: bool,
+    pub voice_gate_blocked: bool,
     pub agc_gain_db: f32,
     pub aec_active: bool,
     pub aec_erle_db: f32,
@@ -454,6 +456,9 @@ pub struct NoiseProcessor {
     atten_lim_db: f32,
     pf_beta: f32,
     vad_gate: VadGate,
+    voice_gate_engaged: bool,
+    speaker_allowed: bool,
+    speaker_gate_gain: f32,
 }
 
 impl NoiseProcessor {
@@ -522,6 +527,9 @@ impl NoiseProcessor {
             atten_lim_db,
             pf_beta,
             vad_gate: VadGate::new(vad_enabled, vad_thresh_db),
+            voice_gate_engaged: false,
+            speaker_allowed: true,
+            speaker_gate_gain: 1.0,
         })
     }
 
@@ -596,15 +604,23 @@ impl NoiseProcessor {
         self.vad_gate.set_params(enabled, thresh_db);
     }
 
+    #[inline]
+    pub fn set_speaker_gate(&mut self, engaged: bool, speaker_allowed: bool) {
+        self.voice_gate_engaged = engaged;
+        self.speaker_allowed = speaker_allowed;
+    }
+
     /// Processes exactly 480 samples (10ms @ 48kHz) with zero heap allocations.
     /// - `aec_ref_480`: optional 48 kHz mono speaker loopback reference frame for WebRTC AEC3
+    /// - `pre_gate_enh_out_480`: optional tap of unity-gain post-AEC/post-DFN3 speech before gates/AGC
     /// - `raw_out_480`: gain-adjusted raw signal (for A/B live monitor & NC bypass)
-    /// - `enh_out_480`: HPF -> AEC3 -> PreDfnNormalizer -> DFN3 -> VAD-gated AGC -> VAD envelope -> soft-limited signal
+    /// - `enh_out_480`: HPF -> AEC3 -> PreDfnNormalizer -> DFN3 -> VAD/Speaker-gated AGC & envelope -> soft-limited signal
     /// - `final_out_480`: active output (denoised or bypassed) with clickless mic-mute fade
     pub fn process_frame_48k(
         &mut self,
         input_480: &[f32],
         aec_ref_480: Option<&[f32]>,
+        pre_gate_enh_out_480: Option<&mut [f32; DFN_HOP_SIZE]>,
         raw_out_480: &mut [f32],
         enh_out_480: &mut [f32],
         final_out_480: &mut [f32],
@@ -698,6 +714,9 @@ impl NoiseProcessor {
             }
         }
         PreDfnNormalizer::restore_output(enh_out_480, restore_gains);
+        if let Some(pre_gate_buf) = pre_gate_enh_out_480 {
+            pre_gate_buf.copy_from_slice(&enh_out_480[..DFN_HOP_SIZE]);
+        }
 
         let mut sum_sq = 0.0f32;
         for &s in enh_out_480.iter() {
@@ -711,15 +730,40 @@ impl NoiseProcessor {
         };
 
         // 4. Evaluate VAD BEFORE AGC so AGC gain never causes false gate openings
-        let (speech_active_now, vad_speaking) = self.vad_gate.evaluate(lsnr, pre_agc_rms_db);
+        let (speech_active_now, vad_open) = self.vad_gate.evaluate(lsnr, pre_agc_rms_db);
+        let spk_open = !self.voice_gate_engaged || self.speaker_allowed;
 
-        // 5. Apply VAD-gated AGC (updates gain only during confirmed active speech)
+        // 5. Apply VAD + Speaker-gated AGC (updates gain only during confirmed user speech)
         let agc_gain_db = self
             .agc
-            .process(speech_active_now, pre_agc_rms_db, enh_out_480);
+            .process(speech_active_now && spk_open, pre_agc_rms_db, enh_out_480);
 
-        // 6. Apply VAD noise gate envelope
+        // 6. Apply VAD noise gate envelope + personalized speaker verification gate envelope
         self.vad_gate.apply_envelope(enh_out_480, self.atten_lim_db);
+
+        let target_spk_gain = if spk_open { 1.0_f32 } else { 0.0_f32 };
+        if (self.speaker_gate_gain - target_spk_gain).abs() < 1e-4 {
+            self.speaker_gate_gain = target_spk_gain;
+            if target_spk_gain == 0.0 {
+                enh_out_480.fill(0.0);
+            }
+        } else {
+            // Smooth ~30ms soft mute when rejecting non-enrolled voice; ~5ms brisk open
+            let alpha = if target_spk_gain > self.speaker_gate_gain {
+                0.012_f32
+            } else {
+                0.0024_f32
+            };
+            for s in enh_out_480.iter_mut() {
+                self.speaker_gate_gain += alpha * (target_spk_gain - self.speaker_gate_gain);
+                if target_spk_gain == 0.0 && self.speaker_gate_gain < 1e-4 {
+                    self.speaker_gate_gain = 0.0;
+                }
+                *s *= self.speaker_gate_gain;
+            }
+        }
+        let voice_gate_blocked = vad_open && !spk_open;
+        let vad_speaking = vad_open && spk_open;
 
         // 7. Post-AGC/VAD soft limiter & output clipping detection
         for s in enh_out_480.iter_mut() {
@@ -769,7 +813,9 @@ impl NoiseProcessor {
 
         FrameProcessResult {
             lsnr_db: lsnr,
+            speech_active_now,
             vad_speaking,
+            voice_gate_blocked,
             agc_gain_db,
             aec_active: aec_metrics.active,
             aec_erle_db: aec_metrics.erle_db,
@@ -951,8 +997,14 @@ mod tests {
                 let rand_unit = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = rand_unit * 0.15;
             }
-            let _res =
-                proc.process_frame_48k(&noisy, None, &mut raw_out, &mut enh_out, &mut clean_out);
+            let _res = proc.process_frame_48k(
+                &noisy,
+                None,
+                None,
+                &mut raw_out,
+                &mut enh_out,
+                &mut clean_out,
+            );
 
             if frame_idx >= 60 {
                 for i in 0..DFN_HOP_SIZE {
@@ -1002,8 +1054,14 @@ mod tests {
             let t = i as f32 / DFN_SAMPLE_RATE as f32;
             *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
         }
-        let res_hot =
-            proc.process_frame_48k(&hot, None, &mut raw_out, &mut enh_out, &mut final_out);
+        let res_hot = proc.process_frame_48k(
+            &hot,
+            None,
+            None,
+            &mut raw_out,
+            &mut enh_out,
+            &mut final_out,
+        );
         assert!(res_hot.clipped, "Expected clipping flag on overdriven input");
         for &s in &final_out {
             assert!(s.abs() <= 1.0, "Soft limiter must keep samples within [-1, 1]");
@@ -1011,9 +1069,22 @@ mod tests {
 
         // Enable mute: frame 1 fades down, frame 2 is completely silent
         proc.set_mic_muted(true);
-        let _ = proc.process_frame_48k(&hot, None, &mut raw_out, &mut enh_out, &mut final_out);
-        let res_muted =
-            proc.process_frame_48k(&hot, None, &mut raw_out, &mut enh_out, &mut final_out);
+        let _ = proc.process_frame_48k(
+            &hot,
+            None,
+            None,
+            &mut raw_out,
+            &mut enh_out,
+            &mut final_out,
+        );
+        let res_muted = proc.process_frame_48k(
+            &hot,
+            None,
+            None,
+            &mut raw_out,
+            &mut enh_out,
+            &mut final_out,
+        );
         assert!(!res_muted.clipped, "Muted state should not emit clipping alerts");
         let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
         assert_eq!(max_abs, 0.0, "Muted output must be completely silent");
@@ -1047,7 +1118,14 @@ mod tests {
             let t = i as f32 / DFN_SAMPLE_RATE as f32;
             *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.6;
         }
-        let res1 = proc.process_frame_48k(&loud, None, &mut raw_out, &mut enh_out, &mut final_out);
+        let res1 = proc.process_frame_48k(
+            &loud,
+            None,
+            None,
+            &mut raw_out,
+            &mut enh_out,
+            &mut final_out,
+        );
         assert!(!res1.clipped);
         let max_abs = final_out.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
         assert_eq!(
@@ -1061,7 +1139,14 @@ mod tests {
         bad[0] = f32::NAN;
         bad[1] = f32::INFINITY;
         bad[2] = f32::NEG_INFINITY;
-        let _ = proc.process_frame_48k(&bad, None, &mut raw_out, &mut enh_out, &mut final_out);
+        let _ = proc.process_frame_48k(
+            &bad,
+            None,
+            None,
+            &mut raw_out,
+            &mut enh_out,
+            &mut final_out,
+        );
         for &s in &final_out {
             assert!(s.is_finite() && s.abs() <= 1.0);
         }
@@ -1119,7 +1204,7 @@ mod tests {
                 let rnd = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = rnd * noise_amp;
             }
-            let _ = proc.process_frame_48k(&nbuf, None, &mut raw, &mut enh, &mut out);
+            let _ = proc.process_frame_48k(&nbuf, None, None, &mut raw, &mut enh, &mut out);
         }
 
         // 2. Feed 2.5s of quiet -45 dBFS speech bursts (without PreDfnNormalizer, DFN3 drops by -24 dB)
@@ -1152,7 +1237,7 @@ mod tests {
                 let rnd = ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
                 *s = voice + rnd * noise_amp;
             }
-            let _ = proc.process_frame_48k(&buf, None, &mut raw, &mut enh, &mut out);
+            let _ = proc.process_frame_48k(&buf, None, None, &mut raw, &mut enh, &mut out);
             if cyc > 0.1 && cyc < 0.55 {
                 cnt += 1;
                 for i in 0..DFN_HOP_SIZE {
@@ -1177,8 +1262,66 @@ mod tests {
             *s = (2.0 * std::f32::consts::PI * 300.0 * t).sin() * 0.5;
         }
         for _ in 0..5 {
-            let _ = proc.process_frame_48k(&loud, None, &mut raw, &mut enh, &mut out);
+            let _ = proc.process_frame_48k(&loud, None, None, &mut raw, &mut enh, &mut out);
             assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
         }
+    }
+
+    #[test]
+    fn test_speaker_gate_smoothly_silences_rejected_voice_and_preserves_pre_gate_tap() {
+        let mut proc = NoiseProcessor::new(
+            ModelVariant::LowLatency,
+            18.0,
+            0.0,
+            -16.0,
+            false,
+            -5.0,
+            true,
+            true, // AGC enabled: must NOT boost rejected voice
+            false,
+            true,
+            false,
+            0.0,
+        )
+        .expect("load LowLatency DFN3");
+
+        let mut pre_tap = [0.0f32; DFN_HOP_SIZE];
+        let mut raw = [0.0f32; DFN_HOP_SIZE];
+        let mut enh = [0.0f32; DFN_HOP_SIZE];
+        let mut out = [0.0f32; DFN_HOP_SIZE];
+
+        // Reject speaker via speaker gate: output fades smoothly to 0.0 while pre-gate tap stays intact
+        proc.set_speaker_gate(true, false);
+        for f in 0..20 {
+            let mut voice = [0.0f32; DFN_HOP_SIZE];
+            let f0 = 140.0 + 20.0 * (f as f32 * 0.25).sin();
+            for (i, s) in voice.iter_mut().enumerate() {
+                let t = (f * DFN_HOP_SIZE + i) as f32 / DFN_SAMPLE_RATE as f32;
+                let mut v = 0.0f32;
+                for h in 1..=12 {
+                    v += (2.0 * std::f32::consts::PI * (f0 * h as f32) * t).sin() / (h as f32);
+                }
+                *s = v * 0.12;
+            }
+            let _ = proc.process_frame_48k(
+                &voice,
+                None,
+                Some(&mut pre_tap),
+                &mut raw,
+                &mut enh,
+                &mut out,
+            );
+        }
+        let max_out = out.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+        let max_tap = pre_tap.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+        assert_eq!(
+            max_out, 0.0,
+            "Rejected speaker output must fade cleanly to exact 0.0"
+        );
+        assert!(
+            max_tap > 0.01,
+            "Pre-gate tap must keep active audio so enrolled user re-entry can be detected (got {})",
+            max_tap
+        );
     }
 }

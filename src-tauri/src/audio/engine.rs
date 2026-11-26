@@ -19,7 +19,11 @@ use crate::audio::devices::{
 use crate::audio::loopback::{build_aec_loopback_stream, LoopbackPipeline};
 use crate::audio::processor::{soft_limit, NoiseProcessor, DFN_HOP_SIZE, DFN_SAMPLE_RATE};
 use crate::audio::resampler::{AdaptiveOutputResampler, DriftController, InputResampler48k};
-use crate::config::{AppConfig, ModelVariant};
+use crate::audio::speaker::{
+    Downsampler48kTo16k, SpeakerHandle, SpeakerRtFrame, SpeakerSharedState,
+    SPEAKER_FRAME_SAMPLES_16K,
+};
+use crate::config::{AppConfig, ConfigSaver, ModelVariant};
 use crate::diagnostics;
 
 #[inline]
@@ -85,6 +89,11 @@ pub struct AudioTelemetry {
     pub aec_enabled: bool,
     pub aec_active: bool,
     pub aec_erle_db: f32,
+    pub voice_gate_enabled: bool,
+    pub has_voice_profile: bool,
+    pub voice_gate_blocking: bool,
+    pub voice_gate_similarity: f32,
+    pub voice_learn_progress: f32,
     pub clipping_active: bool,
     pub clip_count: u64,
     pub config_revision: u64,
@@ -122,7 +131,8 @@ pub struct SharedAudioState {
     pub aec_erle_db_bits: AtomicU32,
     pub clipping_active: AtomicBool,
     pub clip_count: AtomicU64,
-    pub config_revision: AtomicU64,
+    pub config_revision: Arc<AtomicU64>,
+    pub speaker: Arc<SpeakerSharedState>,
     pub live_monitor_enabled: AtomicBool,
     pub monitor_clean: AtomicBool,
     pub monitor_volume_bits: AtomicU32,
@@ -167,7 +177,11 @@ fn u8_to_variant(v: u8) -> ModelVariant {
 }
 
 impl SharedAudioState {
-    pub fn from_config(cfg: &AppConfig) -> Self {
+    pub fn from_config_with_speaker(
+        cfg: &AppConfig,
+        config_revision: Arc<AtomicU64>,
+        speaker: Arc<SpeakerSharedState>,
+    ) -> Self {
         Self {
             nc_enabled: AtomicBool::new(cfg.nc_enabled),
             mic_muted: AtomicBool::new(false),
@@ -187,7 +201,8 @@ impl SharedAudioState {
             aec_erle_db_bits: AtomicU32::new(0.0f32.to_bits()),
             clipping_active: AtomicBool::new(false),
             clip_count: AtomicU64::new(0),
-            config_revision: AtomicU64::new(0),
+            config_revision,
+            speaker,
             live_monitor_enabled: AtomicBool::new(false),
             monitor_clean: AtomicBool::new(true),
             monitor_volume_bits: AtomicU32::new(cfg.monitor_volume.clamp(0.0, 1.0).to_bits()),
@@ -283,6 +298,11 @@ impl SharedAudioState {
             aec_enabled: self.aec_enabled.load(Ordering::Relaxed),
             aec_active: self.aec_active.load(Ordering::Relaxed),
             aec_erle_db: load_f32(&self.aec_erle_db_bits),
+            voice_gate_enabled: self.speaker.gate_enabled.load(Ordering::Relaxed),
+            has_voice_profile: self.speaker.has_profile.load(Ordering::Relaxed),
+            voice_gate_blocking: self.speaker.gate_blocking.load(Ordering::Relaxed),
+            voice_gate_similarity: self.speaker.similarity(),
+            voice_learn_progress: self.speaker.learn_progress(),
             clipping_active: self.clipping_active.load(Ordering::Relaxed),
             clip_count: self.clip_count.load(Ordering::Relaxed),
             config_revision: self.config_revision.load(Ordering::Relaxed),
@@ -345,6 +365,7 @@ enum EngineCommand {
 pub struct AudioEngineHandle {
     cmd_tx: mpsc::Sender<EngineCommand>,
     pub shared: Arc<SharedAudioState>,
+    pub speaker: SpeakerHandle,
 }
 
 struct MonitorSink {
@@ -360,6 +381,7 @@ struct RunningPipeline {
     worker_join: Option<JoinHandle<()>>,
     mon_tx: mpsc::Sender<Option<MonitorSink>>,
     aec_tx: mpsc::Sender<Option<AecRefSink>>,
+    speaker: SpeakerHandle,
     active_input_name: String,
     _input_stream: Stream,
     _virtual_output_stream: Option<Stream>,
@@ -375,6 +397,7 @@ impl RunningPipeline {
         }
         let _ = self.mon_tx.send(None);
         let _ = self.aec_tx.send(None);
+        self.speaker.attach_consumer(None);
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(jh) = self.worker_join.take() {
             jh.thread().unpark();
@@ -427,22 +450,44 @@ impl Drop for MonitorPipeline {
 }
 
 impl AudioEngineHandle {
-    pub fn spawn(config: Arc<Mutex<AppConfig>>) -> Self {
+    pub fn spawn(config: Arc<Mutex<AppConfig>>, config_saver: Option<ConfigSaver>) -> Self {
         let init_cfg = config.lock().map(|g| g.clone()).unwrap_or_default();
-        let shared = Arc::new(SharedAudioState::from_config(&init_cfg));
+        let config_rev = Arc::new(AtomicU64::new(0));
+        let speaker = SpeakerHandle::spawn(
+            Arc::clone(&config),
+            config_saver,
+            Arc::clone(&config_rev),
+        );
+        let shared = Arc::new(SharedAudioState::from_config_with_speaker(
+            &init_cfg,
+            config_rev,
+            Arc::clone(&speaker.shared),
+        ));
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
 
         let shared_ctrl = Arc::clone(&shared);
+        let speaker_ctrl = speaker.clone();
         let ctrl_tx = cmd_tx.clone();
 
         thread::Builder::new()
             .name("shizuka-audio-ctrl".into())
             .spawn(move || {
-                audio_control_loop(cmd_rx, ctrl_tx, shared_ctrl, config, init_cfg);
+                audio_control_loop(
+                    cmd_rx,
+                    ctrl_tx,
+                    shared_ctrl,
+                    speaker_ctrl,
+                    config,
+                    init_cfg,
+                );
             })
             .expect("Failed to spawn audio controller thread");
 
-        Self { cmd_tx, shared }
+        Self {
+            cmd_tx,
+            shared,
+            speaker,
+        }
     }
 
     pub fn start_or_restart(
@@ -472,10 +517,13 @@ impl AudioEngineHandle {
     /// for completion before returning (used for clean app exit & pre-update shutdown).
     pub fn stop_and_wait(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
-        if self.cmd_tx.send(EngineCommand::Stop(Some(ack_tx))).is_err() {
-            return true;
-        }
-        ack_rx.recv_timeout(timeout).is_ok()
+        let ok = if self.cmd_tx.send(EngineCommand::Stop(Some(ack_tx))).is_err() {
+            true
+        } else {
+            ack_rx.recv_timeout(timeout).is_ok()
+        };
+        self.speaker.shutdown(Duration::from_millis(800));
+        ok
     }
 
     pub fn set_nc_enabled(&self, enabled: bool) {
@@ -622,6 +670,8 @@ fn reset_audio_meters(shared: &SharedAudioState) {
     store_f32(&shared.agc_gain_db_bits, 0.0);
     store_f32(&shared.aec_erle_db_bits, 0.0);
     shared.aec_active.store(false, Ordering::Relaxed);
+    shared.speaker.gate_blocking.store(false, Ordering::Relaxed);
+    shared.speaker.speaker_pass.store(true, Ordering::Relaxed);
     shared.vad_speaking.store(false, Ordering::Relaxed);
     shared.clipping_active.store(false, Ordering::Relaxed);
 }
@@ -630,6 +680,7 @@ fn audio_control_loop(
     cmd_rx: mpsc::Receiver<EngineCommand>,
     cmd_tx: mpsc::Sender<EngineCommand>,
     shared: Arc<SharedAudioState>,
+    speaker: SpeakerHandle,
     config: Arc<Mutex<AppConfig>>,
     init_cfg: AppConfig,
 ) {
@@ -834,6 +885,7 @@ fn audio_control_loop(
 
         match build_main_pipeline(
             &shared,
+            &speaker,
             &config,
             &cmd_tx,
             current_gen,
@@ -1566,6 +1618,7 @@ fn build_live_monitor_stream(
 #[allow(clippy::too_many_arguments)]
 fn build_main_pipeline(
     shared: &Arc<SharedAudioState>,
+    speaker: &SpeakerHandle,
     config: &Arc<Mutex<AppConfig>>,
     cmd_tx: &mpsc::Sender<EngineCommand>,
     generation: u64,
@@ -1706,6 +1759,11 @@ fn build_main_pipeline(
 
     let (mon_tx, mon_rx) = mpsc::channel::<Option<MonitorSink>>();
     let (aec_tx, aec_rx) = mpsc::channel::<Option<AecRefSink>>();
+    let spk_rb = HeapRb::<SpeakerRtFrame>::new(256);
+    let (mut spk_prod, spk_cons) = spk_rb.split();
+    speaker.attach_consumer(Some(spk_cons));
+    let spk_worker = speaker.clone();
+
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_worker = Arc::clone(&stop_flag);
     let shared_worker = Arc::clone(shared);
@@ -1750,6 +1808,9 @@ fn build_main_pipeline(
             let mut in_chunk_scratch = vec![0.0f32; 4_096];
             let mut frame_48k_in = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_ref = [0.0f32; DFN_HOP_SIZE];
+            let mut frame_48k_pre_gate = [0.0f32; DFN_HOP_SIZE];
+            let mut frame_16k_spk = [0.0f32; SPEAKER_FRAME_SAMPLES_16K];
+            let mut spk_downsampler = Downsampler48kTo16k::new();
             let mut frame_48k_raw = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_enh = [0.0f32; DFN_HOP_SIZE];
             let mut frame_48k_out = [0.0f32; DFN_HOP_SIZE];
@@ -1762,6 +1823,7 @@ fn build_main_pipeline(
             let mut smooth_out_db = -85.0f32;
             let mut smooth_proc_us: f32 = 0.0;
             let mut clip_hold_frames: u32 = 0;
+            let mut spk_unpark_counter: u8 = 0;
 
             let mut mon_clean_mix = if shared_worker.monitor_clean.load(Ordering::Relaxed) {
                 1.0f32
@@ -1808,9 +1870,13 @@ fn build_main_pipeline(
                     }
 
                     // Sync lock-free parameters from UI / shortcuts
+                    let nc_en = shared_worker.nc_enabled.load(Ordering::Relaxed);
                     let want_aec = shared_worker.aec_enabled.load(Ordering::Relaxed);
                     let mon_active = mon_sink_opt.is_some();
-                    processor.set_enabled(shared_worker.nc_enabled.load(Ordering::Relaxed));
+                    let spk_capture = spk_worker.shared.should_capture_frames(nc_en);
+                    let spk_engaged = spk_worker.shared.is_gate_engaged(nc_en);
+                    let spk_allowed = spk_worker.shared.speaker_pass.load(Ordering::Relaxed);
+                    processor.set_enabled(nc_en);
                     processor.set_mic_muted(shared_worker.mic_muted.load(Ordering::Relaxed));
                     processor.set_hpf_enabled(shared_worker.hpf_enabled.load(Ordering::Relaxed));
                     processor.set_agc_enabled(shared_worker.agc_enabled.load(Ordering::Relaxed));
@@ -1824,6 +1890,7 @@ fn build_main_pipeline(
                         shared_worker.vad_gate_enabled.load(Ordering::Relaxed),
                         load_f32(&shared_worker.vad_threshold_bits),
                     );
+                    processor.set_speaker_gate(spk_engaged, spk_allowed);
                     let alg_latency_ms = processor.algorithmic_latency_ms();
 
                     if in_resampler
@@ -1858,10 +1925,37 @@ fn build_main_pipeline(
                     let res = processor.process_frame_48k(
                         &frame_48k_in,
                         aec_ref_slice,
+                        if spk_capture {
+                            Some(&mut frame_48k_pre_gate)
+                        } else {
+                            None
+                        },
                         &mut frame_48k_raw,
                         &mut frame_48k_enh,
                         &mut frame_48k_out,
                     );
+                    if spk_capture {
+                        spk_downsampler.process_frame(&frame_48k_pre_gate, &mut frame_16k_spk);
+                        if spk_prod
+                            .try_push(SpeakerRtFrame {
+                                samples_16k: frame_16k_spk,
+                                speech_active: res.speech_active_now,
+                                mon_active,
+                                lsnr_db: res.lsnr_db,
+                            })
+                            .is_ok()
+                        {
+                            // Batch cross-thread unpark syscalls to once every 80ms (8 frames)
+                            // so the real-time MMCSS/CoreAudio loop never incurs 100 Hz wakeup jitter.
+                            spk_unpark_counter = spk_unpark_counter.wrapping_add(1);
+                            if spk_unpark_counter >= 8 {
+                                spk_unpark_counter = 0;
+                                spk_worker.notify_frames_ready();
+                            }
+                        }
+                    } else {
+                        spk_unpark_counter = 0;
+                    }
                     if res.dfn_error {
                         shared_worker
                             .dfn_error_count
@@ -1911,33 +2005,41 @@ fn build_main_pipeline(
 
                         let occ = out_prod.occupied_len();
                         let cap = out_prod.capacity().get();
+                        let excess_silence_thresh = target_out_frames + (sr_out as usize * 35) / 1000;
 
-                        // Guard against extreme OS stall (e.g. PC sleep/wake) without injecting hard zeros
-                        // into active speech or erasing learned crystal drift on brief underruns
-                        let rel_ratio = if occ > cap * 3 / 4 {
-                            drift_ctrl.reset();
-                            0.990 // Drain excess smoothly
-                        } else if occ == 0 {
+                        // Drop redundant silent frames if an OS/CPU stall caused >35ms excess queue buildup,
+                        // restoring crisp 30ms latency immediately between words without any audible click!
+                        if !res.vad_speaking && occ > excess_silence_thresh {
                             drift_ctrl.damp_transient();
-                            1.005 // Smoothly rebuild buffer occupancy while keeping learned drift lock
                         } else {
-                            drift_ctrl.update(occ)
-                        };
+                            let rel_ratio = if occ > cap * 3 / 4 {
+                                drift_ctrl.reset();
+                                0.990 // Drain excess smoothly
+                            } else if occ > target_out_frames + (sr_out as usize * 55) / 1000 {
+                                drift_ctrl.damp_transient();
+                                0.975 // Fast drain of transient stall backlog (~25ms/s)
+                            } else if occ == 0 {
+                                drift_ctrl.damp_transient();
+                                1.005 // Smoothly rebuild buffer occupancy while keeping learned drift lock
+                            } else {
+                                drift_ctrl.update(occ)
+                            };
 
-                        match out_resampler.process(&frame_48k_out, rel_ratio) {
-                            Ok(resampled_out) => {
-                                let pushed = out_prod.push_slice(resampled_out);
-                                if pushed < resampled_out.len() {
-                                    shared_worker.output_drop_count.fetch_add(
-                                        (resampled_out.len() - pushed) as u64,
-                                        Ordering::Relaxed,
-                                    );
+                            match out_resampler.process(&frame_48k_out, rel_ratio) {
+                                Ok(resampled_out) => {
+                                    let pushed = out_prod.push_slice(resampled_out);
+                                    if pushed < resampled_out.len() {
+                                        shared_worker.output_drop_count.fetch_add(
+                                            (resampled_out.len() - pushed) as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
                                 }
-                            }
-                            Err(_) => {
-                                shared_worker
-                                    .resampler_error_count
-                                    .fetch_add(1, Ordering::Relaxed);
+                                Err(_) => {
+                                    shared_worker
+                                        .resampler_error_count
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
 
@@ -1961,10 +2063,12 @@ fn build_main_pipeline(
                         monitor_volume_to_gain(load_f32(&shared_worker.monitor_volume_bits));
 
                     if let Some(sink) = &mut mon_sink_opt {
+                        // Keep Live Mic Test latency tight (<= 35ms target) so speaker monitoring never
+                        // develops a >100ms slapback delay that re-triggers the mic in an echo loop!
                         let in_as_mon = ((obs_in as u64 * sink.sr_mon as u64)
                             / (sr_in.max(1) as u64)) as usize;
-                        let mon_floor = (in_as_mon + (sink.sr_mon as usize / 50))
-                            .min((sink.sr_mon as usize * 120) / 1000);
+                        let mon_floor = (in_as_mon + (sink.sr_mon as usize / 65))
+                            .min((sink.sr_mon as usize * 35) / 1000);
                         if mon_floor > sink.target_frames {
                             sink.target_frames = mon_floor;
                             sink.drift.set_target_samples(mon_floor);
@@ -1984,17 +2088,31 @@ fn build_main_pipeline(
 
                         let occ = sink.prod.occupied_len();
                         let cap = sink.prod.capacity().get();
-                        let rel = if occ > cap * 3 / 4 {
-                            sink.drift.reset();
-                            0.990
-                        } else if occ == 0 {
+                        let mon_excess_silence =
+                            sink.target_frames + (sink.sr_mon as usize * 18) / 1000;
+                        let mon_hard_cap =
+                            sink.target_frames + (sink.sr_mon as usize * 35) / 1000;
+
+                        // Never allow Live Monitor queue to accumulate >35ms excess lag (prevents
+                        // delayed speaker playback from re-entering the mic and echoing!)
+                        if (!res.vad_speaking && occ > mon_excess_silence) || occ > mon_hard_cap {
                             sink.drift.damp_transient();
-                            1.005
                         } else {
-                            sink.drift.update(occ)
-                        };
-                        if let Ok(mon_samples) = sink.resampler.process(&frame_48k_mon, rel) {
-                            let _ = sink.prod.push_slice(mon_samples);
+                            let rel = if occ > cap * 3 / 4 {
+                                sink.drift.reset();
+                                0.990
+                            } else if occ > mon_excess_silence {
+                                sink.drift.damp_transient();
+                                0.960 // Rapidly drain any transient monitor lag
+                            } else if occ == 0 {
+                                sink.drift.damp_transient();
+                                1.005
+                            } else {
+                                sink.drift.update(occ)
+                            };
+                            if let Ok(mon_samples) = sink.resampler.process(&frame_48k_mon, rel) {
+                                let _ = sink.prod.push_slice(mon_samples);
+                            }
                         }
                     } else {
                         mon_clean_mix = target_mon_mix;
@@ -2116,6 +2234,7 @@ fn build_main_pipeline(
         worker_join: worker_guard.disarm(),
         mon_tx,
         aec_tx,
+        speaker: speaker.clone(),
         active_input_name: actual_in_name,
         _input_stream: input_stream,
         _virtual_output_stream: virtual_stream_opt,

@@ -1,6 +1,6 @@
 [package]
 name = "shizuka"
-version = "0.5.0"
+version = "0.6.0"
 description = "Shizuka — Local Real-Time AI Microphone Noise Cancellation powered by DeepFilterNet3 + Neural VAD Gate"
 authors = ["naebox"]
 edition = "2021"
@@ -29,6 +29,9 @@ dirs = "5"
 cpal = "0.17"
 ringbuf = "0.4"
 rubato = "0.16"
+realfft = "3.5"
+flate2 = "1"
+half = "2.4"
 audio_thread_priority = "0.34"
 sonora = "0.3"
 
@@ -56,6 +59,9 @@ objc2-foundation = "0.3"
 # Important: build dependencies (tract / rubato / deep_filter) with opt-level = 3 and debug-assertions = false
 # so real-time 10ms budget never glitches AND tract-core 0.21.4 does not trip its debug-only duplicate const name
 # assertion (`/convt3/Conv.bias`) when loading official DeepFilterNet3_onnx.tar.gz!
+[profile.dev]
+opt-level = 2
+
 [profile.dev.package."*"]
 opt-level = 3
 debug-assertions = false
@@ -85,6 +91,8 @@ opt-level = 3
 [profile.release.package.rustfft]
 opt-level = 3
 [profile.release.package.ndarray]
+opt-level = 3
+[profile.release.package.half]
 opt-level = 3
 [profile.release.package.sonora]
 opt-level = 3

@@ -335,6 +335,47 @@ fn set_aec_reference_device(
 }
 
 #[tauri::command]
+fn set_voice_gate_config(
+    state: State<'_, AppState>,
+    enabled: bool,
+    threshold: f32,
+) -> Result<AppConfig, String> {
+    let clamped = if threshold.is_finite() {
+        threshold.clamp(0.16, 0.48)
+    } else {
+        audio::speaker::DEFAULT_VOICE_GATE_THRESHOLD
+    };
+    let updated_cfg = {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+        cfg.voice_gate_threshold = clamped;
+        cfg.voice_gate_enabled = enabled;
+        cfg.clone()
+    };
+    state.engine.speaker.set_gate_config(enabled, clamped);
+    state.config_saver.schedule(updated_cfg.clone());
+    Ok(updated_cfg)
+}
+
+#[tauri::command]
+fn reset_voice_profile(state: State<'_, AppState>) -> Result<AppConfig, String> {
+    state.engine.speaker.reset_profile();
+    let updated_cfg = {
+        let mut cfg = state
+            .config
+            .lock()
+            .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+        cfg.voice_profile = None;
+        cfg.voice_fbank_tilt = None;
+        cfg.clone()
+    };
+    state.config_saver.flush_async(updated_cfg.clone());
+    Ok(updated_cfg)
+}
+
+#[tauri::command]
 fn set_model_variant(state: State<'_, AppState>, model_variant: ModelVariant) -> Result<(), String> {
     let snapshot_cfg = if let Ok(mut cfg) = state.config.lock() {
         cfg.model_variant = model_variant;
@@ -758,7 +799,7 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
         cfg.mic_profiles.len()
     ));
     out.push_str(&format!(
-        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, hpf={}, agc={} ({:+.1} dB), aec={} (active={}, erle={:.1} dB), vad={} ({} dB)\n",
+        "DSP: nc={}, model={:?}, atten={} dB, gain={} dB, hpf={}, agc={} ({:+.1} dB), aec={} (active={}, erle={:.1} dB), vad={} ({} dB), voice_gate={} (enrolled={}, thresh={:.2}, sim={:.2}, blocking={})\n",
         telem.nc_enabled,
         telem.model_variant,
         cfg.atten_lim_db,
@@ -770,7 +811,12 @@ fn get_diagnostics_text(app: AppHandle, state: State<'_, AppState>) -> String {
         telem.aec_active,
         telem.aec_erle_db,
         cfg.vad_gate_enabled,
-        cfg.vad_threshold_db
+        cfg.vad_threshold_db,
+        telem.voice_gate_enabled,
+        telem.has_voice_profile,
+        cfg.voice_gate_threshold,
+        telem.voice_gate_similarity,
+        telem.voice_gate_blocking
     ));
     out.push_str(&format!(
         "Shortcuts: nc={:?}, mute={:?}, sound={}\n",
@@ -883,7 +929,8 @@ pub fn run() {
 
             let shared_cfg = Arc::new(Mutex::new(initial_cfg));
             let config_saver = ConfigSaver::spawn();
-            let engine = AudioEngineHandle::spawn(Arc::clone(&shared_cfg));
+            let engine =
+                AudioEngineHandle::spawn(Arc::clone(&shared_cfg), Some(config_saver.clone()));
             let cue = CuePlayer::spawn();
 
             app.manage(AppState {
@@ -1063,6 +1110,8 @@ pub fn run() {
             set_mic_muted,
             update_dsp_params,
             set_aec_reference_device,
+            set_voice_gate_config,
+            reset_voice_profile,
             set_model_variant,
             select_devices,
             set_stream_active,

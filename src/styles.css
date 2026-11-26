@@ -594,6 +594,11 @@
       outline: 2px solid var(--color-focus);
       outline-offset: 4px;
     }
+
+    &:disabled {
+      opacity: 0.42;
+      cursor: not-allowed;
+    }
   }
 
   /* Compact Mic Mute Bar inside Hero Card */
@@ -682,13 +687,18 @@
         color 140ms ease, scale 120ms ease;
     }
 
-    &:hover {
+    &:hover:not(:disabled) {
       border-color: var(--border-strong);
       box-shadow: var(--hover-shadow);
     }
 
-    &:active {
+    &:active:not(:disabled) {
       scale: 0.96;
+    }
+
+    &:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
 
     &.is-muted {
@@ -1397,6 +1407,20 @@
         var(--border-subtle)
       );
     }
+
+    &.learning {
+      color: var(--text-primary);
+      border-color: var(--border-ui);
+    }
+
+    &.blocking {
+      color: var(--color-text-red);
+      border-color: color-mix(
+        in oklab,
+        var(--color-led-red) 52%,
+        var(--border-subtle)
+      );
+    }
   }
 
   .vad-live-dot {
@@ -1416,6 +1440,81 @@
         forced-color-adjust: none;
       }
     }
+
+    .vad-live-pill.learning & {
+      background: var(--border-strong);
+      border-color: var(--border-strong);
+
+      @media (prefers-reduced-motion: no-preference) {
+        animation: shizuka-pulse 1.6s ease-in-out infinite;
+      }
+    }
+
+    .vad-live-pill.blocking & {
+      background: var(--color-led-red);
+      border-color: var(--color-led-red);
+      box-shadow: var(--led-red-glow);
+
+      @media (forced-colors: active) {
+        forced-color-adjust: none;
+      }
+    }
+  }
+
+  .voice-enroll-box {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    padding: 0.5rem 0.6rem;
+    border-radius: 0.5rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .voice-enroll-empty {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  .voice-enroll-registered {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .voice-enroll-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .voice-enroll-check {
+    color: var(--color-text-green);
+    flex-shrink: 0;
+  }
+
+  .voice-enroll-active {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .voice-enroll-prompt {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .voice-enroll-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
   }
 
   .field-hint {
@@ -1930,13 +2029,18 @@
         color 140ms ease, scale 120ms ease;
     }
 
-    &:hover {
+    &:hover:not(:disabled) {
       border-color: var(--border-strong);
       box-shadow: var(--hover-shadow);
     }
 
-    &:active {
+    &:active:not(:disabled) {
       scale: 0.96;
+    }
+
+    &:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
 
     &.is-recording {

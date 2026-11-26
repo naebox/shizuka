@@ -110,6 +110,7 @@ flowchart LR
 - [x] **`v0.4.3` リリース公開**: 小音量／遠距離マイクでの DeepFilterNet3 低レベル不感帯（デッドゾーン）を解消する先読み整合正規化（`PreDfnNormalizer`）＆ VAD / AGC 低レベル閾値調整 ([processor.rs](./src-tauri/src/audio/processor.rs))
 - [x] **`v0.4.4` リリース公開**: Windows WASAPI (`cpal 0.17`) でのデバイスフレンドリー名解決＆「マイク再接続待ち」誤遷移を修正 ([devices.rs](./src-tauri/src/audio/devices.rs))
 - [x] **`v0.5.0` 機能追加＆安定化**: スピーカー通話向け **エコー除去（WebRTC AEC3）**（`sonora` 純 Rust 実装、Windows WASAPI Loopback / macOS 14.2+ CoreAudio Process Tap 対応、マイクテスト時自動バイパス、マイク別プロファイル記憶）、UI・README の平易な日本語表現への刷新、および `DriftController` の過渡変動抑制（`ζ ≈ 0.88`）を実装 ([aec.rs](./src-tauri/src/audio/aec.rs), [loopback.rs](./src-tauri/src/audio/loopback.rs), [resampler.rs](./src-tauri/src/audio/resampler.rs), [engine.rs](./src-tauri/src/audio/engine.rs), [App.tsx](./src/App.tsx))
+- [x] **`v0.6.0` 機能追加**: **「周囲の話し声カット」声の自動学習＆本人以外の声の自動消音**（普段の会話から主話者クラスタを自動抽出・継続適応するオンライン学習、Apache-2.0 `CAM++` FP16 圧縮モデル同梱、10ms リアルタイム音声スレッド分離、話し始めの頭切れゼロ＋周囲の声を約 0.3 秒で自動消音）を実装 ([speaker.rs](./src-tauri/src/audio/speaker.rs), [processor.rs](./src-tauri/src/audio/processor.rs), [engine.rs](./src-tauri/src/audio/engine.rs), [App.tsx](./src/App.tsx))
 
 ### 継続中の改善・ドッグフーディング
 

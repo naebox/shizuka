@@ -68,6 +68,10 @@ pub struct AppConfig {
     pub hpf_enabled: bool,
     pub agc_enabled: bool,
     pub aec_enabled: bool,
+    pub voice_gate_enabled: bool,
+    pub voice_gate_threshold: f32,
+    pub voice_profile: Option<Vec<f32>>,
+    pub voice_fbank_tilt: Option<Vec<f32>>,
     pub monitor_volume: f32,
     pub stream_active: bool,
     pub mic_profiles: BTreeMap<String, MicProfile>,
@@ -95,6 +99,10 @@ impl Default for AppConfig {
             hpf_enabled: def_prof.hpf_enabled,
             agc_enabled: def_prof.agc_enabled,
             aec_enabled: def_prof.aec_enabled,
+            voice_gate_enabled: false,
+            voice_gate_threshold: crate::audio::speaker::DEFAULT_VOICE_GATE_THRESHOLD,
+            voice_profile: None,
+            voice_fbank_tilt: None,
             monitor_volume: 0.8,
             stream_active: true,
             mic_profiles: BTreeMap::new(),
@@ -222,6 +230,12 @@ impl AppConfig {
         if migrate_values(&mut self.min_db_thresh, &mut self.post_filter_beta) {
             changed = true;
         }
+        // Recalibrate early 0.6.0-dev default voice gate threshold (0.42 -> 0.28) to prevent
+        // false mid-phrase dropouts on casual/soft speech.
+        if (self.voice_gate_threshold - 0.42).abs() < 0.005 {
+            self.voice_gate_threshold = crate::audio::speaker::DEFAULT_VOICE_GATE_THRESHOLD;
+            changed = true;
+        }
         for prof in self.mic_profiles.values_mut() {
             if migrate_values(&mut prof.min_db_thresh, &mut prof.post_filter_beta) {
                 changed = true;
@@ -254,6 +268,26 @@ impl AppConfig {
         } else {
             0.8
         };
+        self.voice_gate_threshold = if self.voice_gate_threshold.is_finite() {
+            self.voice_gate_threshold.clamp(0.16, 0.48)
+        } else {
+            crate::audio::speaker::DEFAULT_VOICE_GATE_THRESHOLD
+        };
+        if self
+            .voice_profile
+            .as_ref()
+            .is_some_and(|v| !crate::audio::speaker::is_valid_embedding(v))
+        {
+            self.voice_profile = None;
+            self.voice_fbank_tilt = None;
+        }
+        if self
+            .voice_fbank_tilt
+            .as_ref()
+            .is_some_and(|t| !crate::audio::speaker::is_valid_fbank_tilt(t))
+        {
+            self.voice_fbank_tilt = None;
+        }
         for prof in self.mic_profiles.values_mut() {
             clamp_vals(
                 &mut prof.atten_lim_db,

@@ -182,6 +182,89 @@ export function VadLiveBadge({
   );
 }
 
+export function VoiceGateLiveBadge({
+  voiceGateEnabled,
+  hasVoiceProfile,
+  ncEnabled,
+}: {
+  voiceGateEnabled: boolean;
+  hasVoiceProfile: boolean;
+  ncEnabled: boolean;
+}) {
+  const telemetry = useLiveTelemetry();
+  const blocking = telemetry?.voice_gate_blocking ?? false;
+  const speaking = telemetry?.vad_speaking ?? false;
+  const learnPct = Math.round(
+    Math.max(0, Math.min(1, telemetry?.voice_learn_progress ?? 0)) * 100
+  );
+
+  const stateClass =
+    !voiceGateEnabled || !ncEnabled
+      ? ""
+      : !hasVoiceProfile
+      ? "learning"
+      : blocking
+      ? "blocking"
+      : speaking
+      ? "speaking"
+      : "";
+
+  const label = !voiceGateEnabled
+    ? "OFF"
+    : !ncEnabled
+    ? "待機"
+    : !hasVoiceProfile
+    ? learnPct > 0
+      ? `学習中 ${learnPct}%`
+      : "声を学習中"
+    : blocking
+    ? "周囲の声を消音中"
+    : speaking
+    ? "話し中"
+    : "待機中";
+
+  return (
+    <span className={`vad-live-pill ${stateClass}`} aria-hidden="true">
+      <span className="vad-live-dot" />
+      <span>{label}</span>
+    </span>
+  );
+}
+
+export function VoiceAutoLearnProgress({
+  progressId,
+}: {
+  progressId: string;
+}) {
+  const telemetry = useLiveTelemetry();
+  const progress = Math.max(
+    0,
+    Math.min(1, telemetry?.voice_learn_progress ?? 0)
+  );
+  const pct = Math.round(progress * 100);
+
+  return (
+    <div className="voice-enroll-active">
+      <div className="slider-top">
+        <label htmlFor={progressId} className="voice-enroll-prompt">
+          普段通りに話すと自動で声を覚えます
+        </label>
+        <span className="slider-val">{pct}%</span>
+      </div>
+      <progress
+        id={progressId}
+        className="update-progress"
+        max={1}
+        value={progress}
+        aria-valuetext={`${pct}%`}
+      />
+      <span className="field-hint">
+        マイクの近くで数秒間会話すると記憶が完了します（話している間だけ進みます）
+      </span>
+    </div>
+  );
+}
+
 export function MicTestLiveMeter({
   monMeterId,
   liveMonitorEnabled,
