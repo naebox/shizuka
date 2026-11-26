@@ -30,3 +30,7 @@
 
 4. **Device Filtering**
    - Keep auxiliary multi-channel virtual endpoints (`CABLE In 16ch` / `CABLE Out 16ch`) hidden in `src-tauri/src/audio/devices.rs` (`should_hide_device`) so voice routing dropdowns stay clear.
+
+5. **Release & Changelog Discipline**
+   - Every version bump MUST keep `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and `drivers/macos-hal/Info.plist` at the exact same version string **and** add a matching `## [X.Y.Z] (YYYY-MM-DD) — <変更概要>` section with plain-Japanese user-facing bullet points to [CHANGELOG.md](./CHANGELOG.md).
+   - Both CI (`.github/workflows/ci.yml`) and Release (`.github/workflows/release.yml`) run `node scripts/extract-release-notes.mjs --check-manifests` to fail immediately if `CHANGELOG.md` is missing the version's notes, and automatically populate GitHub Releases and `latest.json` from `CHANGELOG.md`.

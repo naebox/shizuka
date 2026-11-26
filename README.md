@@ -89,9 +89,9 @@ npm run tauri dev
 npm run tauri build
 ```
 
-## ロードマップ
+## 更新履歴・ロードマップ
 
-これまでの改善履歴や `v1.0.0` 正式版に向けた計画は **[ROADMAP.md](./ROADMAP.md)** をご覧ください。
+各バージョンの変更内容は **[CHANGELOG.md](./CHANGELOG.md)**、`v1.0.0` 正式版に向けた計画は **[ROADMAP.md](./ROADMAP.md)** をご覧ください。
 
 ## ライセンス
 

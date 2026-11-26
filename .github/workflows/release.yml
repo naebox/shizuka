@@ -25,46 +25,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Resolve and validate version across all manifests
+      - name: Resolve version, validate manifests, and extract CHANGELOG.md notes
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-          VERSION=$(node -p "require('./package.json').version")
-          TAURI_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          CARGO_VER=$(node -e "
-            const fs = require('fs');
-            const m = fs.readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version\s*=\s*\"([^\"]+)\"/m);
-            if (!m) process.exit(1);
-            console.log(m[1]);
-          ")
-          HAL_VER=$(node -e "
-            const fs = require('fs');
-            const m = fs.readFileSync('drivers/macos-hal/Info.plist', 'utf8').match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
-            if (!m) process.exit(1);
-            console.log(m[1]);
-          ")
-
           if [ "${{ github.event_name }}" = "push" ]; then
-            TAG="${GITHUB_REF_NAME}"
+            TAG_ARG="${GITHUB_REF_NAME}"
           elif [ -n "${{ inputs.tag }}" ]; then
-            TAG="${{ inputs.tag }}"
+            TAG_ARG="${{ inputs.tag }}"
           else
-            TAG="v${VERSION}"
+            TAG_ARG=""
           fi
 
-          if [ "$VERSION" != "$TAURI_VER" ] || [ "$VERSION" != "$CARGO_VER" ] || [ "$VERSION" != "$HAL_VER" ]; then
-            echo "::error::Version mismatch: package.json=${VERSION}, tauri.conf.json=${TAURI_VER}, Cargo.toml=${CARGO_VER}, macOS HAL Info.plist=${HAL_VER}"
-            exit 1
+          if [ -n "$TAG_ARG" ]; then
+            node scripts/extract-release-notes.mjs \
+              --check-manifests \
+              --tag "$TAG_ARG" \
+              --github-output "$GITHUB_OUTPUT" \
+              --markdown-out release_notes.md
+          else
+            node scripts/extract-release-notes.mjs \
+              --check-manifests \
+              --github-output "$GITHUB_OUTPUT" \
+              --markdown-out release_notes.md
           fi
-          if [ "$TAG" != "v${VERSION}" ]; then
-            echo "::error::Release tag (${TAG}) does not match package version (v${VERSION})"
-            exit 1
-          fi
-
-          echo "Validated unified version ${VERSION} (tag ${TAG})"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Create or reuse draft GitHub Release
         env:
@@ -72,25 +57,11 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
         shell: bash
         run: |
-          NOTES=$(cat <<'EOF'
-          ## Shizuka — 周囲を静かに、声だけをクリアに。
-
-          ### ダウンロード
-          - **Windows（推奨・インストーラ）**: `Shizuka_*_x64-setup.exe`
-          - **Windows（ポータブル版・インストール不要）**: `Shizuka_*_windows_x64_portable.zip`
-          - **Windows（MSI パッケージ）**: `Shizuka_*_x64_en-US.msi`
-          - **macOS（Apple Silicon / M1 以降）**: `Shizuka_*_aarch64.dmg`
-          - **macOS（Intel）**: `Shizuka_*_x64.dmg`
-          - **チェックサム**: `SHA256SUMS.txt`
-
-          > [!NOTE]
-          > 個人ビルド（未署名）のため、初回起動時に OS の警告が表示される場合があります。
-          > - **Windows**: SmartScreen が表示された場合は「詳細情報」→「実行」を選択してください。
-          > - **macOS**: 初回はアプリを右クリック →「開く」（または「システム設定 → プライバシーとセキュリティ → このまま開く」）から起動してください。
-          EOF
-          )
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — reusing and refreshing assets."
+            echo "Release $TAG already exists — refreshing title and release notes."
+            gh release edit "$TAG" \
+              --title "Shizuka $TAG" \
+              --notes-file release_notes.md
           else
             # Create as draft so /releases/latest/download/latest.json never returns 404
             # while platform builds are still running; finalize-release publishes atomically.
@@ -98,7 +69,7 @@ jobs:
               --draft \
               --target "$GITHUB_SHA" \
               --title "Shizuka $TAG" \
-              --notes "$NOTES"
+              --notes-file release_notes.md
           fi
 
   build:
@@ -301,6 +272,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Download updater signature metadata
         uses: actions/download-artifact@v8
         with:
@@ -318,6 +292,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          node scripts/extract-release-notes.mjs \
+            --version "$VERSION" \
+            --markdown-out release_notes.md \
+            --summary-out updater_notes.txt
 
           node <<'EOF'
           const fs = require("fs");
@@ -344,9 +323,10 @@ jobs:
             }
           }
 
+          const notes = fs.readFileSync("updater_notes.txt", "utf8").trim();
           const latest = {
             version,
-            notes: `Shizuka ${tag} が利用可能です。詳細は GitHub Releases をご覧ください。`,
+            notes,
             pub_date: new Date().toISOString(),
             platforms,
           };
@@ -374,4 +354,7 @@ jobs:
 
           gh release upload "$TAG" latest.json SHA256SUMS.txt --clobber
           # Publish atomically only after all binaries, latest.json, and SHA256SUMS.txt are attached
-          gh release edit "$TAG" --draft=false
+          gh release edit "$TAG" \
+            --title "Shizuka $TAG" \
+            --notes-file release_notes.md \
+            --draft=false
