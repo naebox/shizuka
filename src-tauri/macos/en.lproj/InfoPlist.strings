@@ -1,0 +1,2 @@
+"NSMicrophoneUsageDescription" = "Shizuka needs microphone access to apply real-time AI noise cancellation locally on your device. Audio is never sent to external servers.";
+"NSAudioCaptureUsageDescription" = "Shizuka uses system audio access when Echo Cancellation is enabled to prevent speaker audio from feeding back into your microphone. Audio is processed locally and never leaves your device.";

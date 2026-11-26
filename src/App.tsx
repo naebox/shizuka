@@ -9,12 +9,14 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ArrowLeft,
   AudioLines,
   Check,
   CheckCircle2,
   ClipboardCopy,
   Download,
   ExternalLink,
+  FileText,
   Headphones,
   Keyboard,
   Mic,
@@ -43,6 +45,15 @@ import {
   VoiceAutoLearnProgress,
   VoiceGateLiveBadge,
 } from "./components/LiveTelemetryWidgets";
+import { detectBrowserLocale, getMessages, type UiMessages } from "./i18n";
+import {
+  getBundledChangelog,
+  getReleaseItems,
+  getReleaseTitle,
+  parseSingleUpdateNotes,
+  type ReleaseNoteBullet,
+  tokenizeInlineMarkdown,
+} from "./releaseNotes";
 import {
   refreshTelemetryNow,
   seedTelemetry,
@@ -54,6 +65,8 @@ import type {
   AudioTelemetry,
   DeviceListResponse,
   InstallDriverResult,
+  LanguagePreference,
+  Locale,
   ModelVariant,
   ShortcutAction,
   UpdateCheckResult,
@@ -162,7 +175,8 @@ function isSupportedPrimaryCode(code: string): boolean {
 }
 
 function buildAcceleratorFromKeyEvent(
-  e: KeyboardEvent
+  e: KeyboardEvent,
+  t: UiMessages
 ): { ok: true; value: string } | { ok: false; error: string } | null {
   if (MODIFIER_CODES.has(e.code)) {
     return null;
@@ -170,7 +184,7 @@ function buildAcceleratorFromKeyEvent(
   if (!isSupportedPrimaryCode(e.code)) {
     return {
       ok: false,
-      error: "このキーはショートカットに割り当てできません。別のキーを押してください。",
+      error: t.errors.unsupportedKey,
     };
   }
   const mods: string[] = [];
@@ -182,8 +196,7 @@ function buildAcceleratorFromKeyEvent(
   if (mods.length === 0 && !UNMODIFIED_ALLOWED_CODES.has(e.code)) {
     return {
       ok: false,
-      error:
-        "単一キーはファンクションキー（F1〜F24 等）のみ登録できます。Ctrl / Alt / Shift 等と組み合わせてください。",
+      error: t.errors.unmodifiedKeyNotAllowed,
     };
   }
 
@@ -224,9 +237,10 @@ const KEY_DISPLAY_MAP: Record<string, string> = {
 
 function formatShortcutLabel(
   accelerator: string | null | undefined,
-  isMac: boolean
+  isMac: boolean,
+  unassignedLabel: string
 ): string {
-  if (!accelerator) return "未割当";
+  if (!accelerator) return unassignedLabel;
   const parts = accelerator.split("+").map((p) => p.trim());
   return parts
     .map((part) => {
@@ -279,6 +293,13 @@ function applyColorSchemeMeta(
   return invoke("set_window_theme", { theme: nativeTheme })
     .then(() => undefined)
     .catch(() => undefined);
+}
+
+function applyDocumentLocale(loc: Locale) {
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = loc;
+    document.title = getMessages(loc).docTitle;
+  }
 }
 
 function ShizukaMark({
@@ -347,6 +368,68 @@ function formatIpcError(err: unknown): string {
     : String(err);
 }
 
+function InlineFormattedText({ text }: { text: string }) {
+  const segments = tokenizeInlineMarkdown(text);
+  return (
+    <>
+      {segments.map((seg, i) => {
+        if (seg.type === "code") {
+          return (
+            <code key={i} className="release-inline-code">
+              {seg.value}
+            </code>
+          );
+        }
+        if (seg.type === "strong") {
+          return (
+            <strong key={i}>
+              {seg.children.map((child, j) =>
+                child.type === "code" ? (
+                  <code key={j} className="release-inline-code">
+                    {child.value}
+                  </code>
+                ) : (
+                  child.value
+                )
+              )}
+            </strong>
+          );
+        }
+        return seg.value;
+      })}
+    </>
+  );
+}
+
+function ReleaseBulletList({
+  items,
+  compact = false,
+}: {
+  items: ReleaseNoteBullet[];
+  compact?: boolean;
+}) {
+  return (
+    <ul className={`release-bullet-list ${compact ? "is-compact" : ""}`}>
+      {items.map((item, idx) => (
+        <li key={idx} className="release-bullet-item">
+          <span className="release-bullet-headline">
+            <InlineFormattedText text={item.text} />
+          </span>
+          {item.subItems.length > 0 && (
+            <ul className="release-subbullet-list">
+              {item.subItems.map((sub, subIdx) => (
+                <li key={subIdx} className="release-subbullet-item">
+                  <InlineFormattedText text={sub} />
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function App() {
   const uid = useId();
   const ncSwitchId = `${uid}-nc-switch`;
@@ -383,13 +466,20 @@ export function App() {
   const monRawId = `${uid}-mon-raw`;
   const monVolSliderId = `${uid}-mon-vol-slider`;
   const settingsTitleId = `${uid}-settings-title`;
+  const langAutoId = `${uid}-lang-auto`;
+  const langJaId = `${uid}-lang-ja`;
+  const langEnId = `${uid}-lang-en`;
   const autostartSwitchId = `${uid}-autostart-switch`;
   const cueSoundSwitchId = `${uid}-cue-sound-switch`;
   const cueSoundHintId = `${uid}-cue-sound-hint`;
   const updateProgressId = `${uid}-update-progress`;
 
   const settingsDialogRef = useRef<HTMLDialogElement | null>(null);
+  const activeLangInputRef = useRef<HTMLInputElement | null>(null);
   const autostartInputRef = useRef<HTMLInputElement | null>(null);
+  const releaseNotesTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const releaseNotesBackRef = useRef<HTMLButtonElement | null>(null);
+  const settingsViewRef = useRef<"main" | "release_notes">("main");
   const lastReconnectCountRef = useRef<number | null>(null);
   const lastConfigRevisionRef = useRef<number | null>(null);
   const recordingActionRef = useRef<ShortcutAction | null>(null);
@@ -402,6 +492,11 @@ export function App() {
   const updateInstallPollRef = useRef<number | null>(null);
 
   const telemetry = useDiscreteTelemetry();
+
+  const [locale, setLocale] = useState<Locale>(() => detectBrowserLocale());
+  const t = getMessages(locale);
+  const tRef = useRef<UiMessages>(t);
+  tRef.current = t;
 
   const [appVersion, setAppVersion] = useState<string>("");
   const [devices, setDevices] = useState<DeviceListResponse | null>(null);
@@ -427,6 +522,9 @@ export function App() {
     error: null,
   });
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [settingsView, setSettingsView] = useState<"main" | "release_notes">(
+    "main"
+  );
   const [installingDriver, setInstallingDriver] = useState(false);
   const [installMessage, setInstallMessage] = useState<{
     ok: boolean;
@@ -434,7 +532,12 @@ export function App() {
   } | null>(null);
 
   recordingActionRef.current = recordingAction;
+  settingsViewRef.current = settingsView;
   configRef.current = config;
+
+  useEffect(() => {
+    applyDocumentLocale(locale);
+  }, [locale]);
 
   const refreshDevicesAndConfig = useCallback(async (userInitiated = false) => {
     if (userInitiated) {
@@ -442,17 +545,21 @@ export function App() {
       setActionError(null);
     }
     try {
-      const [devs, cfg, autostart] = await Promise.all([
+      const [devs, cfg, autostart, resolvedLoc] = await Promise.all([
         invoke<DeviceListResponse>("get_devices"),
         invoke<AppConfig>("get_config"),
         invoke<boolean>("get_autostart_enabled").catch(() => false),
+        invoke<Locale>("get_resolved_locale").catch(() => null),
       ]);
       setDevices(devs);
       setConfig(cfg);
       setAutostartEnabled(autostart);
+      if (resolvedLoc) {
+        setLocale(resolvedLoc);
+      }
     } catch (err) {
       setActionError(
-        `オーディオデバイスの読み込みに失敗しました: ${formatIpcError(err)}`
+        tRef.current.errors.loadDevicesFailed(formatIpcError(err))
       );
     } finally {
       if (userInitiated) {
@@ -510,10 +617,28 @@ export function App() {
     dialog.close();
   }, [stopShortcutRecording]);
 
+  const openReleaseNotesView = useCallback(() => {
+    settingsViewRef.current = "release_notes";
+    setSettingsView("release_notes");
+    window.requestAnimationFrame(() => {
+      releaseNotesBackRef.current?.focus({ preventScroll: true });
+    });
+  }, []);
+
+  const returnToSettingsMain = useCallback(() => {
+    settingsViewRef.current = "main";
+    setSettingsView("main");
+    window.requestAnimationFrame(() => {
+      releaseNotesTriggerRef.current?.focus({ preventScroll: true });
+    });
+  }, []);
+
   const openSettingsDialog = useCallback(() => {
     const dialog = settingsDialogRef.current;
     if (!dialog || dialog.open) return;
     dialog.removeAttribute("data-closing");
+    settingsViewRef.current = "main";
+    setSettingsView("main");
     setAutostartError(null);
     setShortcutError(null);
     setDiagError(null);
@@ -529,7 +654,9 @@ export function App() {
     dialog.showModal();
     // React 18 consumes `autoFocus` on initial mount while `<dialog>` is closed, so move
     // initial focus explicitly onto the primary control inside the modal after showModal().
-    autostartInputRef.current?.focus({ preventScroll: true });
+    (activeLangInputRef.current ?? autostartInputRef.current)?.focus({
+      preventScroll: true,
+    });
   }, []);
 
   // Capture keyboard shortcut while recording inside Settings dialog
@@ -550,7 +677,7 @@ export function App() {
         return;
       }
 
-      const parsed = buildAcceleratorFromKeyEvent(e);
+      const parsed = buildAcceleratorFromKeyEvent(e, tRef.current);
       if (parsed === null) {
         return;
       }
@@ -609,6 +736,8 @@ export function App() {
     const onClose = () => {
       dialog.removeAttribute("data-closing");
       dialog.returnValue = "";
+      settingsViewRef.current = "main";
+      setSettingsView("main");
       if (recordingActionRef.current !== null) {
         recordingActionRef.current = null;
         shortcutSubmittingRef.current = false;
@@ -617,6 +746,19 @@ export function App() {
       }
     };
     dialog.addEventListener("close", onClose);
+
+    const onDialogKeyDown = (e: KeyboardEvent) => {
+      if (
+        (e.code === "Escape" || e.key === "Escape") &&
+        recordingActionRef.current === null &&
+        settingsViewRef.current === "release_notes"
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        returnToSettingsMain();
+      }
+    };
+    dialog.addEventListener("keydown", onDialogKeyDown);
 
     const supportsNativeTopLayerExit =
       typeof window !== "undefined" &&
@@ -627,6 +769,11 @@ export function App() {
         e.preventDefault();
         setShortcutError(null);
         void stopShortcutRecording();
+        return;
+      }
+      if (settingsViewRef.current === "release_notes") {
+        e.preventDefault();
+        returnToSettingsMain();
         return;
       }
       if (!supportsNativeTopLayerExit) {
@@ -671,15 +818,16 @@ export function App() {
 
     return () => {
       dialog.removeEventListener("close", onClose);
+      dialog.removeEventListener("keydown", onDialogKeyDown);
       dialog.removeEventListener("cancel", onCancel);
       if (!supportsClosedBy) {
         dialog.removeEventListener("pointerdown", onPointerDown);
         dialog.removeEventListener("pointerup", onPointerUp);
       }
     };
-  }, [closeSettingsDialog, stopShortcutRecording]);
+  }, [closeSettingsDialog, returnToSettingsMain, stopShortcutRecording]);
 
-  // Initial bootstrap: load theme, version, devices, config, and first telemetry BEFORE showing
+  // Initial bootstrap: load theme, locale, version, devices, config, and first telemetry BEFORE showing
   // the main window so startup never flashes white or placeholder defaults.
   useEffect(() => {
     let active = true;
@@ -695,16 +843,22 @@ export function App() {
 
     void (async () => {
       const initialStored = readStoredColorScheme();
-      const [, ver, devs, cfg, autostart, initTelem] = await Promise.all([
-        applyColorSchemeMeta(initialStored ?? "light dark"),
-        invoke<string>("get_app_version").catch(() => ""),
-        invoke<DeviceListResponse>("get_devices").catch(() => null),
-        invoke<AppConfig>("get_config").catch(() => null),
-        invoke<boolean>("get_autostart_enabled").catch(() => false),
-        invoke<AudioTelemetry>("get_telemetry").catch(() => null),
-      ]);
+      const [, ver, devs, cfg, resolvedLoc, autostart, initTelem] =
+        await Promise.all([
+          applyColorSchemeMeta(initialStored ?? "light dark"),
+          invoke<string>("get_app_version").catch(() => ""),
+          invoke<DeviceListResponse>("get_devices").catch(() => null),
+          invoke<AppConfig>("get_config").catch(() => null),
+          invoke<Locale>("get_resolved_locale").catch(() => null),
+          invoke<boolean>("get_autostart_enabled").catch(() => false),
+          invoke<AudioTelemetry>("get_telemetry").catch(() => null),
+        ]);
 
       if (!active) return;
+      if (resolvedLoc) {
+        applyDocumentLocale(resolvedLoc);
+        setLocale(resolvedLoc);
+      }
       if (ver) setAppVersion(ver);
       if (devs) setDevices(devs);
       if (cfg) setConfig(cfg);
@@ -807,7 +961,7 @@ export function App() {
       refreshTelemetryNow();
     } catch (err) {
       setConfig((prev) => (prev ? { ...prev, nc_enabled: !next } : prev));
-      setActionError(`ノイズ除去の切替に失敗しました: ${formatIpcError(err)}`);
+      setActionError(t.errors.toggleNcFailed(formatIpcError(err)));
     } finally {
       ncTogglePendingRef.current = false;
     }
@@ -820,7 +974,7 @@ export function App() {
       await invoke("set_mic_muted", { muted: next });
       refreshTelemetryNow();
     } catch (err) {
-      setActionError(`ミュート切替に失敗しました: ${formatIpcError(err)}`);
+      setActionError(t.errors.toggleMuteFailed(formatIpcError(err)));
     }
   };
 
@@ -846,6 +1000,34 @@ export function App() {
         // Ignore storage error
       }
       void applyColorSchemeMeta("light dark");
+    }
+  };
+
+  const handleLanguageChange = async (nextPref: LanguagePreference) => {
+    setAutostartError(null);
+    const prevPref = configRef.current?.language ?? "auto";
+    const prevLocale = locale;
+    const optimisticLocale: Locale =
+      nextPref === "auto" ? detectBrowserLocale() : nextPref;
+
+    setConfig((prev) => (prev ? { ...prev, language: nextPref } : prev));
+    setLocale(optimisticLocale);
+
+    try {
+      const resolved = await invoke<Locale>("set_language", {
+        language: nextPref,
+      });
+      setLocale(resolved);
+      const warn = await invoke<string | null>("get_shortcut_warning").catch(
+        () => null
+      );
+      setShortcutError(warn);
+    } catch (err) {
+      setConfig((prev) => (prev ? { ...prev, language: prevPref } : prev));
+      setLocale(prevLocale);
+      setAutostartError(
+        tRef.current.errors.switchLanguageFailed(formatIpcError(err))
+      );
     }
   };
 
@@ -880,9 +1062,7 @@ export function App() {
       if (seq === deviceSeqRef.current && prevSnapshot) {
         setConfig(prevSnapshot);
       }
-      setActionError(
-        `デバイスの切替に失敗しました: ${formatIpcError(err)}`
-      );
+      setActionError(t.errors.switchDeviceFailed(formatIpcError(err)));
     }
   };
 
@@ -900,9 +1080,7 @@ export function App() {
           prev ? { ...prev, model_variant: prevVariant } : prev
         );
       }
-      setActionError(
-        `AI モデルの切替に失敗しました: ${formatIpcError(err)}`
-      );
+      setActionError(t.errors.switchModelFailed(formatIpcError(err)));
     }
   };
 
@@ -950,7 +1128,7 @@ export function App() {
       });
     } catch (err) {
       if (seq === paramSeqRef.current) {
-        setActionError(`音質パラメータの反映に失敗しました: ${formatIpcError(err)}`);
+        setActionError(t.errors.updateDspFailed(formatIpcError(err)));
         void invoke<AppConfig>("get_config")
           .then(setConfig)
           .catch(() => {});
@@ -977,9 +1155,7 @@ export function App() {
       if (seq === deviceSeqRef.current && prevSnapshot) {
         setConfig(prevSnapshot);
       }
-      setActionError(
-        `スピーカーの切替に失敗しました: ${formatIpcError(err)}`
-      );
+      setActionError(t.errors.switchSpeakerFailed(formatIpcError(err)));
     }
   };
 
@@ -1012,9 +1188,7 @@ export function App() {
       if (seq === paramSeqRef.current && prevSnapshot) {
         setConfig(prevSnapshot);
       }
-      setActionError(
-        `周囲の話し声カットの反映に失敗しました: ${formatIpcError(err)}`
-      );
+      setActionError(t.errors.updateVoiceGateFailed(formatIpcError(err)));
     }
   };
 
@@ -1025,7 +1199,7 @@ export function App() {
       setConfig(synced);
       refreshTelemetryNow();
     } catch (err) {
-      setActionError(`声の記憶のリセットに失敗しました: ${formatIpcError(err)}`);
+      setActionError(t.errors.resetVoiceProfileFailed(formatIpcError(err)));
     }
   };
 
@@ -1065,9 +1239,7 @@ export function App() {
       await invoke("set_live_monitor", { enabled: !cur });
       refreshTelemetryNow();
     } catch (err) {
-      setActionError(
-        `マイクテストの切替に失敗しました: ${formatIpcError(err)}`
-      );
+      setActionError(t.errors.toggleMicTestFailed(formatIpcError(err)));
     }
   };
 
@@ -1078,9 +1250,7 @@ export function App() {
       await invoke("set_monitor_mode", { clean });
     } catch (err) {
       setMonitorClean(!clean);
-      setActionError(
-        `モニターモードの切替に失敗しました: ${formatIpcError(err)}`
-      );
+      setActionError(t.errors.switchMonitorModeFailed(formatIpcError(err)));
     }
   };
 
@@ -1091,7 +1261,7 @@ export function App() {
     try {
       await invoke("set_monitor_volume", { volume: vol });
     } catch (err) {
-      setActionError(`モニター音量の変更に失敗しました: ${formatIpcError(err)}`);
+      setActionError(t.errors.changeMonitorVolFailed(formatIpcError(err)));
     }
   };
 
@@ -1099,7 +1269,7 @@ export function App() {
     try {
       await invoke("quit_app");
     } catch (err) {
-      setActionError(`終了処理に失敗しました: ${formatIpcError(err)}`);
+      setActionError(t.errors.quitFailed(formatIpcError(err)));
     }
   };
 
@@ -1132,9 +1302,7 @@ export function App() {
         setDiagCopied(false);
       }, 2200);
     } catch (err) {
-      setDiagError(
-        `クリップボードへのコピーに失敗しました: ${formatIpcError(err)}`
-      );
+      setDiagError(t.errors.copyClipboardFailed(formatIpcError(err)));
     }
   };
 
@@ -1225,6 +1393,7 @@ export function App() {
     }
   };
 
+  const languagePref: LanguagePreference = config?.language ?? "auto";
   const modelVariant: ModelVariant =
     config?.model_variant ?? telemetry?.model_variant ?? "standard";
   const attenDb = config?.atten_lim_db ?? 65;
@@ -1242,15 +1411,15 @@ export function App() {
     config?.voice_gate_enabled ?? telemetry?.voice_gate_enabled ?? false;
   const voiceGateThresh = Math.max(
     0.16,
-    Math.min(0.40, config?.voice_gate_threshold ?? 0.28)
+    Math.min(0.4, config?.voice_gate_threshold ?? 0.28)
   );
   const voiceStrictPct = Math.round(((voiceGateThresh - 0.16) / 0.24) * 100);
   const voiceGateValueText =
     voiceStrictPct < 35
-      ? `ゆるめ (${voiceStrictPct}%)`
+      ? t.tuning.voiceStrictnessRelaxed(voiceStrictPct)
       : voiceStrictPct > 65
-      ? `厳しめ (${voiceStrictPct}%)`
-      : `標準 (${voiceStrictPct}%)`;
+      ? t.tuning.voiceStrictnessStrict(voiceStrictPct)
+      : t.tuning.voiceStrictnessBalanced(voiceStrictPct);
   const liveMonitorEnabled = telemetry?.live_monitor_enabled ?? false;
   const monVolPct = Math.round(
     (config?.monitor_volume ?? telemetry?.monitor_volume ?? 0.8) * 100
@@ -1259,11 +1428,34 @@ export function App() {
   const shortcutSoundEnabled = config?.shortcut_sound_enabled ?? true;
   const connState = telemetry?.connection_state ?? "running";
   const displayVersion = updateInfo?.current_version ?? appVersion;
+  const bundledChangelog = getBundledChangelog();
+  const pendingUpdateEntry =
+    updateInfo?.available && updateInfo.latest_version
+      ? parseSingleUpdateNotes(
+          updateInfo.latest_version,
+          updateInfo.date,
+          updateInfo.notes
+        ) ??
+        bundledChangelog.find(
+          (entry) => entry.version === updateInfo.latest_version
+        ) ??
+        null
+      : null;
+  const pendingUpdateItems = pendingUpdateEntry
+    ? getReleaseItems(pendingUpdateEntry, locale)
+    : [];
+  const allReleaseEntries =
+    pendingUpdateEntry &&
+    !bundledChangelog.some(
+      (entry) => entry.version === pendingUpdateEntry.version
+    )
+      ? [pendingUpdateEntry, ...bundledChangelog]
+      : bundledChangelog;
 
   const activePreset =
     attenDb <= 30 ? "natural" : attenDb >= 90 ? "max" : "balanced";
   const attenValueText =
-    attenDb >= 100 ? "無制限 (100 dB)" : `${attenDb.toFixed(0)} dB`;
+    attenDb >= 100 ? t.tuning.attenUnlimited : `${attenDb.toFixed(0)} dB`;
   const gainValueText =
     gainDb > 0 ? `+${gainDb.toFixed(1)} dB` : `${gainDb.toFixed(1)} dB`;
   const vadValueText =
@@ -1272,7 +1464,7 @@ export function App() {
       : `${vadThreshDb.toFixed(1)} dB`;
 
   // Detect configured devices that are temporarily unplugged so <select> never falsely displays
-  // "システム既定" while the backend is waiting to auto-reconnect the configured hardware.
+  // system default while the backend is waiting to auto-reconnect the configured hardware.
   const configuredInputMissing = Boolean(
     config?.input_device &&
       devices &&
@@ -1315,11 +1507,11 @@ export function App() {
           >
             <span className="theme-branch if-dark">
               <Sun size={14} aria-hidden="true" />
-              <span className="visually-hidden">ライトモードに切り替え</span>
+              <span className="visually-hidden">{t.topbar.switchToLight}</span>
             </span>
             <span className="theme-branch if-light">
               <Moon size={14} aria-hidden="true" />
-              <span className="visually-hidden">ダークモードに切り替え</span>
+              <span className="visually-hidden">{t.topbar.switchToDark}</span>
             </span>
           </button>
           <button
@@ -1327,7 +1519,7 @@ export function App() {
             className={`icon-btn ${rescanning ? "is-busy" : ""}`}
             disabled={rescanning}
             onClick={() => void refreshDevicesAndConfig(true)}
-            aria-label="オーディオデバイスを再スキャン"
+            aria-label={t.topbar.rescanDevices}
           >
             <RefreshCw size={14} aria-hidden="true" />
           </button>
@@ -1337,8 +1529,8 @@ export function App() {
             onClick={openSettingsDialog}
             aria-label={
               updateInfo?.available
-                ? "アプリ設定を開く（新しいアップデートがあります）"
-                : "アプリ設定を開く"
+                ? t.topbar.openSettingsWithUpdate
+                : t.topbar.openSettings
             }
           >
             <Settings size={14} aria-hidden="true" />
@@ -1354,10 +1546,10 @@ export function App() {
           <div className="status-banner" role="status">
             <span className="status-banner-dot" aria-hidden="true" />
             <span>
-              <strong>マイク再接続待ち：</strong>
+              <strong>{t.banners.waitingMicPrefix}</strong>
               {telemetry?.waiting_device_name
-                ? `「${telemetry.waiting_device_name}」が接続されると自動で再開します。`
-                : "マイクが接続されると自動で再開します。"}
+                ? t.banners.waitingNamedMic(telemetry.waiting_device_name)
+                : t.banners.waitingAnyMic}
             </span>
           </div>
         )}
@@ -1365,7 +1557,7 @@ export function App() {
         {connState === "reconnecting" && (
           <div className="status-banner" role="status">
             <span className="status-banner-dot" aria-hidden="true" />
-            <span>オーディオストリームを自動復旧しています...</span>
+            <span>{t.banners.reconnectingStream}</span>
           </div>
         )}
 
@@ -1398,14 +1590,14 @@ export function App() {
                 htmlFor={ncSwitchId}
                 className="hero-title"
               >
-                AI ノイズキャンセリング
+                {t.hero.title}
               </label>
               <span
                 className={`nc-state-pill ${ncEnabled ? "on" : "off"}`}
                 aria-hidden="true"
               >
                 <span className="nc-state-dot" />
-                <span>{ncEnabled ? "ON" : "スルー"}</span>
+                <span>{ncEnabled ? t.hero.stateOn : t.hero.stateBypass}</span>
               </span>
             </div>
             <input
@@ -1427,11 +1619,15 @@ export function App() {
                 aria-hidden="true"
               />
               <span className="hero-mute-label">
-                {micMuted ? "マイクミュート中（無音）" : "マイク送信中"}
+                {micMuted ? t.hero.micMutedLabel : t.hero.micLiveLabel}
               </span>
               {config?.shortcut_toggle_mute && (
                 <kbd className="inline-kbd">
-                  {formatShortcutLabel(config.shortcut_toggle_mute, isMac)}
+                  {formatShortcutLabel(
+                    config.shortcut_toggle_mute,
+                    isMac,
+                    t.settings.unassigned
+                  )}
                 </kbd>
               )}
             </div>
@@ -1446,7 +1642,7 @@ export function App() {
               ) : (
                 <Mic size={12} aria-hidden="true" />
               )}
-              <span>{micMuted ? "ミュート解除" : "ミュート"}</span>
+              <span>{micMuted ? t.hero.unmuteBtn : t.hero.muteBtn}</span>
             </button>
           </div>
 
@@ -1455,6 +1651,7 @@ export function App() {
             outputMeterId={outputMeterId}
             ncEnabled={ncEnabled}
             micMuted={micMuted}
+            t={t}
           />
         </section>
 
@@ -1463,7 +1660,7 @@ export function App() {
           <div className="section-header">
             <h2 id={`${uid}-routing-heading`} className="section-title">
               <Waves size={14} aria-hidden="true" />
-              <span>入出力デバイス設定</span>
+              <span>{t.routing.sectionTitle}</span>
             </h2>
             <span
               className={`status-indicator ${
@@ -1473,15 +1670,15 @@ export function App() {
               <span className="status-dot" aria-hidden="true" />
               <span>
                 {telemetry?.virtual_out_connected
-                  ? "仮想マイク出力中"
-                  : "単体テストモード"}
+                  ? t.routing.statusVirtualActive
+                  : t.routing.statusStandaloneTest}
               </span>
             </span>
           </div>
 
           <div className="field">
             <label htmlFor={micSelectId} className="field-label">
-              使用する物理マイク
+              {t.routing.inputMicLabel}
             </label>
             <select
               id={micSelectId}
@@ -1496,10 +1693,10 @@ export function App() {
                 )
               }
             >
-              <option value="">システム既定のマイク (自動選択)</option>
+              <option value="">{t.routing.defaultMicOption}</option>
               {configuredInputMissing && config?.input_device && (
                 <option value={config.input_device}>
-                  {config.input_device} (未接続)
+                  {config.input_device} {t.routing.disconnectedSuffix}
                 </option>
               )}
               {devices?.inputs.map((d) => (
@@ -1513,7 +1710,7 @@ export function App() {
 
           <div className="field">
             <label htmlFor={virtSelectId} className="field-label">
-              仮想マイク出力先 (会議アプリ連携)
+              {t.routing.virtualOutLabel}
             </label>
             <select
               id={virtSelectId}
@@ -1528,15 +1725,17 @@ export function App() {
                 )
               }
             >
-              <option value="">出力しない (マイクテストのみ)</option>
+              <option value="">{t.routing.noVirtualOutOption}</option>
               {configuredOutputMissing && config?.output_device && (
                 <option value={config.output_device}>
-                  {config.output_device} (未接続)
+                  {config.output_device} {t.routing.disconnectedSuffix}
                 </option>
               )}
               {devices?.outputs.map((d) => (
                 <option key={d.name} value={d.name}>
-                  {d.is_virtual_cable ? "★推奨 [仮想] " : ""}
+                  {d.is_virtual_cable
+                    ? t.routing.recommendedVirtualPrefix
+                    : ""}
                   {d.name}
                 </option>
               ))}
@@ -1554,19 +1753,34 @@ export function App() {
                     marginInlineEnd: "0.3rem",
                   }}
                 />
-                <strong>仮想マイクが未導入です（会議アプリ連携用）：</strong>
+                <strong>{t.routing.driverMissingTitle}</strong>
                 <br />
-                {isMac ? (
+                {locale === "ja" ? (
+                  isMac ? (
+                    <>
+                      同梱の MIT ライセンス仮想マイク（
+                      <code>Shizuka Virtual Mic</code>
+                      ）をワンクリックで導入できます（再起動不要）。
+                    </>
+                  ) : (
+                    <>
+                      VB-Audio 公式の WHQL 署名済み仮想ケーブル（Donationware:
+                      vb-audio.com）を自動取得・サイレント導入します。導入後は会議アプリのマイクに{" "}
+                      <code>CABLE Output</code> を選択してください。
+                    </>
+                  )
+                ) : isMac ? (
                   <>
-                    同梱の MIT ライセンス仮想マイク（
-                    <code>Shizuka Virtual Mic</code>
-                    ）をワンクリックで導入できます（再起動不要）。
+                    Install the bundled MIT-licensed virtual mic (
+                    <code>Shizuka Virtual Mic</code>) in one click — no restart
+                    required.
                   </>
                 ) : (
                   <>
-                    VB-Audio 公式の WHQL 署名済み仮想ケーブル（Donationware:
-                    vb-audio.com）を自動取得・サイレント導入します。導入後は会議アプリのマイクに{" "}
-                    <code>CABLE Output</code> を選択してください。
+                    Automatically downloads and installs the official
+                    WHQL-signed VB-CABLE driver (Donationware: vb-audio.com).
+                    After setup, select <code>CABLE Output</code> as your
+                    microphone in your call app.
                   </>
                 )}
               </p>
@@ -1579,17 +1793,17 @@ export function App() {
                 {installingDriver ? (
                   <progress
                     className="loading-spinner"
-                    aria-label="ドライバをセットアップ中"
+                    aria-label={t.routing.driverSpinnerAria}
                   />
                 ) : (
                   <Download size={14} aria-hidden="true" />
                 )}
                 <span>
                   {installingDriver
-                    ? "公式ドライバを取得・セットアップ中..."
+                    ? t.routing.driverInstallingBtn
                     : isMac
-                    ? "Shizuka Virtual Mic (MIT) を導入"
-                    : "仮想マイクドライバを自動インストール"}
+                    ? t.routing.driverInstallMacBtn
+                    : t.routing.driverInstallWinBtn}
                 </span>
               </button>
             </div>
@@ -1628,7 +1842,7 @@ export function App() {
         <details className="disclosure-card" open>
           <summary>
             <Sliders size={14} aria-hidden="true" />
-            <span>除去強度・音質チューニング</span>
+            <span>{t.tuning.sectionTitle}</span>
             <span className="summary-meta">
               {modelVariant === "standard" ? "DFN3" : "DFN3-LL"} ·{" "}
               {attenValueText}
@@ -1636,7 +1850,9 @@ export function App() {
           </summary>
           <div className="disclosure-body">
             <fieldset className="segmented-fieldset">
-              <legend className="fieldset-legend">AI モデル選択</legend>
+              <legend className="fieldset-legend">
+                {t.tuning.aiModelLegend}
+              </legend>
               <div className="segmented-grid">
                 <label
                   htmlFor={modelStdId}
@@ -1652,7 +1868,7 @@ export function App() {
                     checked={modelVariant === "standard"}
                     onChange={() => void handleModelVariantChange("standard")}
                   />
-                  <span>高精度 DFN3 (推奨)</span>
+                  <span>{t.tuning.modelStandard}</span>
                 </label>
                 <label
                   htmlFor={modelLlId}
@@ -1670,13 +1886,15 @@ export function App() {
                       void handleModelVariantChange("low_latency")
                     }
                   />
-                  <span>超低遅延 DFN3-LL</span>
+                  <span>{t.tuning.modelLowLatency}</span>
                 </label>
               </div>
             </fieldset>
 
             <fieldset className="segmented-fieldset">
-              <legend className="fieldset-legend">ノイズ除去プリセット</legend>
+              <legend className="fieldset-legend">
+                {t.tuning.presetLegend}
+              </legend>
               <div className="segmented-grid">
                 <label
                   htmlFor={presetNatId}
@@ -1703,7 +1921,7 @@ export function App() {
                       )
                     }
                   />
-                  <span>ナチュラル</span>
+                  <span>{t.tuning.presetNatural}</span>
                 </label>
                 <label
                   htmlFor={presetBalId}
@@ -1730,7 +1948,7 @@ export function App() {
                       )
                     }
                   />
-                  <span>バランス (推奨)</span>
+                  <span>{t.tuning.presetBalanced}</span>
                 </label>
                 <label
                   htmlFor={presetMaxId}
@@ -1757,14 +1975,14 @@ export function App() {
                       )
                     }
                   />
-                  <span>最強 (打鍵音)</span>
+                  <span>{t.tuning.presetMax}</span>
                 </label>
               </div>
             </fieldset>
 
             <div className="slider-row">
               <div className="slider-top">
-                <label htmlFor={attenSliderId}>最大ノイズ減衰量</label>
+                <label htmlFor={attenSliderId}>{t.tuning.attenLabel}</label>
                 <span className="slider-val">{attenValueText}</span>
               </div>
               <input
@@ -1795,7 +2013,7 @@ export function App() {
 
             <div className="slider-row">
               <div className="slider-top">
-                <label htmlFor={gainSliderId}>マイク入力ゲイン補正</label>
+                <label htmlFor={gainSliderId}>{t.tuning.inputGainLabel}</label>
                 <span className="slider-val">{gainValueText}</span>
               </div>
               <input
@@ -1829,10 +2047,10 @@ export function App() {
               <div className="dsp-toggle-row">
                 <div className="dsp-toggle-copy">
                   <label htmlFor={hpfSwitchId} className="vad-title">
-                    低音ノイズカット
+                    {t.tuning.hpfTitle}
                   </label>
                   <span id={hpfHintId} className="field-hint">
-                    机やアームの振動、息が当たる音などの低い雑音を軽減
+                    {t.tuning.hpfHint}
                   </span>
                 </div>
                 <input
@@ -1863,12 +2081,12 @@ export function App() {
                 <div className="dsp-toggle-copy">
                   <div className="vad-title-group">
                     <label htmlFor={agcSwitchId} className="vad-title">
-                      音量の自動調整
+                      {t.tuning.agcTitle}
                     </label>
                     {agcEnabled && <AgcLiveBadge />}
                   </div>
                   <span id={agcHintId} className="field-hint">
-                    話している間だけ、声の大きさを聞き取りやすい音量にそろえます
+                    {t.tuning.agcHint}
                   </span>
                 </div>
                 <input
@@ -1900,14 +2118,17 @@ export function App() {
                   <div className="dsp-toggle-copy">
                     <div className="vad-title-group">
                       <label htmlFor={aecSwitchId} className="vad-title">
-                        エコー除去
+                        {t.tuning.aecTitle}
                       </label>
                       {aecEnabled && (
-                        <AecLiveBadge liveMonitorEnabled={liveMonitorEnabled} />
+                        <AecLiveBadge
+                          liveMonitorEnabled={liveMonitorEnabled}
+                          t={t}
+                        />
                       )}
                     </div>
                     <span id={aecHintId} className="field-hint">
-                      スピーカーから聞こえる声や音をマイクが拾うのを防止
+                      {t.tuning.aecHint}
                     </span>
                   </div>
                   <input
@@ -1937,7 +2158,7 @@ export function App() {
                 {aecEnabled && (
                   <div className="aec-ref-subpanel">
                     <label htmlFor={aecRefSelectId} className="field-label">
-                      使用中のスピーカー
+                      {t.tuning.aecSpeakerLabel}
                     </label>
                     <div className="select-with-icon">
                       <Volume2
@@ -1956,12 +2177,13 @@ export function App() {
                         }
                       >
                         <option value="">
-                          システム既定のスピーカー (自動選択)
+                          {t.tuning.aecDefaultSpeakerOption}
                         </option>
                         {configuredAecRefMissing &&
                           config?.aec_reference_device && (
                             <option value={config.aec_reference_device}>
-                              {config.aec_reference_device} (未接続)
+                              {config.aec_reference_device}{" "}
+                              {t.routing.disconnectedSuffix}
                             </option>
                           )}
                         {physicalOutputs.map((d) => (
@@ -1974,8 +2196,7 @@ export function App() {
                     </div>
                     {isMac && (
                       <span id={aecRefHintId} className="field-hint">
-                        初回有効化時のみ macOS のシステム音声録音の許可が必要です（macOS
-                        14.2+）
+                        {t.tuning.aecMacPermissionHint}
                       </span>
                     )}
                   </div>
@@ -1987,11 +2208,12 @@ export function App() {
               <div className="vad-header">
                 <div className="vad-title-group">
                   <label htmlFor={vadSwitchId} className="vad-title">
-                    話していない時は自動ミュート
+                    {t.tuning.vadTitle}
                   </label>
                   <VadLiveBadge
                     vadGateEnabled={vadGateEnabled}
                     ncEnabled={ncEnabled}
+                    t={t}
                   />
                 </div>
                 <input
@@ -2019,11 +2241,11 @@ export function App() {
 
               <div className="slider-row">
                 <div className="slider-top">
-                  <label htmlFor={vadSliderId}>消音の厳しさ</label>
+                  <label htmlFor={vadSliderId}>{t.tuning.vadSliderLabel}</label>
                   <span className="slider-val">{vadValueText}</span>
                 </div>
                 <span id={vadHintId} className="field-hint">
-                  上げるほど、話していない時のキーボード音や周囲の音をしっかり消します
+                  {t.tuning.vadSliderHint}
                 </span>
                 <input
                   id={vadSliderId}
@@ -2059,16 +2281,17 @@ export function App() {
                 <div className="dsp-toggle-copy">
                   <div className="vad-title-group">
                     <label htmlFor={voiceGateSwitchId} className="vad-title">
-                      周囲の話し声カット
+                      {t.tuning.voiceGateTitle}
                     </label>
                     <VoiceGateLiveBadge
                       voiceGateEnabled={voiceGateEnabled}
                       hasVoiceProfile={hasVoiceProfile}
                       ncEnabled={ncEnabled}
+                      t={t}
                     />
                   </div>
                   <span id={voiceGateHintId} className="field-hint">
-                    普段の会話からあなたの声を自動で覚え、家族の声やテレビの話し声を消音します
+                    {t.tuning.voiceGateHint}
                   </span>
                 </div>
                 <input
@@ -2099,7 +2322,7 @@ export function App() {
                           className="voice-enroll-check"
                           aria-hidden="true"
                         />
-                        <span role="status">あなたの声を記憶済み</span>
+                        <span role="status">{t.tuning.voiceEnrolledStatus}</span>
                       </div>
                       <button
                         type="button"
@@ -2107,12 +2330,13 @@ export function App() {
                         onClick={() => void handleResetVoiceProfile()}
                       >
                         <RefreshCw size={12} aria-hidden="true" />
-                        <span>覚え直す</span>
+                        <span>{t.tuning.voiceRelearnBtn}</span>
                       </button>
                     </div>
                   ) : (
                     <VoiceAutoLearnProgress
                       progressId={voiceEnrollProgressId}
+                      t={t}
                     />
                   )}
                 </div>
@@ -2121,11 +2345,13 @@ export function App() {
               {hasVoiceProfile && (
                 <div className="slider-row">
                   <div className="slider-top">
-                    <label htmlFor={voiceGateSliderId}>カットの厳しさ</label>
+                    <label htmlFor={voiceGateSliderId}>
+                      {t.tuning.voiceStrictnessLabel}
+                    </label>
                     <span className="slider-val">{voiceGateValueText}</span>
                   </div>
                   <span id={voiceGateSliderHintId} className="field-hint">
-                    かすれ声などで自分の声が途切れる時は下げ、周囲の話し声をより強く消したい時は上げます
+                    {t.tuning.voiceStrictnessHint}
                   </span>
                   <input
                     id={voiceGateSliderId}
@@ -2133,13 +2359,13 @@ export function App() {
                     type="range"
                     className="range-control"
                     min={0.16}
-                    max={0.40}
+                    max={0.4}
                     step={0.01}
                     value={voiceGateThresh}
                     disabled={!voiceGateEnabled}
                     aria-valuetext={voiceGateValueText}
                     aria-describedby={voiceGateSliderHintId}
-                    style={sliderCssVars(voiceGateThresh, 0.16, 0.40)}
+                    style={sliderCssVars(voiceGateThresh, 0.16, 0.4)}
                     onChange={(e) =>
                       void handleVoiceGateChange(
                         voiceGateEnabled,
@@ -2157,11 +2383,11 @@ export function App() {
         <details className="disclosure-card" open>
           <summary>
             <Headphones size={14} aria-hidden="true" />
-            <span>マイクテスト</span>
+            <span>{t.micTest.sectionTitle}</span>
             {liveMonitorEnabled && (
               <span className="test-live-pill" aria-hidden="true">
                 <span className="test-live-dot" />
-                <span>テスト中</span>
+                <span>{t.micTest.testingBadge}</span>
               </span>
             )}
           </summary>
@@ -2175,7 +2401,7 @@ export function App() {
                 }`}
                 aria-pressed={liveMonitorEnabled}
                 aria-label={
-                  liveMonitorEnabled ? "マイクテストを停止" : "マイクテストを開始"
+                  liveMonitorEnabled ? t.micTest.stopAria : t.micTest.startAria
                 }
                 onClick={() => void handleToggleLiveMonitor()}
               >
@@ -2186,18 +2412,19 @@ export function App() {
                 )}
               </button>
               <label htmlFor={monMeterId} className="visually-hidden">
-                マイクテスト音量レベル
+                {t.micTest.meterLabel}
               </label>
               <MicTestLiveMeter
                 monMeterId={monMeterId}
                 liveMonitorEnabled={liveMonitorEnabled}
+                t={t}
               />
             </div>
 
             {/* Row 2: Instant Denoised / Raw Audio A/B Toggle */}
             <fieldset className="segmented-fieldset mic-test-mode">
               <legend className="visually-hidden">
-                マイクテストの音声モード
+                {t.micTest.modeLegend}
               </legend>
               <div className="segmented-grid">
                 <label
@@ -2212,7 +2439,7 @@ export function App() {
                     checked={monitorClean}
                     onChange={() => void handleMonitorModeChange(true)}
                   />
-                  <span>ノイズ除去</span>
+                  <span>{t.micTest.modeDenoised}</span>
                 </label>
                 <label
                   htmlFor={monRawId}
@@ -2226,7 +2453,7 @@ export function App() {
                     checked={!monitorClean}
                     onChange={() => void handleMonitorModeChange(false)}
                   />
-                  <span>生音声</span>
+                  <span>{t.micTest.modeRaw}</span>
                 </label>
               </div>
             </fieldset>
@@ -2239,7 +2466,7 @@ export function App() {
                 ) : (
                   <Volume2 size={15} aria-hidden="true" />
                 )}
-                <span className="visually-hidden">マイクテスト出力音量</span>
+                <span className="visually-hidden">{t.micTest.volumeLabel}</span>
               </label>
               <input
                 id={monVolSliderId}
@@ -2264,7 +2491,7 @@ export function App() {
             {/* Row 4: Compact Speaker / Headphone Dropdown */}
             <div className="select-with-icon">
               <label htmlFor={monSelectId} className="visually-hidden">
-                テスト再生用スピーカー / ヘッドホン
+                {t.micTest.speakerLabel}
               </label>
               <Volume2
                 size={14}
@@ -2284,10 +2511,10 @@ export function App() {
                   )
                 }
               >
-                <option value="">既定のスピーカー / ヘッドホン</option>
+                <option value="">{t.micTest.defaultSpeakerOption}</option>
                 {configuredMonitorMissing && config?.monitor_device && (
                   <option value={config.monitor_device}>
-                    {config.monitor_device} (未接続)
+                    {config.monitor_device} {t.routing.disconnectedSuffix}
                   </option>
                 )}
                 {physicalOutputs.map((d) => (
@@ -2302,13 +2529,13 @@ export function App() {
       </main>
 
       <footer className="footer-bar">
-        <span>[×] でバックグラウンド動作</span>
+        <span>{t.footer.closeRunsInBackground}</span>
         <button
           type="button"
           className="quit-btn"
           onClick={() => void handleQuit()}
         >
-          アプリを終了
+          {t.footer.quitBtn}
         </button>
       </footer>
 
@@ -2323,30 +2550,178 @@ export function App() {
       >
         <div className="settings-dialog-panel">
           <div className="settings-dialog-header">
-            <h2 id={settingsTitleId} className="settings-dialog-title">
-              <Settings size={14} aria-hidden="true" />
-              <span>アプリ設定</span>
-            </h2>
+            <div className="settings-header-start">
+              {settingsView === "release_notes" && (
+                <button
+                  ref={releaseNotesBackRef}
+                  type="button"
+                  className="icon-btn settings-back-btn"
+                  onClick={returnToSettingsMain}
+                  aria-label={t.settings.backToSettingsAria}
+                >
+                  <ArrowLeft size={14} aria-hidden="true" />
+                </button>
+              )}
+              <h2 id={settingsTitleId} className="settings-dialog-title">
+                {settingsView === "release_notes" ? (
+                  <>
+                    <FileText size={14} aria-hidden="true" />
+                    <span>{t.settings.releaseNotesTitle}</span>
+                  </>
+                ) : (
+                  <>
+                    <Settings size={14} aria-hidden="true" />
+                    <span>{t.settings.title}</span>
+                  </>
+                )}
+              </h2>
+            </div>
             <button
               type="button"
               className="icon-btn"
               onClick={() => void closeSettingsDialog()}
-              aria-label="アプリ設定を閉じる"
+              aria-label={t.settings.closeAria}
             >
               <X size={14} aria-hidden="true" />
             </button>
           </div>
 
-          <div className="settings-dialog-body">
+          {settingsView === "release_notes" ? (
+            <div className="settings-dialog-body release-notes-body">
+              {allReleaseEntries.map((entry, idx) => {
+                const isAvailable = Boolean(
+                  updateInfo?.available &&
+                    updateInfo.latest_version === entry.version
+                );
+                const isCurrent =
+                  !isAvailable &&
+                  (displayVersion
+                    ? entry.version === displayVersion
+                    : idx === 0);
+                const entryTitle = getReleaseTitle(entry, locale);
+                const entryItems = getReleaseItems(entry, locale);
+
+                return (
+                  <details
+                    key={entry.version}
+                    className={`release-entry-card ${
+                      isAvailable ? "is-available" : ""
+                    }`}
+                    open={isAvailable || isCurrent}
+                  >
+                    <summary className="release-entry-summary">
+                      <div className="release-summary-content">
+                        <div className="release-summary-top">
+                          <span className="release-version-tag">
+                            v{entry.version}
+                          </span>
+                          {isAvailable && (
+                            <span className="release-version-pill is-available">
+                              {t.settings.badgeAvailable}
+                            </span>
+                          )}
+                          {isCurrent && (
+                            <span className="release-version-pill is-current">
+                              {t.settings.badgeCurrent}
+                            </span>
+                          )}
+                          {entry.date && (
+                            <span className="release-date">{entry.date}</span>
+                          )}
+                        </div>
+                        {entryTitle && (
+                          <span className="release-summary-subtitle">
+                            {entryTitle}
+                          </span>
+                        )}
+                      </div>
+                    </summary>
+                    <div className="release-entry-body">
+                      <ReleaseBulletList items={entryItems} />
+                    </div>
+                  </details>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="settings-dialog-body">
             <div className="settings-group">
-              <span className="settings-group-label">起動設定</span>
+              <span className="settings-group-label">
+                {t.settings.generalGroup}
+              </span>
+
+              <fieldset className="segmented-fieldset">
+                <legend className="fieldset-legend">
+                  {t.settings.languageLegend}
+                </legend>
+                <div className="segmented-grid">
+                  <label
+                    htmlFor={langAutoId}
+                    className={`seg-option ${
+                      languagePref === "auto" ? "is-selected" : ""
+                    }`}
+                  >
+                    <input
+                      ref={
+                        languagePref === "auto" ? activeLangInputRef : undefined
+                      }
+                      id={langAutoId}
+                      type="radio"
+                      name="app_language"
+                      className="visually-hidden"
+                      checked={languagePref === "auto"}
+                      onChange={() => void handleLanguageChange("auto")}
+                    />
+                    <span>{t.settings.languageAuto}</span>
+                  </label>
+                  <label
+                    htmlFor={langJaId}
+                    className={`seg-option ${
+                      languagePref === "ja" ? "is-selected" : ""
+                    }`}
+                  >
+                    <input
+                      ref={
+                        languagePref === "ja" ? activeLangInputRef : undefined
+                      }
+                      id={langJaId}
+                      type="radio"
+                      name="app_language"
+                      className="visually-hidden"
+                      checked={languagePref === "ja"}
+                      onChange={() => void handleLanguageChange("ja")}
+                    />
+                    <span lang="ja">日本語</span>
+                  </label>
+                  <label
+                    htmlFor={langEnId}
+                    className={`seg-option ${
+                      languagePref === "en" ? "is-selected" : ""
+                    }`}
+                  >
+                    <input
+                      ref={
+                        languagePref === "en" ? activeLangInputRef : undefined
+                      }
+                      id={langEnId}
+                      type="radio"
+                      name="app_language"
+                      className="visually-hidden"
+                      checked={languagePref === "en"}
+                      onChange={() => void handleLanguageChange("en")}
+                    />
+                    <span lang="en">English</span>
+                  </label>
+                </div>
+              </fieldset>
+
               <div className="settings-toggle-row">
                 <div className="settings-toggle-copy">
                   <label
                     htmlFor={autostartSwitchId}
                     className="settings-toggle-title"
                   >
-                    OS 起動時にバックグラウンドで自動起動
+                    {t.settings.autostartTitle}
                   </label>
                 </div>
                 <input
@@ -2373,18 +2748,24 @@ export function App() {
 
             <div className="settings-group">
               <span className="settings-group-label">
-                グローバルショートカット・操作音
+                {t.settings.shortcutsGroup}
               </span>
 
               <div className="shortcut-row">
                 <div className="shortcut-copy">
-                  <span className="shortcut-title">ノイズ除去 ON / OFF</span>
+                  <span className="shortcut-title">
+                    {t.settings.shortcutToggleNc}
+                  </span>
                   <kbd
                     className={`shortcut-kbd ${
                       config?.shortcut_toggle_nc ? "" : "is-empty"
                     }`}
                   >
-                    {formatShortcutLabel(config?.shortcut_toggle_nc, isMac)}
+                    {formatShortcutLabel(
+                      config?.shortcut_toggle_nc,
+                      isMac,
+                      t.settings.unassigned
+                    )}
                   </kbd>
                 </div>
                 <div className="shortcut-actions">
@@ -2399,11 +2780,11 @@ export function App() {
                     <Keyboard size={12} aria-hidden="true" />
                     <span>
                       {recordingAction === "toggle_nc"
-                        ? "キーを入力 (Esc取消)"
-                        : "設定"}
+                        ? t.settings.recordingPrompt
+                        : t.settings.recordBtn}
                     </span>
                     <span className="visually-hidden">
-                      （ノイズ除去 ON/OFF）
+                      {t.settings.recordNcContext}
                     </span>
                   </button>
                   {config?.shortcut_toggle_nc && (
@@ -2411,7 +2792,7 @@ export function App() {
                       type="button"
                       className="icon-btn shortcut-clear-btn"
                       onClick={() => void handleClearShortcut("toggle_nc")}
-                      aria-label="ノイズ除去 ON/OFF のショートカットを解除"
+                      aria-label={t.settings.clearNcAria}
                     >
                       <X size={12} aria-hidden="true" />
                     </button>
@@ -2421,13 +2802,19 @@ export function App() {
 
               <div className="shortcut-row">
                 <div className="shortcut-copy">
-                  <span className="shortcut-title">マイクミュート</span>
+                  <span className="shortcut-title">
+                    {t.settings.shortcutToggleMute}
+                  </span>
                   <kbd
                     className={`shortcut-kbd ${
                       config?.shortcut_toggle_mute ? "" : "is-empty"
                     }`}
                   >
-                    {formatShortcutLabel(config?.shortcut_toggle_mute, isMac)}
+                    {formatShortcutLabel(
+                      config?.shortcut_toggle_mute,
+                      isMac,
+                      t.settings.unassigned
+                    )}
                   </kbd>
                 </div>
                 <div className="shortcut-actions">
@@ -2442,17 +2829,19 @@ export function App() {
                     <Keyboard size={12} aria-hidden="true" />
                     <span>
                       {recordingAction === "toggle_mute"
-                        ? "キーを入力 (Esc取消)"
-                        : "設定"}
+                        ? t.settings.recordingPrompt
+                        : t.settings.recordBtn}
                     </span>
-                    <span className="visually-hidden">（マイクミュート）</span>
+                    <span className="visually-hidden">
+                      {t.settings.recordMuteContext}
+                    </span>
                   </button>
                   {config?.shortcut_toggle_mute && (
                     <button
                       type="button"
                       className="icon-btn shortcut-clear-btn"
                       onClick={() => void handleClearShortcut("toggle_mute")}
-                      aria-label="マイクミュートのショートカットを解除"
+                      aria-label={t.settings.clearMuteAria}
                     >
                       <X size={12} aria-hidden="true" />
                     </button>
@@ -2466,11 +2855,10 @@ export function App() {
                     htmlFor={cueSoundSwitchId}
                     className="settings-toggle-title"
                   >
-                    ショートカット操作音
+                    {t.settings.shortcutSoundTitle}
                   </label>
                   <span id={cueSoundHintId} className="field-hint">
-                    ホットキーや{isMac ? "メニューバー" : "通知領域"}
-                    からの切替時に控えめな確認音を鳴らします
+                    {t.settings.shortcutSoundHint(isMac)}
                   </span>
                 </div>
                 <input
@@ -2496,8 +2884,10 @@ export function App() {
             </div>
 
             <div className="settings-group">
-              <span className="settings-group-label">自動復旧・診断情報</span>
-              <SettingsDiagGrid connState={connState} />
+              <span className="settings-group-label">
+                {t.settings.diagnosticsGroup}
+              </span>
+              <SettingsDiagGrid connState={connState} t={t} />
               <button
                 type="button"
                 className="btn"
@@ -2509,7 +2899,9 @@ export function App() {
                   <ClipboardCopy size={14} aria-hidden="true" />
                 )}
                 <span>
-                  {diagCopied ? "診断情報をコピーしました" : "診断情報をコピー"}
+                  {diagCopied
+                    ? t.settings.diagCopiedBtn
+                    : t.settings.diagCopyBtn}
                 </span>
               </button>
               {diagError && (
@@ -2520,7 +2912,9 @@ export function App() {
             </div>
 
             <div className="settings-group">
-              <span className="settings-group-label">アップデート</span>
+              <span className="settings-group-label">
+                {t.settings.updatesGroup}
+              </span>
               <div className="update-card">
                 <div className="update-card-top">
                   <div className="update-copy">
@@ -2529,14 +2923,15 @@ export function App() {
                     </span>
                     <span className="field-hint" role="status">
                       {updateChecking
-                        ? "最新バージョンを確認しています..."
-                        : updateInfo?.available
-                        ? `v${updateInfo.latest_version} が利用可能です${
-                            updateInfo.is_portable ? "（ポータブル版）" : ""
-                          }`
+                        ? t.settings.updateChecking
+                        : updateInfo?.available && updateInfo.latest_version
+                        ? t.settings.updateAvailable(
+                            updateInfo.latest_version,
+                            updateInfo.is_portable
+                          )
                         : updateInfo
-                        ? "最新バージョンです"
-                        : "最新版をオンラインで確認できます"}
+                        ? t.settings.updateUpToDate
+                        : t.settings.updateCheckPrompt}
                     </span>
                   </div>
                   <button
@@ -2548,24 +2943,35 @@ export function App() {
                     {updateChecking ? (
                       <progress
                         className="loading-spinner"
-                        aria-label="アップデートを確認中"
+                        aria-label={t.settings.updateCheckingSpinnerAria}
                       />
                     ) : (
                       <RefreshCw size={12} aria-hidden="true" />
                     )}
-                    <span>更新を確認</span>
+                    <span>{t.settings.updateCheckBtn}</span>
                   </button>
                 </div>
 
                 {updateInfo?.available && (
                   <div className="update-action-box">
+                    {pendingUpdateItems.length > 0 && (
+                      <div className="update-notes-preview">
+                        <span className="update-notes-heading">
+                          {t.settings.whatsNewHeading(
+                            updateInfo.latest_version ?? ""
+                          )}
+                        </span>
+                        <ReleaseBulletList items={pendingUpdateItems} compact />
+                      </div>
+                    )}
+
                     {updateInstalling && (
                       <div className="update-progress-wrap">
                         <div className="slider-top">
                           <label htmlFor={updateProgressId}>
                             {updateProgress.phase === "installing"
-                              ? "インストールを適用しています..."
-                              : "アップデートをダウンロード中..."}
+                              ? t.settings.updateInstallingProgress
+                              : t.settings.updateDownloadingProgress}
                           </label>
                           {updateProgress.total_bytes &&
                             updateProgress.total_bytes > 0 && (
@@ -2606,8 +3012,7 @@ export function App() {
                     {updateInfo.is_portable ? (
                       <>
                         <span className="field-hint">
-                          ポータブル版は自動上書きに対応していないため、GitHub
-                          Releases から最新版を取得してください。
+                          {t.settings.updatePortableHint}
                         </span>
                         <button
                           type="button"
@@ -2615,7 +3020,7 @@ export function App() {
                           onClick={() => void handleOpenReleasesPage()}
                         >
                           <ExternalLink size={14} aria-hidden="true" />
-                          <span>Releases ページを開く</span>
+                          <span>{t.settings.openReleasesBtn}</span>
                         </button>
                       </>
                     ) : (
@@ -2628,8 +3033,10 @@ export function App() {
                         <Download size={14} aria-hidden="true" />
                         <span>
                           {updateInstalling
-                            ? "アップデートを適用中..."
-                            : `v${updateInfo.latest_version} へ今すぐアップデート`}
+                            ? t.settings.updateApplyingBtn
+                            : t.settings.updateNowBtn(
+                                updateInfo.latest_version ?? ""
+                              )}
                         </span>
                       </button>
                     )}
@@ -2641,14 +3048,49 @@ export function App() {
                     {updateError}
                   </div>
                 )}
+
+                <div className="update-links-row">
+                  <button
+                    ref={releaseNotesTriggerRef}
+                    type="button"
+                    className="shortcut-record-btn update-link-btn"
+                    onClick={openReleaseNotesView}
+                  >
+                    <FileText size={12} aria-hidden="true" />
+                    <span>{t.settings.releaseNotesBtn}</span>
+                  </button>
+                  {!(updateInfo?.available && updateInfo.is_portable) && (
+                    <button
+                      type="button"
+                      className="shortcut-record-btn update-link-btn"
+                      onClick={() => void handleOpenReleasesPage()}
+                      aria-label={t.settings.openGithubReleasesAria}
+                    >
+                      <ExternalLink size={12} aria-hidden="true" />
+                      <span>{t.settings.githubReleasesBtn}</span>
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
+          )}
 
           <div className="settings-dialog-footer">
             <span>
               {displayVersion ? `Shizuka v${displayVersion}` : "Shizuka"}
             </span>
+            {settingsView === "release_notes" && (
+              <button
+                type="button"
+                className="footer-link-btn"
+                onClick={() => void handleOpenReleasesPage()}
+                aria-label={t.settings.openGithubReleasesAria}
+              >
+                <span>{t.settings.githubReleasesBtn}</span>
+                <ExternalLink size={11} aria-hidden="true" />
+              </button>
+            )}
           </div>
         </div>
       </dialog>

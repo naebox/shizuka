@@ -25,6 +25,7 @@ use crate::audio::speaker::{
 };
 use crate::config::{AppConfig, ConfigSaver, ModelVariant};
 use crate::diagnostics;
+use crate::i18n::{self, tr, Locale};
 
 #[inline]
 fn store_f32(atom: &AtomicU32, val: f32) {
@@ -46,6 +47,14 @@ pub enum ConnectionState {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorSource {
+    Pipeline,
+    VirtualOutput,
+    Monitor,
+    Aec,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineDeviceStatus {
     pub connection_state: ConnectionState,
@@ -60,6 +69,8 @@ pub struct EngineDeviceStatus {
     pub input_drop_count: u64,
     pub output_underrun_count: u64,
     pub last_error: Option<String>,
+    #[serde(skip)]
+    pub(crate) last_error_source: Option<ErrorSource>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -740,12 +751,9 @@ fn audio_control_loop(
                     shared.live_monitor_enabled.store(true, Ordering::Relaxed);
                     if let Ok(mut st) = shared.status.lock() {
                         st.active_monitor_name = Some(actual_mon_name);
-                        if st
-                            .last_error
-                            .as_deref()
-                            .is_some_and(|e| e.contains("再生デバイス") || e.contains("マイクテスト"))
-                        {
+                        if st.last_error_source == Some(ErrorSource::Monitor) {
                             st.last_error = None;
+                            st.last_error_source = None;
                         }
                     }
                     true
@@ -756,6 +764,7 @@ fn audio_control_loop(
                     if let Ok(mut st) = shared.status.lock() {
                         st.active_monitor_name = None;
                         st.last_error = Some(format!("{:#}", e));
+                        st.last_error_source = Some(ErrorSource::Monitor);
                     }
                     false
                 }
@@ -792,13 +801,9 @@ fn audio_control_loop(
             wd.next_aec_reattach_at = None;
             if let Ok(mut st) = shared.status.lock() {
                 st.active_aec_ref_name = None;
-                if !want_aec
-                    && st
-                        .last_error
-                        .as_deref()
-                        .is_some_and(|e| e.contains("エコー除去"))
-                {
+                if !want_aec && st.last_error_source == Some(ErrorSource::Aec) {
                     st.last_error = None;
+                    st.last_error_source = None;
                 }
             }
             return;
@@ -829,12 +834,9 @@ fn audio_control_loop(
                     ));
                     if let Ok(mut st) = shared.status.lock() {
                         st.active_aec_ref_name = Some(actual_ref_name);
-                        if st
-                            .last_error
-                            .as_deref()
-                            .is_some_and(|e| e.contains("エコー除去"))
-                        {
+                        if st.last_error_source == Some(ErrorSource::Aec) {
                             st.last_error = None;
+                            st.last_error_source = None;
                         }
                     }
                 }
@@ -848,6 +850,7 @@ fn audio_control_loop(
                         st.active_aec_ref_name = None;
                         if wd.aec_reattach_attempt == 0 {
                             st.last_error = Some(format!("{:#}", e));
+                            st.last_error_source = Some(ErrorSource::Aec);
                         }
                     }
                     wd.next_aec_reattach_at = Some(
@@ -954,6 +957,7 @@ fn audio_control_loop(
                     st.active_monitor_name = None;
                     st.active_aec_ref_name = None;
                     st.last_error = None;
+                    st.last_error_source = None;
                 }
                 wd.next_retry_at = Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
                 wd.retry_attempt = wd.retry_attempt.saturating_add(1);
@@ -977,6 +981,7 @@ fn audio_control_loop(
                     st.active_monitor_name = None;
                     st.active_aec_ref_name = None;
                     st.last_error = Some(format!("{:#}", e));
+                    st.last_error_source = Some(ErrorSource::Pipeline);
                 }
                 wd.next_retry_at = Some(Instant::now() + reconnect_backoff_duration(wd.retry_attempt));
                 wd.retry_attempt = wd.retry_attempt.saturating_add(1);
@@ -1230,10 +1235,17 @@ fn audio_control_loop(
                                     &mut live_mon_pipe,
                                 );
                                 if let Ok(mut st) = shared.status.lock() {
-                                    st.last_error = Some(format!(
-                                        "マイクテスト再生デバイスが切断されました: {}",
-                                        message
-                                    ));
+                                    st.last_error = Some(match i18n::current_locale() {
+                                        Locale::Ja => format!(
+                                            "マイクテスト再生デバイスが切断されました: {}",
+                                            message
+                                        ),
+                                        Locale::En => format!(
+                                            "Mic Test playback device disconnected: {}",
+                                            message
+                                        ),
+                                    });
+                                    st.last_error_source = Some(ErrorSource::Monitor);
                                 }
                                 if !want_mon {
                                     wd.aec_reattach_attempt = 0;
@@ -1282,13 +1294,20 @@ fn audio_control_loop(
                                     st.connection_state = ConnectionState::WaitingDevice;
                                     st.waiting_device_name = cur_in_dev.clone();
                                     st.last_error = None;
+                                    st.last_error_source = None;
                                 } else {
                                     st.connection_state = ConnectionState::Reconnecting;
                                     st.waiting_device_name = cur_in_dev.clone();
-                                    st.last_error = Some(format!(
-                                        "オーディオストリームを再接続しています: {}",
-                                        message
-                                    ));
+                                    st.last_error = Some(match i18n::current_locale() {
+                                        Locale::Ja => format!(
+                                            "オーディオストリームを再接続しています: {}",
+                                            message
+                                        ),
+                                        Locale::En => {
+                                            format!("Reconnecting audio stream: {}", message)
+                                        }
+                                    });
+                                    st.last_error_source = Some(ErrorSource::Pipeline);
                                 }
                             }
                             // Preserve exponential backoff on flapping streams (healthy streams already reset retry_attempt after 10s)
@@ -1564,18 +1583,39 @@ fn build_live_monitor_stream(
     let explicit = mon_name.filter(|s| !s.is_empty());
     let mon_dev = find_output_device(explicit, explicit.is_none()).ok_or_else(|| {
         if let Some(name) = explicit {
-            anyhow!(
-                "指定された再生デバイス「{}」が見つかりません（スピーカーへの誤出力を防ぐためマイクテストを停止しました）",
-                name
-            )
+            match i18n::current_locale() {
+                Locale::Ja => anyhow!(
+                    "指定された再生デバイス「{}」が見つかりません（スピーカーへの誤出力を防ぐためマイクテストを停止しました）",
+                    name
+                ),
+                Locale::En => anyhow!(
+                    "Playback device \"{}\" was not found (Mic Test was stopped to prevent accidental speaker feedback)",
+                    name
+                ),
+            }
         } else {
-            anyhow!("マイクテスト用のスピーカー／ヘッドホンが見つかりません")
+            anyhow!(
+                "{}",
+                tr(
+                    "マイクテスト用のスピーカー／ヘッドホンが見つかりません",
+                    "No speakers or headphones found for Mic Test"
+                )
+            )
         }
     })?;
     let actual_mon_name = device_name(&mon_dev).unwrap_or_else(|| "Default Output".to_string());
     let supported_mon = mon_dev
         .default_output_config()
-        .with_context(|| format!("再生デバイス「{}」のフォーマット取得に失敗しました", actual_mon_name))?;
+        .with_context(|| match i18n::current_locale() {
+            Locale::Ja => format!(
+                "再生デバイス「{}」のフォーマット取得に失敗しました",
+                actual_mon_name
+            ),
+            Locale::En => format!(
+                "Failed to query audio format for playback device \"{}\"",
+                actual_mon_name
+            ),
+        })?;
     let mon_fmt = supported_mon.sample_format();
     let mon_cfg: StreamConfig = supported_mon.into();
     let sr_mon = mon_cfg.sample_rate;
@@ -1597,10 +1637,25 @@ fn build_live_monitor_stream(
         None,
         err_notifier,
     )
-    .with_context(|| format!("再生デバイス「{}」のストリーム作成に失敗しました", actual_mon_name))?;
+    .with_context(|| match i18n::current_locale() {
+        Locale::Ja => format!(
+            "再生デバイス「{}」のストリーム作成に失敗しました",
+            actual_mon_name
+        ),
+        Locale::En => format!(
+            "Failed to create output stream for playback device \"{}\"",
+            actual_mon_name
+        ),
+    })?;
     stream
         .play()
-        .with_context(|| format!("再生デバイス「{}」の再生開始に失敗しました", actual_mon_name))?;
+        .with_context(|| match i18n::current_locale() {
+            Locale::Ja => format!(
+                "再生デバイス「{}」の再生開始に失敗しました",
+                actual_mon_name
+            ),
+            Locale::En => format!("Failed to start playback on device \"{}\"", actual_mon_name),
+        })?;
 
     Ok((
         MonitorPipeline { _stream: stream },
@@ -1647,7 +1702,10 @@ fn build_main_pipeline(
     *last_profile_mic = Some(actual_in_name.clone());
     let supported_in = in_dev
         .default_input_config()
-        .context("マイクの標準入力フォーマットを取得できません")
+        .context(tr(
+            "マイクの標準入力フォーマットを取得できません",
+            "Failed to query default microphone input format",
+        ))
         .map_err(PipelineStartError::Other)?;
     let in_sample_format = supported_in.sample_format();
     let mut in_cfg: StreamConfig = supported_in.into();
@@ -1711,25 +1769,43 @@ fn build_main_pipeline(
                             virtual_stream_opt = Some(stream);
                         }
                         Err(e) => {
-                            virtual_out_warning = Some(format!(
-                                "仮想出力「{}」のストリーム作成に失敗しました: {:#}",
-                                resolved_out_name, e
-                            ));
+                            virtual_out_warning = Some(match i18n::current_locale() {
+                                Locale::Ja => format!(
+                                    "仮想出力「{}」のストリーム作成に失敗しました: {:#}",
+                                    resolved_out_name, e
+                                ),
+                                Locale::En => format!(
+                                    "Failed to create stream for virtual output \"{}\": {:#}",
+                                    resolved_out_name, e
+                                ),
+                            });
                         }
                     }
                 }
                 Err(e) => {
-                    virtual_out_warning = Some(format!(
-                        "仮想出力「{}」のフォーマット取得に失敗しました: {}",
-                        target_out, e
-                    ));
+                    virtual_out_warning = Some(match i18n::current_locale() {
+                        Locale::Ja => format!(
+                            "仮想出力「{}」のフォーマット取得に失敗しました: {}",
+                            target_out, e
+                        ),
+                        Locale::En => format!(
+                            "Failed to query format for virtual output \"{}\": {}",
+                            target_out, e
+                        ),
+                    });
                 }
             },
             None => {
-                virtual_out_warning = Some(format!(
-                    "仮想出力「{}」が見つかりません（再接続待ち）",
-                    target_out
-                ));
+                virtual_out_warning = Some(match i18n::current_locale() {
+                    Locale::Ja => format!(
+                        "仮想出力「{}」が見つかりません（再接続待ち）",
+                        target_out
+                    ),
+                    Locale::En => format!(
+                        "Virtual output \"{}\" not found (waiting to reconnect)",
+                        target_out
+                    ),
+                });
             }
         }
     }
@@ -2168,7 +2244,13 @@ fn build_main_pipeline(
     init_rx
         .recv()
         .map_err(|_| {
-            PipelineStartError::Other(anyhow!("AI推論スレッドの初期化待機中に中断されました"))
+            PipelineStartError::Other(anyhow!(
+                "{}",
+                tr(
+                    "AI推論スレッドの初期化待機中に中断されました",
+                    "Interrupted while waiting for AI inference thread initialization"
+                )
+            ))
         })?
         .map_err(PipelineStartError::Other)?;
 
@@ -2181,11 +2263,11 @@ fn build_main_pipeline(
             Err(e) => {
                 let label = actual_out_name
                     .take()
-                    .unwrap_or_else(|| "仮想出力".to_string());
-                virtual_out_warning = Some(format!(
-                    "仮想出力「{}」の再生開始に失敗しました: {}",
-                    label, e
-                ));
+                    .unwrap_or_else(|| tr("仮想出力", "Virtual Output").to_string());
+                virtual_out_warning = Some(match i18n::current_locale() {
+                    Locale::Ja => format!("仮想出力「{}」の再生開始に失敗しました: {}", label, e),
+                    Locale::En => format!("Failed to start virtual output \"{}\": {}", label, e),
+                });
             }
         }
     }
@@ -2210,7 +2292,10 @@ fn build_main_pipeline(
     .map_err(PipelineStartError::Other)?;
     input_stream
         .play()
-        .context("マイク入力ストリームの開始に失敗しました")
+        .context(tr(
+            "マイク入力ストリームの開始に失敗しました",
+            "Failed to start microphone input stream",
+        ))
         .map_err(PipelineStartError::Other)?;
 
     let virt_connected = virtual_stream_opt.is_some();
@@ -2226,6 +2311,11 @@ fn build_main_pipeline(
         st.active_output_name = actual_out_name;
         st.input_sample_rate = sr_in;
         st.output_sample_rate = sr_out;
+        st.last_error_source = if virtual_out_warning.is_some() {
+            Some(ErrorSource::VirtualOutput)
+        } else {
+            None
+        };
         st.last_error = virtual_out_warning;
     }
 
@@ -2343,7 +2433,10 @@ fn build_input_stream_to_rb(
             shared,
             err_notifier,
         ),
-        other => Err(anyhow!("未対応の入力サンプル形式: {:?}", other)),
+        other => Err(match i18n::current_locale() {
+            Locale::Ja => anyhow!("未対応の入力サンプル形式: {:?}", other),
+            Locale::En => anyhow!("Unsupported input sample format: {:?}", other),
+        }),
     }
 }
 
@@ -2652,7 +2745,10 @@ fn build_output_stream_from_rb(
             underrun_shared,
             err_notifier,
         ),
-        other => Err(anyhow!("未対応の出力サンプル形式: {:?}", other)),
+        other => Err(match i18n::current_locale() {
+            Locale::Ja => anyhow!("未対応の出力サンプル形式: {:?}", other),
+            Locale::En => anyhow!("Unsupported output sample format: {:?}", other),
+        }),
     }
 }
 

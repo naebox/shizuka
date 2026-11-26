@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Validates unified version across Shizuka manifests and extracts release notes
- * for a given version from CHANGELOG.md.
+ * Validates unified version across Shizuka manifests and extracts bilingual (JA / EN)
+ * release notes for a given version from CHANGELOG.md.
  *
  * Used by:
- * - `.github/workflows/ci.yml` (`--check-manifests`) so forgetting CHANGELOG.md fails CI immediately
+ * - `.github/workflows/ci.yml` (`--check-manifests`) so forgetting CHANGELOG.md (or either language) fails CI immediately
  * - `.github/workflows/release.yml` (`--check-manifests --markdown-out ... --summary-out ...`)
- *   so GitHub Releases and `latest.json` always contain human-readable Japanese release notes.
+ *   so GitHub Releases and `latest.json` always contain bilingual Japanese & English release notes.
  */
 
 import fs from "node:fs";
@@ -117,7 +117,7 @@ function extractChangelogEntry(changelogPath, version) {
   if (startIdx === -1) {
     throw new Error(
       `CHANGELOG.md is missing a section for version ${version}. ` +
-        `Add '## [${version}] (YYYY-MM-DD) — <変更概要>' and bullet points before releasing.`
+        `Add '## [${version}] (YYYY-MM-DD) — <変更概要 / Summary>' with '### 主な変更点' and '### What's Changed' before releasing.`
     );
   }
 
@@ -150,6 +150,14 @@ function extractChangelogEntry(changelogPath, version) {
     );
   }
 
+  const hasJaHeading = /^###\s+主な変更点\s*$/m.test(body);
+  const hasEnHeading = /^###\s+What's Changed\s*$/m.test(body);
+  if (!hasJaHeading || !hasEnHeading) {
+    throw new Error(
+      `CHANGELOG.md section for version ${version} must include both '### 主な変更点' (Japanese) and '### What's Changed' (English) subsections.`
+    );
+  }
+
   return { subtitle, body };
 }
 
@@ -163,18 +171,18 @@ function buildReleaseMarkdown(version, subtitle, body) {
     "",
     body,
     "",
-    "### ダウンロード",
-    `- **Windows（推奨・インストーラ）**: \`Shizuka_${version}_x64-setup.exe\``,
-    `- **Windows（ポータブル版・インストール不要）**: \`Shizuka_${version}_windows_x64_portable.zip\``,
-    `- **Windows（MSI パッケージ）**: \`Shizuka_${version}_x64_en-US.msi\``,
-    `- **macOS（Apple Silicon / M1 以降）**: \`Shizuka_${version}_aarch64.dmg\``,
+    "### ダウンロード / Downloads",
+    `- **Windows（推奨インストーラ / Recommended Installer）**: \`Shizuka_${version}_x64-setup.exe\``,
+    `- **Windows（ポータブル版 / Portable ZIP）**: \`Shizuka_${version}_windows_x64_portable.zip\``,
+    `- **Windows（MSI パッケージ / MSI Package）**: \`Shizuka_${version}_x64_en-US.msi\``,
+    `- **macOS（Apple Silicon / M1+）**: \`Shizuka_${version}_aarch64.dmg\``,
     `- **macOS（Intel）**: \`Shizuka_${version}_x64.dmg\``,
-    "- **チェックサム**: `SHA256SUMS.txt`",
+    "- **チェックサム / Checksums**: `SHA256SUMS.txt`",
     "",
     "> [!NOTE]",
-    "> 個人ビルド（未署名）のため、初回起動時に OS の警告が表示される場合があります。",
-    "> - **Windows**: SmartScreen が表示された場合は「詳細情報」→「実行」を選択してください。",
-    "> - **macOS**: 初回はアプリを右クリック →「開く」（または「システム設定 → プライバシーとセキュリティ → このまま開く」）から起動してください。",
+    "> **初回起動時の OS 確認画面について / First-Launch OS Prompt (Unsigned Personal Build)**",
+    "> - **Windows**: SmartScreen が表示された場合は「詳細情報」→「実行」（**More info** → **Run anyway**）を選択してください。",
+    "> - **macOS**: 初回はアプリアイコンを右クリック →「開く」（Right-click → **Open**, or **System Settings → Privacy & Security → Open Anyway**）から起動してください。",
     "",
   ].join("\n");
 }
@@ -249,7 +257,7 @@ function main() {
   }
 
   console.log(
-    `Validated release notes for Shizuka v${version}${
+    `Validated bilingual release notes for Shizuka v${version}${
       subtitle ? ` (${subtitle})` : ""
     }`
   );

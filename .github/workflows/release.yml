@@ -176,6 +176,7 @@ jobs:
           Copy-Item "src-tauri/target/release/shizuka.exe" "$portableDir/Shizuka.exe"
           Copy-Item "LICENSE" "$portableDir/LICENSE"
           Copy-Item "README.md" "$portableDir/README.md"
+          Copy-Item "README.en.md" "$portableDir/README.en.md"
           New-Item -ItemType File -Force "$portableDir/.portable" | Out-Null
           $zipPath = "Shizuka_${env:VERSION}_windows_x64_portable.zip"
           Compress-Archive -Path "$portableDir/*" -DestinationPath $zipPath -Force

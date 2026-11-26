@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod config;
 pub mod diagnostics;
+pub mod i18n;
 pub mod installer;
 pub mod shortcuts;
 pub mod updater;
@@ -22,6 +23,7 @@ use audio::cue::{CueKind, CuePlayer};
 use audio::devices::{default_physical_input_name, list_audio_devices, DeviceListResponse};
 use audio::engine::{AudioEngineHandle, AudioTelemetry, DspParams};
 use config::{AppConfig, ConfigSaver, ModelVariant};
+use i18n::{tr, tr_for, LanguagePreference, Locale};
 use installer::{install_virtual_audio_driver, InstallDriverResult};
 use shortcuts::{ShortcutAction, ShortcutRegistry};
 use updater::{
@@ -30,16 +32,46 @@ use updater::{
 };
 
 const TRAY_ID: &str = "shizuka-tray";
-const TOOLTIP_ON: &str = "Shizuka — AIノイズ除去: ON";
-const TOOLTIP_OFF: &str = "Shizuka — AIノイズ除去: OFF (バイパス中)";
-const TOOLTIP_MUTE: &str = "Shizuka — マイクミュート中";
+
+fn tray_tooltip(locale: Locale, nc_enabled: bool, mic_muted: bool) -> &'static str {
+    if mic_muted {
+        tr_for(
+            locale,
+            "Shizuka — マイクミュート中",
+            "Shizuka — Microphone Muted",
+        )
+    } else if nc_enabled {
+        tr_for(
+            locale,
+            "Shizuka — AIノイズ除去: ON",
+            "Shizuka — AI Noise Cancellation: ON",
+        )
+    } else {
+        tr_for(
+            locale,
+            "Shizuka — AIノイズ除去: OFF (バイパス中)",
+            "Shizuka — AI Noise Cancellation: OFF (Bypass)",
+        )
+    }
+}
+
+fn tray_menu_labels(locale: Locale) -> (&'static str, &'static str, &'static str, &'static str) {
+    (
+        tr_for(locale, "Shizuka を開く", "Open Shizuka"),
+        tr_for(locale, "AI ノイズ除去", "AI Noise Cancellation"),
+        tr_for(locale, "マイクミュート", "Mute Microphone"),
+        tr_for(locale, "終了", "Quit"),
+    )
+}
 
 struct TrayUiHandles {
     icon_on: Image<'static>,
     icon_off: Image<'static>,
     icon_mute: Image<'static>,
+    show_item: MenuItem<tauri::Wry>,
     nc_item: CheckMenuItem<tauri::Wry>,
     mute_item: CheckMenuItem<tauri::Wry>,
+    quit_item: MenuItem<tauri::Wry>,
 }
 
 pub struct AppState {
@@ -57,13 +89,7 @@ pub struct AppState {
 
 fn update_tray_ui(app: &AppHandle, nc_enabled: bool, mic_muted: bool) {
     let st = app.state::<AppState>();
-    let tooltip = if mic_muted {
-        TOOLTIP_MUTE
-    } else if nc_enabled {
-        TOOLTIP_ON
-    } else {
-        TOOLTIP_OFF
-    };
+    let tooltip = tray_tooltip(i18n::current_locale(), nc_enabled, mic_muted);
 
     if let Ok(guard) = st.tray_handles.lock() {
         if let Some(ref handles) = *guard {
@@ -87,6 +113,22 @@ fn update_tray_ui(app: &AppHandle, nc_enabled: bool, mic_muted: bool) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_tooltip(Some(tooltip));
     }
+}
+
+fn refresh_tray_locale(app: &AppHandle, locale: Locale) {
+    let st = app.state::<AppState>();
+    let (show_lbl, nc_lbl, mute_lbl, quit_lbl) = tray_menu_labels(locale);
+    if let Ok(guard) = st.tray_handles.lock() {
+        if let Some(ref handles) = *guard {
+            let _ = handles.show_item.set_text(show_lbl);
+            let _ = handles.nc_item.set_text(nc_lbl);
+            let _ = handles.mute_item.set_text(mute_lbl);
+            let _ = handles.quit_item.set_text(quit_lbl);
+        }
+    }
+    let nc_enabled = st.engine.shared.nc_enabled.load(Ordering::Relaxed);
+    let mic_muted = st.engine.shared.mic_muted.load(Ordering::Relaxed);
+    update_tray_ui(app, nc_enabled, mic_muted);
 }
 
 fn unpause_shortcuts(app: &AppHandle) {
@@ -349,7 +391,13 @@ fn set_voice_gate_config(
         let mut cfg = state
             .config
             .lock()
-            .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+            .map_err(|_| {
+                tr(
+                    "設定のロック取得に失敗しました",
+                    "Failed to acquire settings lock",
+                )
+                .to_string()
+            })?;
         cfg.voice_gate_threshold = clamped;
         cfg.voice_gate_enabled = enabled;
         cfg.clone()
@@ -366,7 +414,13 @@ fn reset_voice_profile(state: State<'_, AppState>) -> Result<AppConfig, String> 
         let mut cfg = state
             .config
             .lock()
-            .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+            .map_err(|_| {
+                tr(
+                    "設定のロック取得に失敗しました",
+                    "Failed to acquire settings lock",
+                )
+                .to_string()
+            })?;
         cfg.voice_profile = None;
         cfg.voice_fbank_tilt = None;
         cfg.clone()
@@ -547,18 +601,24 @@ fn set_shortcut(
     accelerator: Option<String>,
 ) -> Result<AppConfig, String> {
     let normalized = {
-        let mut reg = state
-            .shortcuts
-            .lock()
-            .map_err(|_| "ショートカット管理のロック取得に失敗しました".to_string())?;
+        let mut reg = state.shortcuts.lock().map_err(|_| {
+            tr(
+                "ショートカット管理のロック取得に失敗しました",
+                "Failed to acquire shortcut manager lock",
+            )
+            .to_string()
+        })?;
         reg.update_binding(&app, action, accelerator.as_deref())?
     };
 
     let cloned = {
-        let mut cfg = state
-            .config
-            .lock()
-            .map_err(|_| "設定のロック取得に失敗しました".to_string())?;
+        let mut cfg = state.config.lock().map_err(|_| {
+            tr(
+                "設定のロック取得に失敗しました",
+                "Failed to acquire settings lock",
+            )
+            .to_string()
+        })?;
         match action {
             ShortcutAction::ToggleNc => cfg.shortcut_toggle_nc = normalized,
             ShortcutAction::ToggleMute => cfg.shortcut_toggle_mute = normalized,
@@ -575,10 +635,13 @@ fn set_shortcuts_paused(
     state: State<'_, AppState>,
     paused: bool,
 ) -> Result<(), String> {
-    let mut reg = state
-        .shortcuts
-        .lock()
-        .map_err(|_| "ショートカット管理のロック取得に失敗しました".to_string())?;
+    let mut reg = state.shortcuts.lock().map_err(|_| {
+        tr(
+            "ショートカット管理のロック取得に失敗しました",
+            "Failed to acquire shortcut manager lock",
+        )
+        .to_string()
+    })?;
     reg.set_paused(&app, paused)
 }
 
@@ -594,6 +657,44 @@ fn set_shortcut_sound_enabled(state: State<'_, AppState>, enabled: bool) -> Resu
         state.config_saver.flush_async(cfg);
     }
     Ok(())
+}
+
+#[tauri::command]
+fn get_resolved_locale(state: State<'_, AppState>) -> Locale {
+    let pref = state
+        .config
+        .lock()
+        .map(|g| g.language)
+        .unwrap_or_default();
+    let resolved = pref.resolve();
+    i18n::set_active_locale(resolved);
+    resolved
+}
+
+#[tauri::command]
+fn set_language(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    language: LanguagePreference,
+) -> Result<Locale, String> {
+    let snapshot_cfg = {
+        let mut cfg = state.config.lock().map_err(|_| {
+            tr(
+                "設定のロック取得に失敗しました",
+                "Failed to acquire settings lock",
+            )
+            .to_string()
+        })?;
+        cfg.language = language;
+        cfg.clone()
+    };
+    state.config_saver.flush_async(snapshot_cfg);
+
+    let resolved = language.resolve();
+    i18n::set_active_locale(resolved);
+    refresh_tray_locale(&app, resolved);
+    let _ = app.emit("shizuka-state-changed", ());
+    Ok(resolved)
 }
 
 #[tauri::command]
@@ -615,7 +716,10 @@ async fn install_virtual_driver(
         install_virtual_audio_driver(resource_dir)
     })
     .await
-    .map_err(|e| format!("セットアップタスク実行エラー: {}", e))?
+    .map_err(|e| match i18n::current_locale() {
+        Locale::Ja => format!("セットアップタスク実行エラー: {}", e),
+        Locale::En => format!("Driver setup task failed: {}", e),
+    })?
     .map_err(|e| format!("{:#}", e))?;
 
     if result.device_detected_now {
@@ -722,11 +826,17 @@ fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
     if enabled {
         autolaunch
             .enable()
-            .map_err(|e| format!("自動起動の有効化に失敗しました: {}", e))?;
+            .map_err(|e| match i18n::current_locale() {
+                Locale::Ja => format!("自動起動の有効化に失敗しました: {}", e),
+                Locale::En => format!("Failed to enable launch at login: {}", e),
+            })?;
     } else {
         autolaunch
             .disable()
-            .map_err(|e| format!("自動起動の無効化に失敗しました: {}", e))?;
+            .map_err(|e| match i18n::current_locale() {
+                Locale::Ja => format!("自動起動の無効化に失敗しました: {}", e),
+                Locale::En => format!("Failed to disable launch at login: {}", e),
+            })?;
     }
     Ok(autolaunch.is_enabled().unwrap_or(enabled))
 }
@@ -923,6 +1033,8 @@ pub fn run() {
             ));
 
             let initial_cfg = AppConfig::load();
+            let init_locale = initial_cfg.language.resolve();
+            i18n::set_active_locale(init_locale);
             let init_nc = initial_cfg.nc_enabled;
             let init_sc_nc = initial_cfg.shortcut_toggle_nc.clone();
             let init_sc_mute = initial_cfg.shortcut_toggle_mute.clone();
@@ -992,12 +1104,13 @@ pub fn run() {
                 };
             }
 
+            let (show_lbl, nc_lbl, mute_lbl, quit_lbl) = tray_menu_labels(init_locale);
             let show_item =
-                MenuItem::with_id(app, "show", "Shizuka を開く", true, None::<&str>)?;
+                MenuItem::with_id(app, "show", show_lbl, true, None::<&str>)?;
             let toggle_item = CheckMenuItem::with_id(
                 app,
                 "toggle_nc",
-                "AI ノイズ除去",
+                nc_lbl,
                 true,
                 init_nc,
                 None::<&str>,
@@ -1005,13 +1118,13 @@ pub fn run() {
             let mute_item = CheckMenuItem::with_id(
                 app,
                 "toggle_mute",
-                "マイクミュート",
+                mute_lbl,
                 true,
                 false,
                 None::<&str>,
             )?;
             let sep = PredefinedMenuItem::separator(app)?;
-            let quit_item = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", quit_lbl, true, None::<&str>)?;
 
             let menu = Menu::with_items(
                 app,
@@ -1035,15 +1148,17 @@ pub fn run() {
                         icon_on,
                         icon_off,
                         icon_mute,
+                        show_item,
                         nc_item: toggle_item,
                         mute_item,
+                        quit_item,
                     });
                 };
             }
 
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(init_icon)
-                .tooltip(if init_nc { TOOLTIP_ON } else { TOOLTIP_OFF })
+                .tooltip(tray_tooltip(init_locale, init_nc, false))
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app_handle, event| match event.id.as_ref() {
@@ -1121,6 +1236,8 @@ pub fn run() {
             set_shortcut,
             set_shortcuts_paused,
             set_shortcut_sound_enabled,
+            get_resolved_locale,
+            set_language,
             get_shortcut_warning,
             install_virtual_driver,
             check_for_update,

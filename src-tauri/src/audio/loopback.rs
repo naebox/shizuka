@@ -17,6 +17,7 @@ use ringbuf::HeapRb;
 use crate::audio::aec::AecRefSink;
 use crate::audio::devices::{device_name, find_aec_reference_device};
 use crate::audio::engine::StreamErrorNotifier;
+use crate::i18n::{self, tr, Locale};
 
 /// Active OS speaker loopback stream handle.
 /// Pauses and tears down the underlying OS loopback stream (WASAPI Loopback on Windows,
@@ -44,12 +45,18 @@ pub(crate) fn build_aec_loopback_stream(
     let explicit = ref_name.filter(|s| !s.is_empty());
     let out_dev = find_aec_reference_device(explicit).ok_or_else(|| {
         if let Some(name) = explicit {
-            anyhow!(
-                "エコー除去用のスピーカー「{}」が見つかりません",
-                name
-            )
+            match i18n::current_locale() {
+                Locale::Ja => anyhow!("エコー除去用のスピーカー「{}」が見つかりません", name),
+                Locale::En => anyhow!("Echo cancellation speaker \"{}\" not found", name),
+            }
         } else {
-            anyhow!("エコー除去用のスピーカーが見つかりません")
+            anyhow!(
+                "{}",
+                tr(
+                    "エコー除去用のスピーカーが見つかりません",
+                    "No speaker found for echo cancellation"
+                )
+            )
         }
     })?;
 
@@ -58,10 +65,16 @@ pub(crate) fn build_aec_loopback_stream(
     #[cfg(not(target_os = "macos"))]
     {
         let supported = out_dev.default_output_config().with_context(|| {
-            format!(
-                "エコー除去用のスピーカー「{}」のフォーマット取得に失敗しました",
-                actual_name
-            )
+            match i18n::current_locale() {
+                Locale::Ja => format!(
+                    "エコー除去用のスピーカー「{}」のフォーマット取得に失敗しました",
+                    actual_name
+                ),
+                Locale::En => format!(
+                    "Failed to query format for echo cancellation speaker \"{}\"",
+                    actual_name
+                ),
+            }
         })?;
         let sample_format = supported.sample_format();
         let mut cfg: StreamConfig = supported.into();
@@ -84,17 +97,25 @@ pub(crate) fn build_aec_loopback_stream(
             observed_block_frames,
             err_notifier,
         )
-        .with_context(|| {
-            format!(
+        .with_context(|| match i18n::current_locale() {
+            Locale::Ja => format!(
                 "エコー除去用のスピーカー「{}」の音声取得に失敗しました",
                 actual_name
-            )
+            ),
+            Locale::En => format!(
+                "Failed to capture audio from echo cancellation speaker \"{}\"",
+                actual_name
+            ),
         })?;
-        stream.play().with_context(|| {
-            format!(
+        stream.play().with_context(|| match i18n::current_locale() {
+            Locale::Ja => format!(
                 "エコー除去用のスピーカー「{}」の音声取得開始に失敗しました",
                 actual_name
-            )
+            ),
+            Locale::En => format!(
+                "Failed to start loopback stream for echo cancellation speaker \"{}\"",
+                actual_name
+            ),
         })?;
 
         Ok((LoopbackPipeline { _stream: stream }, sink, actual_name))
@@ -103,10 +124,16 @@ pub(crate) fn build_aec_loopback_stream(
     #[cfg(target_os = "macos")]
     {
         let supported = out_dev.default_output_config().with_context(|| {
-            format!(
-                "エコー除去用のスピーカー「{}」のフォーマット取得に失敗しました",
-                actual_name
-            )
+            match i18n::current_locale() {
+                Locale::Ja => format!(
+                    "エコー除去用のスピーカー「{}」のフォーマット取得に失敗しました",
+                    actual_name
+                ),
+                Locale::En => format!(
+                    "Failed to query format for echo cancellation speaker \"{}\"",
+                    actual_name
+                ),
+            }
         })?;
         let fallback_sr = supported.sample_rate();
         let device_uid = out_dev.id().ok().map(|id| id.1);
@@ -118,11 +145,15 @@ pub(crate) fn build_aec_loopback_stream(
             Arc::clone(&observed_block_frames),
             err_notifier,
         )
-        .with_context(|| {
-            format!(
+        .with_context(|| match i18n::current_locale() {
+            Locale::Ja => format!(
                 "エコー除去用のシステム音声取得「{}」に失敗しました（システム設定 > プライバシーとセキュリティ > 画面収録とシステムオーディオ録音 の権限を確認してください）",
                 actual_name
-            )
+            ),
+            Locale::En => format!(
+                "Failed to capture system audio on \"{}\" for echo cancellation (check permission in System Settings > Privacy & Security > Screen & System Audio Recording)",
+                actual_name
+            ),
         })?;
 
         let sink = AecRefSink::new(cons, actual_sr, observed_block_frames)?;
@@ -227,7 +258,10 @@ fn build_cpal_loopback_to_rb(
             observed_block_frames,
             err_notifier,
         ),
-        other => Err(anyhow!("未対応の参照音声サンプル形式: {:?}", other)),
+        other => Err(match i18n::current_locale() {
+            Locale::Ja => anyhow!("未対応の参照音声サンプル形式: {:?}", other),
+            Locale::En => anyhow!("Unsupported reference audio sample format: {:?}", other),
+        }),
     }
 }
 
@@ -363,6 +397,7 @@ mod macos_tap {
     use ringbuf::HeapRb;
 
     use crate::audio::engine::StreamErrorNotifier;
+    use crate::i18n::{self, tr, Locale};
 
     static TAP_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -598,7 +633,13 @@ mod macos_tap {
                 },
             );
             if !is_14_2_plus {
-                bail!("macOS でエコー除去を使用するには macOS 14.2 以降が必要です");
+                bail!(
+                    "{}",
+                    tr(
+                        "macOS でエコー除去を使用するには macOS 14.2 以降が必要です",
+                        "Echo cancellation on macOS requires macOS 14.2 or later"
+                    )
+                );
             }
 
             let excluded_procs: Retained<NSArray<NSNumber>> =
@@ -630,7 +671,13 @@ mod macos_tap {
                             &excluded_procs,
                         )
                     } else {
-                        bail!("この macOS 環境は CoreAudio Process Tap API に対応していません");
+                        bail!(
+                            "{}",
+                            tr(
+                                "この macOS 環境は CoreAudio Process Tap API に対応していません",
+                                "CoreAudio Process Tap API is not supported on this macOS version"
+                            )
+                        );
                     }
                 } else if cls.responds_to(sel!(initStereoGlobalTapButExcludeProcesses:)) {
                     CATapDescription::initStereoGlobalTapButExcludeProcesses(
@@ -638,7 +685,13 @@ mod macos_tap {
                         &excluded_procs,
                     )
                 } else {
-                    bail!("この macOS 環境は CoreAudio Process Tap API に対応していません");
+                    bail!(
+                        "{}",
+                        tr(
+                            "この macOS 環境は CoreAudio Process Tap API に対応していません",
+                            "CoreAudio Process Tap API is not supported on this macOS version"
+                        )
+                    );
                 }
             };
 
@@ -655,10 +708,16 @@ mod macos_tap {
                 AudioHardwareCreateProcessTap(Some(tap_desc.as_ref()), tap_id_uninit.as_mut_ptr())
             };
             if tap_status != 0 {
-                bail!(
-                    "CoreAudio Process Tap の作成に失敗しました (OSStatus={})",
-                    tap_status
-                );
+                match i18n::current_locale() {
+                    Locale::Ja => bail!(
+                        "CoreAudio Process Tap の作成に失敗しました (OSStatus={})",
+                        tap_status
+                    ),
+                    Locale::En => bail!(
+                        "Failed to create CoreAudio Process Tap (OSStatus={})",
+                        tap_status
+                    ),
+                }
             }
             let tap_id = unsafe { tap_id_uninit.assume_init() };
             let mut tap_guard = TapObjectsGuard {
@@ -675,17 +734,26 @@ mod macos_tap {
                 AudioHardwareCreateAggregateDevice(agg_props.as_ref(), NonNull::from(&mut agg_id))
             };
             if agg_status != 0 || agg_id == 0 {
-                bail!(
-                    "CoreAudio Aggregate Device の作成に失敗しました (OSStatus={})",
-                    agg_status
-                );
+                match i18n::current_locale() {
+                    Locale::Ja => bail!(
+                        "CoreAudio Aggregate Device の作成に失敗しました (OSStatus={})",
+                        agg_status
+                    ),
+                    Locale::En => bail!(
+                        "Failed to create CoreAudio Aggregate Device (OSStatus={})",
+                        agg_status
+                    ),
+                }
             }
             tap_guard.aggregate_id = Some(agg_id);
 
             let (sr_ref, ch_ref) = query_device_nominal_rate_and_channels(agg_id, fallback_sr);
 
-            let mut audio_unit = AudioUnit::new(IOType::HalOutput)
-                .map_err(|e| anyhow!("AUHAL 初期化失敗: {}", e))?;
+            let mut audio_unit =
+                AudioUnit::new(IOType::HalOutput).map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL 初期化失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL initialization failed: {}", e),
+                })?;
             let enable_in = 1u32;
             audio_unit
                 .set_property(
@@ -694,7 +762,10 @@ mod macos_tap {
                     Element::Input,
                     Some(&enable_in),
                 )
-                .map_err(|e| anyhow!("AUHAL 入力有効化失敗: {}", e))?;
+                .map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL 入力有効化失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL input enable failed: {}", e),
+                })?;
             let disable_out = 0u32;
             audio_unit
                 .set_property(
@@ -703,7 +774,10 @@ mod macos_tap {
                     Element::Output,
                     Some(&disable_out),
                 )
-                .map_err(|e| anyhow!("AUHAL 出力無効化失敗: {}", e))?;
+                .map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL 出力無効化失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL output disable failed: {}", e),
+                })?;
             audio_unit
                 .set_property(
                     kAudioOutputUnitProperty_CurrentDevice,
@@ -711,7 +785,10 @@ mod macos_tap {
                     Element::Output,
                     Some(&agg_id),
                 )
-                .map_err(|e| anyhow!("AUHAL デバイス割当失敗: {}", e))?;
+                .map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL デバイス割当失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL device assignment failed: {}", e),
+                })?;
 
             let bytes_per_sample = mem::size_of::<f32>() as u32;
             let asbd = AudioStreamBasicDescription {
@@ -732,7 +809,10 @@ mod macos_tap {
                     Element::Input,
                     Some(&asbd),
                 )
-                .map_err(|e| anyhow!("AUHAL フォーマット設定失敗: {}", e))?;
+                .map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL フォーマット設定失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL stream format configuration failed: {}", e),
+                })?;
 
             let rb_cap = (sr_ref as usize / 2).max(8_192);
             let rb = HeapRb::<f32>::new(rb_cap);
@@ -806,11 +886,17 @@ mod macos_tap {
                     }
                     Ok(())
                 })
-                .map_err(|e| anyhow!("AUHAL コールバック登録失敗: {}", e))?;
+                .map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL コールバック登録失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL callback registration failed: {}", e),
+                })?;
 
             audio_unit
                 .start()
-                .map_err(|e| anyhow!("AUHAL ストリーム開始失敗: {}", e))?;
+                .map_err(|e| match i18n::current_locale() {
+                    Locale::Ja => anyhow!("AUHAL ストリーム開始失敗: {}", e),
+                    Locale::En => anyhow!("AUHAL stream start failed: {}", e),
+                })?;
 
             Ok((
                 Self {

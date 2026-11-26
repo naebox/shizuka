@@ -18,6 +18,10 @@ export type ModelVariant = "standard" | "low_latency";
 
 export type ShortcutAction = "toggle_nc" | "toggle_mute";
 
+export type LanguagePreference = "auto" | "ja" | "en";
+
+export type Locale = "ja" | "en";
+
 export interface AppConfig {
   input_device: string | null;
   output_device: string | null;
@@ -43,6 +47,7 @@ export interface AppConfig {
   shortcut_toggle_nc: string | null;
   shortcut_toggle_mute: string | null;
   shortcut_sound_enabled: boolean;
+  language: LanguagePreference;
 }
 
 export type ConnectionState =

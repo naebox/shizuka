@@ -111,6 +111,7 @@ flowchart LR
 - [x] **`v0.4.4` リリース公開**: Windows WASAPI (`cpal 0.17`) でのデバイスフレンドリー名解決＆「マイク再接続待ち」誤遷移を修正 ([devices.rs](./src-tauri/src/audio/devices.rs))
 - [x] **`v0.5.0` 機能追加＆安定化**: スピーカー通話向け **エコー除去（WebRTC AEC3）**（`sonora` 純 Rust 実装、Windows WASAPI Loopback / macOS 14.2+ CoreAudio Process Tap 対応、マイクテスト時自動バイパス、マイク別プロファイル記憶）、UI・README の平易な日本語表現への刷新、および `DriftController` の過渡変動抑制（`ζ ≈ 0.88`）を実装 ([aec.rs](./src-tauri/src/audio/aec.rs), [loopback.rs](./src-tauri/src/audio/loopback.rs), [resampler.rs](./src-tauri/src/audio/resampler.rs), [engine.rs](./src-tauri/src/audio/engine.rs), [App.tsx](./src/App.tsx))
 - [x] **`v0.6.0` 機能追加**: **「周囲の話し声カット」声の自動学習＆本人以外の声の自動消音**（普段の会話から主話者クラスタを自動抽出・継続適応するオンライン学習、Apache-2.0 `CAM++` FP16 圧縮モデル同梱、10ms リアルタイム音声スレッド分離、話し始めの頭切れゼロ＋周囲の声を約 0.3 秒で自動消音）を実装 ([speaker.rs](./src-tauri/src/audio/speaker.rs), [processor.rs](./src-tauri/src/audio/processor.rs), [engine.rs](./src-tauri/src/audio/engine.rs), [App.tsx](./src/App.tsx))
+- [x] **`v0.7.0` 機能追加**: **日本語・英語の多言語対応（i18n）＆アプリ内更新履歴ビューア**（OS 言語の自動判定＋設定モーダルからの即時言語切り替え、アプリ内での日英リリースノート・新着アップデート内容の閲覧、システムトレイ・全エラー文言・macOS 権限ダイアログの日英対応、英語版 [README.en.md](./README.en.md) 追加、および [CHANGELOG.md](./CHANGELOG.md)・GitHub Releases の日英併記化）を実装 ([i18n.rs](./src-tauri/src/i18n.rs), [i18n.ts](./src/i18n.ts), [releaseNotes.ts](./src/releaseNotes.ts), [App.tsx](./src/App.tsx), [lib.rs](./src-tauri/src/lib.rs), [Info.plist](./src-tauri/Info.plist), [extract-release-notes.mjs](./scripts/extract-release-notes.mjs))
 
 ### 継続中の改善・ドッグフーディング
 

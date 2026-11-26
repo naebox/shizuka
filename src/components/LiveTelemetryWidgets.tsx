@@ -1,3 +1,4 @@
+import type { UiMessages } from "../i18n";
 import { useLiveTelemetry } from "../telemetryStore";
 import type { ConnectionState } from "../types";
 
@@ -10,7 +11,10 @@ export function TopBarStatPills() {
   const telemetry = useLiveTelemetry();
   const cpuPct = telemetry?.cpu_load_pct ?? 0;
   const cpuText = cpuPct >= 99.95 ? "100%" : `${cpuPct.toFixed(1)}%`;
-  const latencyMs = Math.min(999, Math.max(0, Math.round(telemetry?.latency_ms ?? 10)));
+  const latencyMs = Math.min(
+    999,
+    Math.max(0, Math.round(telemetry?.latency_ms ?? 10))
+  );
 
   return (
     <>
@@ -41,11 +45,13 @@ export function HeroLiveMeters({
   outputMeterId,
   ncEnabled,
   micMuted,
+  t,
 }: {
   inputMeterId: string;
   outputMeterId: string;
   ncEnabled: boolean;
   micMuted: boolean;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const inDb = telemetry?.input_rms_db ?? -90;
@@ -57,7 +63,7 @@ export function HeroLiveMeters({
     <div className="meters-box">
       <div className="meter-row">
         <div className="meter-label">
-          <label htmlFor={inputMeterId}>入力マイク (処理前)</label>
+          <label htmlFor={inputMeterId}>{t.hero.meterInputRaw}</label>
           <span>{inDb.toFixed(0)} dB</span>
         </div>
         <progress
@@ -74,20 +80,17 @@ export function HeroLiveMeters({
           <span className="meter-label-left">
             <label htmlFor={outputMeterId}>
               {micMuted
-                ? "ミュート中 (無音送信)"
+                ? t.hero.meterMutedSilence
                 : ncEnabled
-                ? "ノイズ除去後"
-                : "スルー出力 (未処理)"}
+                ? t.hero.meterDenoised
+                : t.hero.meterBypassRaw}
             </label>
             {!micMuted && ncEnabled && reducedDb > 1.5 && (
               <span className="reduction-badge">-{reducedDb.toFixed(0)} dB</span>
             )}
             <span role="status" aria-live="polite">
               {clippingActive && (
-                <span
-                  className="clip-badge"
-                  title="入力または出力がリミッターに達しました。入力ゲインを下げてください。"
-                >
+                <span className="clip-badge" title={t.hero.clipTooltip}>
                   CLIP
                 </span>
               )}
@@ -102,7 +105,7 @@ export function HeroLiveMeters({
           }`}
           max={1}
           value={micMuted ? 0 : dbToRatio(outDb)}
-          aria-valuetext={micMuted ? "ミュート" : `${outDb.toFixed(0)} dB`}
+          aria-valuetext={micMuted ? t.hero.meterMutedAria : `${outDb.toFixed(0)} dB`}
         />
       </div>
     </div>
@@ -125,19 +128,21 @@ export function AgcLiveBadge() {
 
 export function AecLiveBadge({
   liveMonitorEnabled,
+  t,
 }: {
   liveMonitorEnabled: boolean;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const aecActive = telemetry?.aec_active ?? false;
   const erleDb = telemetry?.aec_erle_db ?? 0;
   const label = liveMonitorEnabled
-    ? "テスト中停止"
+    ? t.tuning.aecPausedInTest
     : aecActive
     ? erleDb >= 2.0
-      ? `稼働中 · -${erleDb.toFixed(0)} dB`
-      : "稼働中"
-    : "待機中";
+      ? t.tuning.aecActiveWithErle(erleDb.toFixed(0))
+      : t.tuning.aecActive
+    : t.tuning.aecStandby;
 
   return (
     <span
@@ -155,9 +160,11 @@ export function AecLiveBadge({
 export function VadLiveBadge({
   vadGateEnabled,
   ncEnabled,
+  t,
 }: {
   vadGateEnabled: boolean;
   ncEnabled: boolean;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const vadSpeaking = telemetry?.vad_speaking ?? false;
@@ -173,10 +180,10 @@ export function VadLiveBadge({
         {!vadGateEnabled
           ? "OFF"
           : !ncEnabled
-          ? "待機"
+          ? t.tuning.vadStandby
           : vadSpeaking
-          ? "話し中"
-          : "消音中"}
+          ? t.tuning.vadSpeaking
+          : t.tuning.vadMuted}
       </span>
     </span>
   );
@@ -186,10 +193,12 @@ export function VoiceGateLiveBadge({
   voiceGateEnabled,
   hasVoiceProfile,
   ncEnabled,
+  t,
 }: {
   voiceGateEnabled: boolean;
   hasVoiceProfile: boolean;
   ncEnabled: boolean;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const blocking = telemetry?.voice_gate_blocking ?? false;
@@ -212,16 +221,16 @@ export function VoiceGateLiveBadge({
   const label = !voiceGateEnabled
     ? "OFF"
     : !ncEnabled
-    ? "待機"
+    ? t.tuning.vadStandby
     : !hasVoiceProfile
     ? learnPct > 0
-      ? `学習中 ${learnPct}%`
-      : "声を学習中"
+      ? t.tuning.voiceGateLearningPct(learnPct)
+      : t.tuning.voiceGateLearning
     : blocking
-    ? "周囲の声を消音中"
+    ? t.tuning.voiceGateBlocking
     : speaking
-    ? "話し中"
-    : "待機中";
+    ? t.tuning.vadSpeaking
+    : t.tuning.aecStandby;
 
   return (
     <span className={`vad-live-pill ${stateClass}`} aria-hidden="true">
@@ -233,8 +242,10 @@ export function VoiceGateLiveBadge({
 
 export function VoiceAutoLearnProgress({
   progressId,
+  t,
 }: {
   progressId: string;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const progress = Math.max(
@@ -247,7 +258,7 @@ export function VoiceAutoLearnProgress({
     <div className="voice-enroll-active">
       <div className="slider-top">
         <label htmlFor={progressId} className="voice-enroll-prompt">
-          普段通りに話すと自動で声を覚えます
+          {t.tuning.voiceAutoLearnPrompt}
         </label>
         <span className="slider-val">{pct}%</span>
       </div>
@@ -258,9 +269,7 @@ export function VoiceAutoLearnProgress({
         value={progress}
         aria-valuetext={`${pct}%`}
       />
-      <span className="field-hint">
-        マイクの近くで数秒間会話すると記憶が完了します（話している間だけ進みます）
-      </span>
+      <span className="field-hint">{t.tuning.voiceAutoLearnHint}</span>
     </div>
   );
 }
@@ -268,9 +277,11 @@ export function VoiceAutoLearnProgress({
 export function MicTestLiveMeter({
   monMeterId,
   liveMonitorEnabled,
+  t,
 }: {
   monMeterId: string;
   liveMonitorEnabled: boolean;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const monDb = telemetry?.monitor_rms_db ?? -90;
@@ -281,48 +292,54 @@ export function MicTestLiveMeter({
       className="discord-meter"
       max={1}
       value={ratio}
-      aria-valuetext={liveMonitorEnabled ? `${monDb.toFixed(0)} dB` : "停止中"}
+      aria-valuetext={
+        liveMonitorEnabled ? `${monDb.toFixed(0)} dB` : t.micTest.stoppedAria
+      }
     />
   );
 }
 
 export function SettingsDiagGrid({
   connState,
+  t,
 }: {
   connState: ConnectionState;
+  t: UiMessages;
 }) {
   const telemetry = useLiveTelemetry();
   const connStateLabel =
     connState === "running"
-      ? "稼働中"
+      ? t.settings.diagStateRunning
       : connState === "waiting_device"
-      ? "再接続待ち"
+      ? t.settings.diagStateWaiting
       : connState === "reconnecting"
-      ? "再接続中"
-      : "停止中";
+      ? t.settings.diagStateReconnecting
+      : t.settings.diagStateStopped;
   const driftPpm = telemetry?.drift_ppm ?? 0;
 
   return (
     <div className="diag-grid">
       <div className="diag-item">
-        <span className="diag-key">パイプライン状態</span>
+        <span className="diag-key">{t.settings.diagPipelineStatus}</span>
         <span className="diag-val">{connStateLabel}</span>
       </div>
       <div className="diag-item">
-        <span className="diag-key">クロック同期補正</span>
+        <span className="diag-key">{t.settings.diagClockSync}</span>
         <span className="diag-val">
           {driftPpm >= 0 ? "+" : ""}
           {driftPpm.toFixed(0)} ppm
         </span>
       </div>
       <div className="diag-item">
-        <span className="diag-key">自動復旧回数</span>
+        <span className="diag-key">{t.settings.diagReconnects}</span>
         <span className="diag-val">
-          {telemetry?.status.reconnect_count ?? 0} 回
+          {t.settings.diagReconnectValue(
+            telemetry?.status.reconnect_count ?? 0
+          )}
         </span>
       </div>
       <div className="diag-item">
-        <span className="diag-key">サンプルレート</span>
+        <span className="diag-key">{t.settings.diagSampleRate}</span>
         <span className="diag-val">
           {telemetry?.status.input_sample_rate
             ? `${Math.round(telemetry.status.input_sample_rate / 1000)} kHz`
@@ -330,13 +347,13 @@ export function SettingsDiagGrid({
         </span>
       </div>
       <div className="diag-item">
-        <span className="diag-key">入力ドロップ</span>
+        <span className="diag-key">{t.settings.diagInputDrops}</span>
         <span className="diag-val">
           {telemetry?.status.input_drop_count ?? 0}
         </span>
       </div>
       <div className="diag-item">
-        <span className="diag-key">出力アンダーラン</span>
+        <span className="diag-key">{t.settings.diagOutputUnderruns}</span>
         <span className="diag-val">
           {telemetry?.status.output_underrun_count ?? 0}
         </span>

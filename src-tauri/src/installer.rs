@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::audio::devices::list_audio_devices;
 use crate::diagnostics;
+use crate::i18n::{self, tr, tr_for, Locale};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -28,7 +29,13 @@ impl InstallLockGuard {
         {
             Ok(Self)
         } else {
-            Err(anyhow!("仮想マイクドライバのセットアップがすでに進行中です。"))
+            Err(anyhow!(
+                "{}",
+                tr(
+                    "仮想マイクドライバのセットアップがすでに進行中です。",
+                    "Virtual microphone driver setup is already in progress."
+                )
+            ))
         }
     }
 }
@@ -90,26 +97,56 @@ pub fn build_macos_hal_applescript(bundle_path: &Path) -> String {
     )
 }
 
-/// Formats a user-facing error message for a failed macOS `osascript` privilege escalation step,
-/// distinguishing explicit user cancellation (`-128`) from shell/system errors.
-pub fn format_macos_osascript_error(exit_code: Option<i32>, stderr: &str) -> String {
+/// Formats a user-facing error message for a failed macOS `osascript` privilege escalation step
+/// in the specified `locale`, distinguishing explicit user cancellation (`-128`) from shell/system errors.
+pub fn format_macos_osascript_error_for(
+    locale: Locale,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> String {
     let trimmed = stderr.trim();
     let lower = trimmed.to_lowercase();
-    if trimmed.contains("(-128)") || lower.contains("user canceled") || lower.contains("user cancelled") {
-        return "管理者認証がキャンセルされました。".to_string();
+    if trimmed.contains("(-128)")
+        || lower.contains("user canceled")
+        || lower.contains("user cancelled")
+    {
+        return tr_for(
+            locale,
+            "管理者認証がキャンセルされました。",
+            "Administrator authentication was canceled.",
+        )
+        .to_string();
     }
     if trimmed.is_empty() {
-        match exit_code {
-            Some(code) => format!("ドライバの配置に失敗しました（終了コード: {}）。", code),
-            None => "ドライバの配置に失敗しました。".to_string(),
+        match (locale, exit_code) {
+            (Locale::Ja, Some(code)) => {
+                format!("ドライバの配置に失敗しました（終了コード: {}）。", code)
+            }
+            (Locale::En, Some(code)) => {
+                format!("Failed to install the audio driver (exit code: {}).", code)
+            }
+            (Locale::Ja, None) => "ドライバの配置に失敗しました。".to_string(),
+            (Locale::En, None) => "Failed to install the audio driver.".to_string(),
         }
     } else {
         let single_line = trimmed.lines().collect::<Vec<_>>().join(" / ");
-        match exit_code {
-            Some(code) => format!("ドライバの配置に失敗しました（終了コード: {}）: {}", code, single_line),
-            None => format!("ドライバの配置に失敗しました: {}", single_line),
+        match (locale, exit_code) {
+            (Locale::Ja, Some(code)) => format!(
+                "ドライバの配置に失敗しました（終了コード: {}）: {}",
+                code, single_line
+            ),
+            (Locale::En, Some(code)) => format!(
+                "Failed to install the audio driver (exit code: {}): {}",
+                code, single_line
+            ),
+            (Locale::Ja, None) => format!("ドライバの配置に失敗しました: {}", single_line),
+            (Locale::En, None) => format!("Failed to install the audio driver: {}", single_line),
         }
     }
+}
+
+pub fn format_macos_osascript_error(exit_code: Option<i32>, stderr: &str) -> String {
+    format_macos_osascript_error_for(i18n::current_locale(), exit_code, stderr)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +191,11 @@ pub fn install_virtual_audio_driver(resource_dir: Option<PathBuf>) -> Result<Ins
     {
         let _ = resource_dir;
         Err(anyhow!(
-            "自動セットアップは Windows および macOS のみ対応しています。"
+            "{}",
+            tr(
+                "自動セットアップは Windows および macOS のみ対応しています。",
+                "Automatic driver setup is supported on Windows and macOS only."
+            )
         ))
     }
 }
@@ -163,7 +204,10 @@ pub fn install_virtual_audio_driver(resource_dir: Option<PathBuf>) -> Result<Ins
 fn run_hidden(cmd: &mut Command) -> Result<std::process::Output> {
     cmd.creation_flags(CREATE_NO_WINDOW)
         .output()
-        .context("外部コマンドの実行に失敗しました")
+        .context(tr(
+            "外部コマンドの実行に失敗しました",
+            "Failed to execute system command",
+        ))
 }
 
 #[cfg(target_os = "windows")]
@@ -246,7 +290,10 @@ fn find_setup_exe(dir: &Path) -> Option<PathBuf> {
 fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
     let work_path = std::env::temp_dir().join(format!("shizuka-vbcable-setup-{}", std::process::id()));
     let _ = fs::remove_dir_all(&work_path);
-    fs::create_dir_all(&work_path).context("一時作業フォルダの作成に失敗しました")?;
+    fs::create_dir_all(&work_path).context(tr(
+        "一時作業フォルダの作成に失敗しました",
+        "Failed to create temporary working directory",
+    ))?;
     let work_guard = TempDirGuard(work_path);
     let work_dir = work_guard.path();
 
@@ -279,7 +326,11 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
 
     if !downloaded {
         return Err(anyhow!(
-            "VB-Audio 公式サイトからドライバパッケージを取得できませんでした。インターネット接続をご確認ください。"
+            "{}",
+            tr(
+                "VB-Audio 公式サイトからドライバパッケージを取得できませんでした。インターネット接続をご確認ください。",
+                "Could not download the driver package from vb-audio.com. Please check your internet connection."
+            )
         ));
     }
 
@@ -288,11 +339,23 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
     let ext_str = extract_dir.to_string_lossy().to_string();
     let tar_out = run_hidden(Command::new("tar.exe").args(["-xf", &zip_str, "-C", &ext_str]))?;
     if !tar_out.status.success() {
-        return Err(anyhow!("ダウンロードしたドライバ ZIP の展開に失敗しました。"));
+        return Err(anyhow!(
+            "{}",
+            tr(
+                "ダウンロードしたドライバ ZIP の展開に失敗しました。",
+                "Failed to extract the downloaded driver ZIP archive."
+            )
+        ));
     }
 
     let setup_exe = find_setup_exe(&extract_dir).ok_or_else(|| {
-        anyhow!("展開されたアーカイブ内に VBCABLE_Setup 実行ファイルが見つかりませんでした。")
+        anyhow!(
+            "{}",
+            tr(
+                "展開されたアーカイブ内に VBCABLE_Setup 実行ファイルが見つかりませんでした。",
+                "Could not find the VBCABLE_Setup executable inside the extracted archive."
+            )
+        )
     })?;
 
     let setup_dir = setup_exe
@@ -332,12 +395,19 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
             let check = list_audio_devices();
             if !check.has_virtual_cable {
                 return Err(anyhow!(
-                    "インストールがキャンセルされたか完了しませんでした（管理者権限ダイアログで「はい」を選択してください）。"
+                    "{}",
+                    tr(
+                        "インストールがキャンセルされたか完了しませんでした（管理者権限ダイアログで「はい」を選択してください）。",
+                        "Installation was canceled or did not complete (please click \"Yes\" in the Administrator UAC prompt)."
+                    )
                 ));
             }
         }
         Err(e) => {
-            return Err(anyhow!("インストーラの起動に失敗しました: {:#}", e));
+            return Err(match i18n::current_locale() {
+                Locale::Ja => anyhow!("インストーラの起動に失敗しました: {:#}", e),
+                Locale::En => anyhow!("Failed to launch the driver installer: {:#}", e),
+            });
         }
     }
 
@@ -352,7 +422,11 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
                 device_detected_now: true,
                 detected_device_name: det,
                 reboot_recommended: true,
-                message: "VB-CABLE (by VB-Audio) の導入が完了し、CABLE Input に自動接続しました。会議アプリのマイク設定で「CABLE Output」を選択してください（※音声が安定しない場合は一度Windowsを再起動してください）。".into(),
+                message: tr(
+                    "VB-CABLE (by VB-Audio) の導入が完了し、CABLE Input に自動接続しました。会議アプリのマイク設定で「CABLE Output」を選択してください（※音声が安定しない場合は一度Windowsを再起動してください）。",
+                    "VB-CABLE (by VB-Audio) is installed and connected to CABLE Input. Select \"CABLE Output\" as your microphone in your call app (restart Windows if audio seems unstable)."
+                )
+                .into(),
             });
         }
     }
@@ -362,7 +436,11 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
         device_detected_now: false,
         detected_device_name: None,
         reboot_recommended: true,
-        message: "VB-CABLE ドライバのインストールが完了しました。Windows に仮想マイクを認識させるため、一度 PC を再起動してください。".into(),
+        message: tr(
+            "VB-CABLE ドライバのインストールが完了しました。Windows に仮想マイクを認識させるため、一度 PC を再起動してください。",
+            "VB-CABLE driver installation is complete. Please restart your PC so Windows registers the virtual microphone."
+        )
+        .into(),
     })
 }
 
@@ -370,7 +448,10 @@ fn install_windows_vbcable_from_official() -> Result<InstallDriverResult> {
 fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDriverResult> {
     let work_path = std::env::temp_dir().join(format!("shizuka-hal-install-{}", std::process::id()));
     let _ = fs::remove_dir_all(&work_path);
-    fs::create_dir_all(&work_path).context("一時作業フォルダの作成に失敗しました")?;
+    fs::create_dir_all(&work_path).context(tr(
+        "一時作業フォルダの作成に失敗しました",
+        "Failed to create temporary working directory",
+    ))?;
     let work_guard = TempDirGuard(work_path);
     let work_dir = work_guard.path();
     let bundle_dir = work_dir.join("ShizukaAudio.driver");
@@ -384,10 +465,16 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
                 bundle_dir.to_str().unwrap_or_default(),
             ])
             .output()
-            .context("同梱ドライバの一時コピーに失敗しました")?;
+            .context(tr(
+                "同梱ドライバの一時コピーに失敗しました",
+                "Failed to stage bundled audio driver",
+            ))?;
         if !copy_out.status.success() {
             let stderr = String::from_utf8_lossy(&copy_out.stderr);
-            return Err(anyhow!("同梱ドライバの展開に失敗しました: {}", stderr));
+            return Err(match i18n::current_locale() {
+                Locale::Ja => anyhow!("同梱ドライバの展開に失敗しました: {}", stderr),
+                Locale::En => anyhow!("Failed to unpack bundled audio driver: {}", stderr),
+            });
         }
     } else {
         // Fallback path for local `tauri dev` without prebuilt driver resource: compile from bundled MIT source
@@ -423,11 +510,17 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
                 bin_path.to_str().unwrap_or_default(),
             ])
             .output()
-            .context("clang の起動に失敗しました（Xcode Command Line Tools が必要です: xcode-select --install）")?;
+            .context(tr(
+                "clang の起動に失敗しました（Xcode Command Line Tools が必要です: xcode-select --install）",
+                "Failed to launch clang (Xcode Command Line Tools required: xcode-select --install)",
+            ))?;
 
         if !compile.status.success() {
             let stderr = String::from_utf8_lossy(&compile.stderr);
-            return Err(anyhow!("MIT 仮想オーディオドライバのビルドに失敗しました: {}", stderr));
+            return Err(match i18n::current_locale() {
+                Locale::Ja => anyhow!("MIT 仮想オーディオドライバのビルドに失敗しました: {}", stderr),
+                Locale::En => anyhow!("Failed to build MIT virtual audio driver: {}", stderr),
+            });
         }
 
         let sign_out = Command::new("codesign")
@@ -439,13 +532,19 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
                 bundle_dir.to_str().unwrap_or_default(),
             ])
             .output()
-            .context("ドライバへのアドホック署名 (codesign) の起動に失敗しました")?;
+            .context(tr(
+                "ドライバへのアドホック署名 (codesign) の起動に失敗しました",
+                "Failed to launch codesign for ad-hoc driver signing",
+            ))?;
         if !sign_out.status.success() {
             let stderr = String::from_utf8_lossy(&sign_out.stderr);
-            return Err(anyhow!(
-                "仮想オーディオドライバの署名 (codesign) に失敗しました: {}",
-                stderr
-            ));
+            return Err(match i18n::current_locale() {
+                Locale::Ja => anyhow!(
+                    "仮想オーディオドライバの署名 (codesign) に失敗しました: {}",
+                    stderr
+                ),
+                Locale::En => anyhow!("Failed to sign virtual audio driver (codesign): {}", stderr),
+            });
         }
     }
 
@@ -454,7 +553,10 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
     let osa_out = Command::new("osascript")
         .args(["-e", &osa_cmd])
         .output()
-        .context("管理者権限プロンプトの起動に失敗しました")?;
+        .context(tr(
+            "管理者権限プロンプトの起動に失敗しました",
+            "Failed to open administrator password prompt",
+        ))?;
 
     drop(work_guard);
 
@@ -484,7 +586,11 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
                 device_detected_now: true,
                 detected_device_name: devs.recommended_virtual_output,
                 reboot_recommended: false,
-                message: "Shizuka Virtual Mic (MIT ライセンス) の導入が完了し自動接続しました！会議アプリのマイク設定で「Shizuka Virtual Mic」を選択してください。".into(),
+                message: tr(
+                    "Shizuka Virtual Mic (MIT ライセンス) の導入が完了し自動接続しました！会議アプリのマイク設定で「Shizuka Virtual Mic」を選択してください。",
+                    "Shizuka Virtual Mic (MIT License) is installed and connected! Select \"Shizuka Virtual Mic\" as your microphone in your call app."
+                )
+                .into(),
             });
         }
     }
@@ -494,7 +600,11 @@ fn install_macos_mit_hal_driver(resource_dir: Option<&Path>) -> Result<InstallDr
         device_detected_now: false,
         detected_device_name: None,
         reboot_recommended: false,
-        message: "Shizuka Virtual Mic をインストールしました。右上の更新ボタンを押してデバイスを再読み込みしてください。".into(),
+        message: tr(
+            "Shizuka Virtual Mic をインストールしました。右上の更新ボタンを押してデバイスを再読み込みしてください。",
+            "Shizuka Virtual Mic has been installed. Click the refresh button in the top right to rescan audio devices."
+        )
+        .into(),
     })
 }
 
@@ -546,18 +656,44 @@ mod tests {
     #[test]
     fn test_format_macos_osascript_error() {
         assert_eq!(
-            format_macos_osascript_error(Some(1), "36:45: execution error: User canceled. (-128)\n"),
+            format_macos_osascript_error_for(
+                Locale::Ja,
+                Some(1),
+                "36:45: execution error: User canceled. (-128)\n"
+            ),
             "管理者認証がキャンセルされました。"
         );
-        let detail = format_macos_osascript_error(
+        assert_eq!(
+            format_macos_osascript_error_for(
+                Locale::En,
+                Some(1),
+                "36:45: execution error: User canceled. (-128)\n"
+            ),
+            "Administrator authentication was canceled."
+        );
+        let detail_ja = format_macos_osascript_error_for(
+            Locale::Ja,
             Some(1),
             "Could not kickstart service: 1: Operation not permitted\n",
         );
-        assert!(detail.contains("終了コード: 1"));
-        assert!(detail.contains("Operation not permitted"));
+        assert!(detail_ja.contains("終了コード: 1"));
+        assert!(detail_ja.contains("Operation not permitted"));
+
+        let detail_en = format_macos_osascript_error_for(
+            Locale::En,
+            Some(1),
+            "Could not kickstart service: 1: Operation not permitted\n",
+        );
+        assert!(detail_en.contains("exit code: 1"));
+        assert!(detail_en.contains("Operation not permitted"));
+
         assert_eq!(
-            format_macos_osascript_error(Some(2), "   "),
+            format_macos_osascript_error_for(Locale::Ja, Some(2), "   "),
             "ドライバの配置に失敗しました（終了コード: 2）。"
+        );
+        assert_eq!(
+            format_macos_osascript_error_for(Locale::En, Some(2), "   "),
+            "Failed to install the audio driver (exit code: 2)."
         );
     }
 }

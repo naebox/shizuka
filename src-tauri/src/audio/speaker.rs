@@ -14,6 +14,7 @@ use tract_onnx::prelude::*;
 use crate::audio::processor::DFN_HOP_SIZE;
 use crate::config::{AppConfig, ConfigSaver};
 use crate::diagnostics;
+use crate::i18n::{self, tr, Locale};
 
 pub const SPEAKER_SAMPLE_RATE: usize = 16_000;
 pub const SPEAKER_FRAME_SAMPLES_16K: usize = 160; // 10ms hop at 16kHz (exact 3:1 from 480 @ 48kHz)
@@ -477,7 +478,10 @@ impl SpeakerEmbeddingModel {
         let mut gz = GzDecoder::new(Cursor::new(CAMPPLUS_FP16_GZ_BYTES));
         let mut proto = tract_onnx::onnx()
             .proto_model_for_read(&mut gz)
-            .context("声の識別モデルの展開に失敗しました")?;
+            .context(tr(
+                "声の識別モデルの展開に失敗しました",
+                "Failed to unpack bundled voice isolation model",
+            ))?;
 
         // Unpack FP16-compressed weight initializers (`data_type == 10`) back to IEEE-754 f32 (`1`)
         if let Some(ref mut g) = proto.graph {
@@ -496,7 +500,10 @@ impl SpeakerEmbeddingModel {
 
         let mut model = tract_onnx::onnx()
             .model_for_proto_model(&proto)
-            .context("声の識別モデルのグラフ構築に失敗しました")?;
+            .context(tr(
+                "声の識別モデルのグラフ構築に失敗しました",
+                "Failed to build voice isolation model graph",
+            ))?;
         let t_sym = model.symbol_table.sym("T");
         model
             .set_input_fact(
@@ -506,13 +513,22 @@ impl SpeakerEmbeddingModel {
                     tvec!(1.into(), TDim::Sym(t_sym), (FBANK_NUM_BINS as i64).into()),
                 ),
             )
-            .context("声の識別モデルの入力シェイプ設定に失敗しました")?;
+            .context(tr(
+                "声の識別モデルの入力シェイプ設定に失敗しました",
+                "Failed to configure input shape for voice isolation model",
+            ))?;
 
         let runnable = model
             .into_optimized()
-            .context("声の識別モデルの最適化に失敗しました")?
+            .context(tr(
+                "声の識別モデルの最適化に失敗しました",
+                "Failed to optimize voice isolation model",
+            ))?
             .into_runnable()
-            .context("声の識別モデルの実行プラン構築に失敗しました")?;
+            .context(tr(
+                "声の識別モデルの実行プラン構築に失敗しました",
+                "Failed to build execution plan for voice isolation model",
+            ))?;
 
         Ok(Self { runnable })
     }
@@ -528,7 +544,10 @@ impl SpeakerEmbeddingModel {
         baseline_tilt: Option<&[f32; FBANK_NUM_BINS]>,
     ) -> Result<([f32; SPEAKER_EMBEDDING_DIM], FbankWindowStats)> {
         if frames.len() < 15 {
-            return Err(anyhow!("音声フレームが短すぎます ({} frames)", frames.len()));
+            return Err(match i18n::current_locale() {
+                Locale::Ja => anyhow!("音声フレームが短すぎます ({} frames)", frames.len()),
+                Locale::En => anyhow!("Speech window too short ({} frames)", frames.len()),
+            });
         }
         let n = frames.len();
         let stats = compute_fbank_window_stats(frames);
@@ -553,22 +572,35 @@ impl SpeakerEmbeddingModel {
         }
 
         let input = tract_ndarray::Array3::from_shape_vec((1, n, FBANK_NUM_BINS), flat)
-            .context("特徴量テンソル生成エラー")?
+            .context(tr(
+                "特徴量テンソル生成エラー",
+                "Failed to construct feature tensor",
+            ))?
             .into_tensor();
         let outputs = self
             .runnable
             .run(tvec!(input.into()))
-            .context("声の識別推論エラー")?;
+            .context(tr("声の識別推論エラー", "Voice isolation inference error"))?;
         let view = outputs[0]
             .to_array_view::<f32>()
-            .context("特徴ベクトル読み取りエラー")?;
+            .context(tr(
+                "特徴ベクトル読み取りエラー",
+                "Failed to read speaker embedding output",
+            ))?;
 
         if view.len() != SPEAKER_EMBEDDING_DIM {
-            return Err(anyhow!(
-                "想定外の特徴ベクトル次元: {} (expected {})",
-                view.len(),
-                SPEAKER_EMBEDDING_DIM
-            ));
+            return Err(match i18n::current_locale() {
+                Locale::Ja => anyhow!(
+                    "想定外の特徴ベクトル次元: {} (expected {})",
+                    view.len(),
+                    SPEAKER_EMBEDDING_DIM
+                ),
+                Locale::En => anyhow!(
+                    "Unexpected speaker embedding dimension: {} (expected {})",
+                    view.len(),
+                    SPEAKER_EMBEDDING_DIM
+                ),
+            });
         }
 
         let mut emb = [0.0f32; SPEAKER_EMBEDDING_DIM];
@@ -576,7 +608,13 @@ impl SpeakerEmbeddingModel {
             *dst = if src.is_finite() { src } else { 0.0 };
         }
         if !l2_normalize(&mut emb) {
-            return Err(anyhow!("無音のため声の特徴を抽出できませんでした"));
+            return Err(anyhow!(
+                "{}",
+                tr(
+                    "無音のため声の特徴を抽出できませんでした",
+                    "Could not extract voice features from silent audio"
+                )
+            ));
         }
         Ok((emb, stats))
     }

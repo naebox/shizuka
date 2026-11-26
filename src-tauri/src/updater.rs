@@ -7,6 +7,7 @@ use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::diagnostics;
+use crate::i18n::{self, tr, Locale};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -155,7 +156,10 @@ pub fn open_releases_page_in_browser() -> Result<(), String> {
             .args(["url.dll,FileProtocolHandler", RELEASES_PAGE_URL])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
-            .map_err(|e| format!("ブラウザの起動に失敗しました: {}", e))?;
+            .map_err(|e| match i18n::current_locale() {
+                Locale::Ja => format!("ブラウザの起動に失敗しました: {}", e),
+                Locale::En => format!("Failed to open web browser: {}", e),
+            })?;
         Ok(())
     }
     #[cfg(target_os = "macos")]
@@ -163,7 +167,10 @@ pub fn open_releases_page_in_browser() -> Result<(), String> {
         Command::new("open")
             .arg(RELEASES_PAGE_URL)
             .spawn()
-            .map_err(|e| format!("ブラウザの起動に失敗しました: {}", e))?;
+            .map_err(|e| match i18n::current_locale() {
+                Locale::Ja => format!("ブラウザの起動に失敗しました: {}", e),
+                Locale::En => format!("Failed to open web browser: {}", e),
+            })?;
         Ok(())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -171,7 +178,10 @@ pub fn open_releases_page_in_browser() -> Result<(), String> {
         Command::new("xdg-open")
             .arg(RELEASES_PAGE_URL)
             .spawn()
-            .map_err(|e| format!("ブラウザの起動に失敗しました: {}", e))?;
+            .map_err(|e| match i18n::current_locale() {
+                Locale::Ja => format!("ブラウザの起動に失敗しました: {}", e),
+                Locale::En => format!("Failed to open web browser: {}", e),
+            })?;
         Ok(())
     }
 }
@@ -182,7 +192,10 @@ pub async fn check_for_update_impl(app: &AppHandle) -> Result<UpdateCheckResult,
 
     let updater = app
         .updater()
-        .map_err(|e| format!("アップデータの初期化に失敗しました: {}", e))?;
+        .map_err(|e| match i18n::current_locale() {
+            Locale::Ja => format!("アップデータの初期化に失敗しました: {}", e),
+            Locale::En => format!("Failed to initialize updater: {}", e),
+        })?;
 
     match updater.check().await {
         Ok(Some(update)) => Ok(UpdateCheckResult {
@@ -203,7 +216,10 @@ pub async fn check_for_update_impl(app: &AppHandle) -> Result<UpdateCheckResult,
             is_portable,
             releases_url: RELEASES_PAGE_URL.to_string(),
         }),
-        Err(e) => Err(format!("アップデートの確認に失敗しました: {}", e)),
+        Err(e) => Err(match i18n::current_locale() {
+            Locale::Ja => format!("アップデートの確認に失敗しました: {}", e),
+            Locale::En => format!("Failed to check for updates: {}", e),
+        }),
     }
 }
 
@@ -218,14 +234,20 @@ where
     FResume: FnOnce() + Send + 'static,
 {
     if is_current_build_portable() {
-        return Err(
-            "ポータブル版は自動更新に対応していません。GitHub Releases から最新版をダウンロードしてください。"
-                .to_string(),
-        );
+        return Err(tr(
+            "ポータブル版は自動更新に対応していません。GitHub Releases から最新版をダウンロードしてください。",
+            "Portable builds do not support automatic updates. Please download the latest version from GitHub Releases.",
+        )
+        .to_string());
     }
 
-    let _guard = UpdateInProgressGuard::acquire()
-        .ok_or_else(|| "アップデートの適用がすでに進行中です。".to_string())?;
+    let _guard = UpdateInProgressGuard::acquire().ok_or_else(|| {
+        tr(
+            "アップデートの適用がすでに進行中です。",
+            "An update installation is already in progress.",
+        )
+        .to_string()
+    })?;
 
     if let Ok(mut p) = progress.lock() {
         *p = UpdateProgressSnapshot {
@@ -239,7 +261,10 @@ where
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
-            let msg = format!("アップデータの初期化に失敗しました: {}", e);
+            let msg = match i18n::current_locale() {
+                Locale::Ja => format!("アップデータの初期化に失敗しました: {}", e),
+                Locale::En => format!("Failed to initialize updater: {}", e),
+            };
             diagnostics::error(&msg);
             if let Ok(mut p) = progress.lock() {
                 p.phase = "error".to_string();
@@ -255,10 +280,17 @@ where
             if let Ok(mut p) = progress.lock() {
                 *p = UpdateProgressSnapshot::default();
             }
-            return Err("利用可能なアップデートはありません。".to_string());
+            return Err(tr(
+                "利用可能なアップデートはありません。",
+                "No updates are available.",
+            )
+            .to_string());
         }
         Err(e) => {
-            let msg = format!("アップデートの確認に失敗しました: {}", e);
+            let msg = match i18n::current_locale() {
+                Locale::Ja => format!("アップデートの確認に失敗しました: {}", e),
+                Locale::En => format!("Failed to check for updates: {}", e),
+            };
             diagnostics::warn(&msg);
             if let Ok(mut p) = progress.lock() {
                 p.phase = "error".to_string();
@@ -290,7 +322,14 @@ where
     {
         Ok(bytes) => bytes,
         Err(e) => {
-            let msg = format!("アップデートのダウンロードまたは署名検証に失敗しました: {}", e);
+            let msg = match i18n::current_locale() {
+                Locale::Ja => {
+                    format!("アップデートのダウンロードまたは署名検証に失敗しました: {}", e)
+                }
+                Locale::En => {
+                    format!("Failed to download or verify update signature: {}", e)
+                }
+            };
             diagnostics::error(&msg);
             if let Ok(mut p) = progress.lock() {
                 p.phase = "error".to_string();
@@ -309,10 +348,16 @@ where
 
     let install_res = tauri::async_runtime::spawn_blocking(move || update.install(&verified_bytes))
         .await
-        .map_err(|e| format!("アップデート適用タスクの実行に失敗しました: {}", e))?;
+        .map_err(|e| match i18n::current_locale() {
+            Locale::Ja => format!("アップデート適用タスクの実行に失敗しました: {}", e),
+            Locale::En => format!("Update installation task failed: {}", e),
+        })?;
 
     if let Err(e) = install_res {
-        let msg = format!("アップデートの適用に失敗しました: {}", e);
+        let msg = match i18n::current_locale() {
+            Locale::Ja => format!("アップデートの適用に失敗しました: {}", e),
+            Locale::En => format!("Failed to install update: {}", e),
+        };
         diagnostics::error(&msg);
         // Restore microphone pipeline if installer failed or user cancelled UAC prompt
         resume_audio();

@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::diagnostics;
+use crate::i18n::LanguagePreference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +79,7 @@ pub struct AppConfig {
     pub shortcut_toggle_nc: Option<String>,
     pub shortcut_toggle_mute: Option<String>,
     pub shortcut_sound_enabled: bool,
+    pub language: LanguagePreference,
 }
 
 impl Default for AppConfig {
@@ -109,6 +111,7 @@ impl Default for AppConfig {
             shortcut_toggle_nc: None,
             shortcut_toggle_mute: None,
             shortcut_sound_enabled: true,
+            language: LanguagePreference::Auto,
         }
     }
 }
@@ -540,6 +543,7 @@ mod tests {
         assert_eq!(loaded.shortcut_toggle_nc, None);
         assert_eq!(loaded.shortcut_toggle_mute, None);
         assert!(loaded.shortcut_sound_enabled);
+        assert_eq!(loaded.language, LanguagePreference::Auto);
 
         // Initial startup with unseen mic must NOT wipe the migrated v0.2.0 gain (+4.5 dB)
         let mut migrated = loaded;

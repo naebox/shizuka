@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut};
 
+use crate::i18n::{self, tr, tr_for, Locale};
+
 const TRIGGER_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +13,75 @@ const TRIGGER_DEBOUNCE: Duration = Duration::from_millis(200);
 pub enum ShortcutAction {
     ToggleNc,
     ToggleMute,
+}
+
+#[derive(Debug, Clone)]
+enum ShortcutParseIssue {
+    Empty,
+    InvalidFormat(String),
+    UnmodifiedKeyDisallowed,
+}
+
+impl ShortcutParseIssue {
+    fn format_for(&self, locale: Locale) -> String {
+        match self {
+            Self::Empty => {
+                tr_for(locale, "ショートカットキーが空です", "Shortcut key is empty").to_string()
+            }
+            Self::InvalidFormat(raw) => match locale {
+                Locale::Ja => format!("未対応または無効なショートカット形式です: {}", raw),
+                Locale::En => format!("Unsupported or invalid shortcut format: {}", raw),
+            },
+            Self::UnmodifiedKeyDisallowed => tr_for(
+                locale,
+                "単一キーはファンクションキー（F1〜F24 等）のみ登録できます。Ctrl / Alt / Shift 等と組み合わせてください。",
+                "Single-key shortcuts are only allowed for function keys (F1–F24, etc.). Combine with Ctrl, Alt, or Shift.",
+            )
+            .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum StartupWarning {
+    ParseIssue(ShortcutParseIssue),
+    RegisterNcFailed { raw: String, err: String },
+    RegisterMuteFailed { raw: String, err: String },
+    DuplicateBinding,
+}
+
+impl StartupWarning {
+    fn format_for(&self, locale: Locale) -> String {
+        match self {
+            Self::ParseIssue(issue) => issue.format_for(locale),
+            Self::RegisterNcFailed { raw, err } => match locale {
+                Locale::Ja => format!(
+                    "ノイズ除去ショートカット（{}）を登録できませんでした: {}",
+                    raw, err
+                ),
+                Locale::En => format!(
+                    "Could not register noise cancellation shortcut ({}): {}",
+                    raw, err
+                ),
+            },
+            Self::RegisterMuteFailed { raw, err } => match locale {
+                Locale::Ja => format!(
+                    "マイクミュートショートカット（{}）を登録できませんでした: {}",
+                    raw, err
+                ),
+                Locale::En => format!(
+                    "Could not register mic mute shortcut ({}): {}",
+                    raw, err
+                ),
+            },
+            Self::DuplicateBinding => tr_for(
+                locale,
+                "ノイズ除去とマイクミュートに同じショートカットが設定されています。",
+                "Noise cancellation and mic mute are assigned the same shortcut.",
+            )
+            .to_string(),
+        }
+    }
 }
 
 fn is_unmodified_key_allowed(code: Code) -> bool {
@@ -52,22 +123,23 @@ fn is_unmodified_key_allowed(code: Code) -> bool {
     )
 }
 
-pub fn validate_and_parse_shortcut(raw: &str) -> Result<Shortcut, String> {
+fn parse_shortcut_inner(raw: &str) -> Result<Shortcut, ShortcutParseIssue> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("ショートカットキーが空です".to_string());
+        return Err(ShortcutParseIssue::Empty);
     }
     let shortcut = Shortcut::from_str(trimmed)
-        .map_err(|_| format!("未対応または無効なショートカット形式です: {}", trimmed))?;
+        .map_err(|_| ShortcutParseIssue::InvalidFormat(trimmed.to_string()))?;
 
     if shortcut.mods.is_empty() && !is_unmodified_key_allowed(shortcut.key) {
-        return Err(
-            "単一キーはファンクションキー（F1〜F24 等）のみ登録できます。Ctrl / Alt / Shift 等と組み合わせてください。"
-                .to_string(),
-        );
+        return Err(ShortcutParseIssue::UnmodifiedKeyDisallowed);
     }
 
     Ok(shortcut)
+}
+
+pub fn validate_and_parse_shortcut(raw: &str) -> Result<Shortcut, String> {
+    parse_shortcut_inner(raw).map_err(|issue| issue.format_for(i18n::current_locale()))
 }
 
 #[derive(Default)]
@@ -77,7 +149,7 @@ pub struct ShortcutRegistry {
     paused: bool,
     last_triggered_nc: Option<Instant>,
     last_triggered_mute: Option<Instant>,
-    startup_warning: Option<String>,
+    startup_warnings: Vec<StartupWarning>,
 }
 
 impl ShortcutRegistry {
@@ -91,49 +163,53 @@ impl ShortcutRegistry {
         let manager = app.global_shortcut();
 
         if let Some(raw) = nc_raw.map(str::trim).filter(|s| !s.is_empty()) {
-            match validate_and_parse_shortcut(raw) {
+            match parse_shortcut_inner(raw) {
                 Ok(sc) => match manager.register(sc) {
                     Ok(()) => self.toggle_nc = Some(sc),
-                    Err(e) => warnings.push(format!(
-                        "ノイズ除去ショートカット（{}）を登録できませんでした: {}",
-                        raw, e
-                    )),
+                    Err(e) => warnings.push(StartupWarning::RegisterNcFailed {
+                        raw: raw.to_string(),
+                        err: e.to_string(),
+                    }),
                 },
-                Err(e) => warnings.push(e),
+                Err(issue) => warnings.push(StartupWarning::ParseIssue(issue)),
             }
         }
 
         if let Some(raw) = mute_raw.map(str::trim).filter(|s| !s.is_empty()) {
-            match validate_and_parse_shortcut(raw) {
+            match parse_shortcut_inner(raw) {
                 Ok(sc) => {
                     if self.toggle_nc == Some(sc) {
-                        warnings.push(
-                            "ノイズ除去とマイクミュートに同じショートカットが設定されています。"
-                                .to_string(),
-                        );
+                        warnings.push(StartupWarning::DuplicateBinding);
                     } else {
                         match manager.register(sc) {
                             Ok(()) => self.toggle_mute = Some(sc),
-                            Err(e) => warnings.push(format!(
-                                "マイクミュートショートカット（{}）を登録できませんでした: {}",
-                                raw, e
-                            )),
+                            Err(e) => warnings.push(StartupWarning::RegisterMuteFailed {
+                                raw: raw.to_string(),
+                                err: e.to_string(),
+                            }),
                         }
                     }
                 }
-                Err(e) => warnings.push(e),
+                Err(issue) => warnings.push(StartupWarning::ParseIssue(issue)),
             }
         }
 
-        self.startup_warning = if warnings.is_empty() {
-            None
-        } else {
-            Some(warnings.join(" / "))
-        };
+        self.startup_warnings = warnings;
     }
 
     pub fn startup_warning(&self) -> Option<String> {
-        self.startup_warning.clone()
+        if self.startup_warnings.is_empty() {
+            None
+        } else {
+            let locale = i18n::current_locale();
+            Some(
+                self.startup_warnings
+                    .iter()
+                    .map(|w| w.format_for(locale))
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+            )
+        }
     }
 
     /// Updates a shortcut binding transactionally and ensures shortcuts are active (unpaused):
@@ -157,10 +233,11 @@ impl ShortcutRegistry {
         };
         if let (Some(new_sc), Some(other_sc)) = (new_shortcut, other_shortcut) {
             if new_sc == other_sc {
-                return Err(
-                    "もう一方の操作と同じショートカットは登録できません。別のキーを指定してください。"
-                        .to_string(),
-                );
+                return Err(tr(
+                    "もう一方の操作と同じショートカットは登録できません。別のキーを指定してください。",
+                    "This shortcut is already assigned to the other action. Please choose a different key.",
+                )
+                .to_string());
             }
         }
 
@@ -176,7 +253,7 @@ impl ShortcutRegistry {
             if was_paused {
                 self.set_paused(app, false)?;
             }
-            self.startup_warning = None;
+            self.startup_warnings.clear();
             return Ok(cleaned.map(String::from));
         }
 
@@ -198,10 +275,16 @@ impl ShortcutRegistry {
                     }
                     self.paused = false;
                 }
-                return Err(format!(
-                    "このショートカットは他のアプリまたは OS で使用されているため登録できません（{}）",
-                    err
-                ));
+                return Err(match i18n::current_locale() {
+                    Locale::Ja => format!(
+                        "このショートカットは他のアプリまたは OS で使用されているため登録できません（{}）",
+                        err
+                    ),
+                    Locale::En => format!(
+                        "This shortcut is already in use by another app or the OS ({})",
+                        err
+                    ),
+                });
             }
         }
 
@@ -216,7 +299,7 @@ impl ShortcutRegistry {
             ShortcutAction::ToggleNc => self.toggle_nc = new_shortcut,
             ShortcutAction::ToggleMute => self.toggle_mute = new_shortcut,
         }
-        self.startup_warning = None;
+        self.startup_warnings.clear();
         Ok(cleaned.map(String::from))
     }
 
@@ -251,10 +334,11 @@ impl ShortcutRegistry {
             if failed.is_empty() {
                 Ok(())
             } else {
-                Err(format!(
-                    "ショートカットの再登録に失敗しました: {}",
-                    failed.join(", ")
-                ))
+                let joined = failed.join(", ");
+                Err(match i18n::current_locale() {
+                    Locale::Ja => format!("ショートカットの再登録に失敗しました: {}", joined),
+                    Locale::En => format!("Failed to re-register shortcuts: {}", joined),
+                })
             }
         }
     }

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Shizuka",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "identifier": "app.shizuka.audio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -56,7 +56,11 @@
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",
-      "entitlements": "Entitlements.plist"
+      "entitlements": "Entitlements.plist",
+      "files": {
+        "Resources/en.lproj/InfoPlist.strings": "macos/en.lproj/InfoPlist.strings",
+        "Resources/ja.lproj/InfoPlist.strings": "macos/ja.lproj/InfoPlist.strings"
+      }
     }
   },
   "plugins": {
