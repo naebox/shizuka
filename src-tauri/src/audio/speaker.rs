@@ -109,7 +109,7 @@ impl Downsampler48kTo16k {
         in_480: &[f32; DFN_HOP_SIZE],
         out_160: &mut [f32; SPEAKER_FRAME_SAMPLES_16K],
     ) {
-        for (dst, chunk) in out_160.iter_mut().zip(in_480.chunks_exact(3)) {
+        for (dst, chunk) in out_160.iter_mut().zip(in_480.as_chunks::<3>().0) {
             let mut y = 0.0_f64;
             for &s in chunk {
                 let x = if s.is_finite() { s as f64 } else { 0.0 };
@@ -484,8 +484,8 @@ impl SpeakerEmbeddingModel {
             for init in &mut g.initializer {
                 if init.data_type == 10 && !init.raw_data.is_empty() {
                     let mut f32_bytes = Vec::with_capacity(init.raw_data.len() * 2);
-                    for b in init.raw_data.chunks_exact(2) {
-                        let v = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+                    for &b in init.raw_data.as_chunks::<2>().0 {
+                        let v = half::f16::from_le_bytes(b).to_f32();
                         f32_bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     init.raw_data = f32_bytes;
