@@ -1026,12 +1026,16 @@ pub fn run() {
         ))
         .setup(move |app| {
             if let Some(base_win_cfg) = app.config().app.windows.first() {
-                let mut win_cfg = base_win_cfg.clone();
                 #[cfg(target_os = "windows")]
                 {
+                    let mut win_cfg = base_win_cfg.clone();
                     win_cfg.decorations = false;
+                    WebviewWindowBuilder::from_config(app, &win_cfg)?.build()?;
                 }
-                WebviewWindowBuilder::from_config(app, &win_cfg)?.build()?;
+                #[cfg(not(target_os = "windows"))]
+                {
+                    WebviewWindowBuilder::from_config(app, base_win_cfg)?.build()?;
+                }
             }
 
             let start_minimized = std::env::args().any(|arg| arg == "--minimized");

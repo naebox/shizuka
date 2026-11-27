@@ -8,7 +8,9 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "check:release": "node scripts/extract-release-notes.mjs --check-manifests"
+    "check:release": "node scripts/extract-release-notes.mjs --check-manifests",
+    "ship": "node scripts/ship.mjs",
+    "ship:release": "node scripts/ship.mjs --release"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

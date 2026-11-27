@@ -37,3 +37,8 @@
 
 6. **Bilingual Localization Parity (`ja` / `en`)**
    - Keep all user-facing strings in the WebView UI (`src/i18n.ts`), Rust backend / system tray (`src-tauri/src/i18n.rs`), and macOS permission prompts (`src-tauri/Info.plist`, `src-tauri/macos/*.lproj/InfoPlist.strings`) localized in both Japanese (`ja`) and idiomatic English (`en`) with zero external i18n library dependencies.
+
+7. **Zero-Failure Cross-Platform CI & Release Shipping (`npm run ship`)**
+   - Keep the Rust & Clippy version pinned in [rust-toolchain.toml](./rust-toolchain.toml) so local development and GitHub Actions (`ci.yml` / `release.yml`) always run identical lint rules.
+   - When writing `#[cfg(target_os = "...")]` blocks in `src-tauri/src/`, scope `mut` bindings and OS-specific imports strictly inside the matching `#[cfg(...)]` block so `cargo clippy -- -D warnings` passes cleanly on both Windows and macOS.
+   - **Never push unverified commits directly to `main` or push `main` + `vX.Y.Z` tags simultaneously.** Always ship via `npm run ship` (for normal commits) or `npm run ship:release` (for version releases): [scripts/ship.mjs](./scripts/ship.mjs) pushes `HEAD` to an ephemeral `verify/<sha>` branch, waits for GitHub Actions `CI` (Ubuntu + Windows + macOS) to succeed on that exact commit, cleans up `verify/<sha>`, and only then fast-forwards `origin/main` and pushes the release tag.
