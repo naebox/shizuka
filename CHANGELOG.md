@@ -6,6 +6,30 @@ Release history of key features, improvements, and bug fixes across **Shizuka** 
 
 ---
 
+## [0.7.1] (2026-11-27) — タイトルバーの一体化・画面表記の整理・macOS スクロール修正 / Unified Titlebar, Cleaner Labels & macOS Scroll Fix
+
+### 主な変更点
+- **ウィンドウのタイトルバーと上部ツールバーを一体化**
+  - OS 標準タイトルバーの重複する `Shizuka` 表記をなくし、macOS の信号機ボタン／Windows の最小化・閉じるボタンとアプリの操作アイコンを 1 本のスリムな固定バーに統合しました。
+  - リアルタイムの `CPU` 使用率と処理遅延（`ms`）の表示を「AI ノイズキャンセリング」カード内へ集約し、上部をよりすっきりとドラッグ移動しやすい構成にしました。
+- **モデル選択・レベルメーターの表記をシンプルに整理**
+  - AI モデル選択から専門的な型番（`DFN3` / `DFN3-LL`）を外し、`高精度` と `超低遅延` のわかりやすい表記に統一しました。
+  - 入力レベルメーターの見出しを `処理前` に簡潔化し、`ノイズ除去後` とひと目で対比できるようにしました。
+- **macOS で設定画面を最後までスクロールした際の背面スクロール反応を修正**
+  - アプリ設定モーダル（および更新履歴）を下端までスクロールしたときに、後ろのメイン画面まで一緒にスクロールしてしまう問題を修正しました。
+
+### What's Changed
+- **Unified Minimal Titlebar & Relocated Live Telemetry**
+  - Merged the window titlebar and top toolbar into a single sleek, sticky bar—removing the duplicate `Shizuka` title next to macOS traffic lights and adding integrated minimize/close caption controls on Windows.
+  - Moved live `CPU` and latency (`ms`) telemetry into the **AI Noise Cancellation** hero card for a calmer top frame with a wider window drag area.
+- **Cleaner Model & Level Meter Labels**
+  - Simplified the AI Model selector and section summary to **High Accuracy** and **Low Latency** without internal `DFN3` / `DFN3-LL` model codes.
+  - Shortened the raw input meter label to **Unprocessed** so it pairs cleanly with **Noise Cancelled**.
+- **Fixed Background Scroll Chaining in Settings on macOS**
+  - Fixed an issue on macOS (`WKWebView`) where scrolling to the bottom of the **Settings** or **Release Notes** modal could scroll the underlying main window.
+
+---
+
 ## [0.7.0] (2026-11-26) — 英語表示対応＆アプリ内更新履歴ビューア / English Localization & In-App Release Notes
 
 ### 主な変更点

@@ -18,6 +18,8 @@ export interface UiMessages {
     rescanDevices: string;
     openSettings: string;
     openSettingsWithUpdate: string;
+    minimizeWindow: string;
+    closeWindow: string;
   };
   banners: {
     waitingMicPrefix: string;
@@ -204,6 +206,8 @@ const JA_MESSAGES: UiMessages = {
     rescanDevices: "オーディオデバイスを再スキャン",
     openSettings: "アプリ設定を開く",
     openSettingsWithUpdate: "アプリ設定を開く（新しいアップデートがあります）",
+    minimizeWindow: "最小化",
+    closeWindow: "閉じる",
   },
   banners: {
     waitingMicPrefix: "マイク再接続待ち：",
@@ -215,11 +219,11 @@ const JA_MESSAGES: UiMessages = {
     title: "AI ノイズキャンセリング",
     stateOn: "ON",
     stateBypass: "スルー",
-    micMutedLabel: "マイクミュート中（無音）",
+    micMutedLabel: "マイクミュート中",
     micLiveLabel: "マイク送信中",
     unmuteBtn: "ミュート解除",
     muteBtn: "ミュート",
-    meterInputRaw: "入力マイク (処理前)",
+    meterInputRaw: "処理前",
     meterMutedSilence: "ミュート中 (無音送信)",
     meterDenoised: "ノイズ除去後",
     meterBypassRaw: "スルー出力 (未処理)",
@@ -245,8 +249,8 @@ const JA_MESSAGES: UiMessages = {
   tuning: {
     sectionTitle: "除去強度・音質チューニング",
     aiModelLegend: "AI モデル選択",
-    modelStandard: "高精度 DFN3 (推奨)",
-    modelLowLatency: "超低遅延 DFN3-LL",
+    modelStandard: "高精度",
+    modelLowLatency: "超低遅延",
     presetLegend: "ノイズ除去プリセット",
     presetNatural: "ナチュラル",
     presetBalanced: "バランス (推奨)",
@@ -401,6 +405,8 @@ const EN_MESSAGES: UiMessages = {
     rescanDevices: "Rescan audio devices",
     openSettings: "Open settings",
     openSettingsWithUpdate: "Open settings (new update available)",
+    minimizeWindow: "Minimize",
+    closeWindow: "Close",
   },
   banners: {
     waitingMicPrefix: "Waiting for Microphone: ",
@@ -413,11 +419,11 @@ const EN_MESSAGES: UiMessages = {
     title: "AI Noise Cancellation",
     stateOn: "ON",
     stateBypass: "Bypass",
-    micMutedLabel: "Mic Muted (Silent)",
+    micMutedLabel: "Mic Muted",
     micLiveLabel: "Mic Active",
     unmuteBtn: "Unmute",
     muteBtn: "Mute",
-    meterInputRaw: "Mic Input (Raw)",
+    meterInputRaw: "Unprocessed",
     meterMutedSilence: "Muted (Sending Silence)",
     meterDenoised: "Noise Cancelled",
     meterBypassRaw: "Bypass (Unprocessed)",
@@ -444,8 +450,8 @@ const EN_MESSAGES: UiMessages = {
   tuning: {
     sectionTitle: "Noise & Voice Tuning",
     aiModelLegend: "AI Model",
-    modelStandard: "Standard DFN3 (Rec.)",
-    modelLowLatency: "Low-Latency DFN3-LL",
+    modelStandard: "High Accuracy",
+    modelLowLatency: "Low Latency",
     presetLegend: "Suppression Preset",
     presetNatural: "Natural",
     presetBalanced: "Balanced",

@@ -8,6 +8,7 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowLeft,
   AudioLines,
@@ -37,10 +38,10 @@ import {
 import {
   AecLiveBadge,
   AgcLiveBadge,
+  HeroInlineStats,
   HeroLiveMeters,
   MicTestLiveMeter,
   SettingsDiagGrid,
-  TopBarStatPills,
   VadLiveBadge,
   VoiceAutoLearnProgress,
   VoiceGateLiveBadge,
@@ -314,8 +315,8 @@ function ShizukaMark({
     <svg
       className={`brand-mark ${muted ? "muted" : active ? "active" : ""}`}
       viewBox="0 0 100 100"
-      width="26"
-      height="26"
+      width="20"
+      height="20"
       shapeRendering="geometricPrecision"
       aria-hidden="true"
     >
@@ -816,10 +817,35 @@ export function App() {
       dialog.addEventListener("pointerup", onPointerUp);
     }
 
+    // WKWebView fallback: Safari ignores `overscroll-behavior: contain` on non-scrollable
+    // areas (backdrop/header/footer) and chains new wheel gestures started at scroll boundaries.
+    const canScrollY = (el: HTMLElement, dy: number) =>
+      (dy < 0 && el.scrollTop > 0) ||
+      (dy > 0 && el.scrollTop + el.clientHeight < el.scrollHeight - 1);
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || !dialog.open) return;
+      for (
+        let el = e.target instanceof HTMLElement ? e.target : null;
+        el && el !== dialog;
+        el = el.parentElement
+      ) {
+        if (
+          (el.classList.contains("update-notes-preview") ||
+            el.classList.contains("settings-dialog-body")) &&
+          canScrollY(el, e.deltaY)
+        ) {
+          return;
+        }
+      }
+      e.preventDefault();
+    };
+    dialog.addEventListener("wheel", onWheel, { passive: false });
+
     return () => {
       dialog.removeEventListener("close", onClose);
       dialog.removeEventListener("keydown", onDialogKeyDown);
       dialog.removeEventListener("cancel", onCancel);
+      dialog.removeEventListener("wheel", onWheel);
       if (!supportsClosedBy) {
         dialog.removeEventListener("pointerdown", onPointerDown);
         dialog.removeEventListener("pointerup", onPointerUp);
@@ -1273,6 +1299,18 @@ export function App() {
     }
   };
 
+  const handleMinimizeWindow = () => {
+    void getCurrentWindow()
+      .minimize()
+      .catch(() => {});
+  };
+
+  const handleCloseWindow = () => {
+    void getCurrentWindow()
+      .close()
+      .catch(() => {});
+  };
+
   const handleToggleAutostart = async (next: boolean) => {
     setAutostartBusy(true);
     setAutostartError(null);
@@ -1424,7 +1462,10 @@ export function App() {
   const monVolPct = Math.round(
     (config?.monitor_volume ?? telemetry?.monitor_volume ?? 0.8) * 100
   );
-  const isMac = devices?.platform === "macos";
+  const isMac = devices
+    ? devices.platform === "macos"
+    : typeof navigator !== "undefined" &&
+      /Mac|iPhone|iPod|iPad/i.test(navigator.userAgent);
   const shortcutSoundEnabled = config?.shortcut_sound_enabled ?? true;
   const connState = telemetry?.connection_state ?? "running";
   const displayVersion = updateInfo?.current_version ?? appVersion;
@@ -1490,56 +1531,121 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <ShizukaMark
-            active={Boolean(telemetry?.stream_running && ncEnabled)}
-            muted={micMuted}
-          />
-          <h1 className="brand-title">Shizuka</h1>
-        </div>
-        <div className="badge-row">
-          <TopBarStatPills />
-          <button
-            type="button"
-            className="icon-btn"
-            onClick={handleToggleColorScheme}
-          >
-            <span className="theme-branch if-dark">
-              <Sun size={14} aria-hidden="true" />
-              <span className="visually-hidden">{t.topbar.switchToLight}</span>
-            </span>
-            <span className="theme-branch if-light">
-              <Moon size={14} aria-hidden="true" />
-              <span className="visually-hidden">{t.topbar.switchToDark}</span>
-            </span>
-          </button>
-          <button
-            type="button"
-            className={`icon-btn ${rescanning ? "is-busy" : ""}`}
-            disabled={rescanning}
-            onClick={() => void refreshDevicesAndConfig(true)}
-            aria-label={t.topbar.rescanDevices}
-          >
-            <RefreshCw size={14} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className="icon-btn settings-icon-btn"
-            onClick={openSettingsDialog}
-            aria-label={
-              updateInfo?.available
-                ? t.topbar.openSettingsWithUpdate
-                : t.topbar.openSettings
-            }
-          >
-            <Settings size={14} aria-hidden="true" />
-            {updateInfo?.available && (
-              <span className="update-badge-dot" aria-hidden="true" />
+      <div className="topbar-sticky">
+        <header
+          className={`topbar ${isMac ? "is-mac" : "is-win"}`}
+          data-tauri-drag-region="deep"
+        >
+          <h1 className="visually-hidden">Shizuka</h1>
+          <div className="topbar-start">
+            {!isMac && (
+              <ShizukaMark
+                active={Boolean(telemetry?.stream_running && ncEnabled)}
+                muted={micMuted}
+              />
             )}
-          </button>
-        </div>
-      </header>
+          </div>
+          <div className="topbar-end">
+            <div className="topbar-actions">
+              <button
+                type="button"
+                className="topbar-icon-btn"
+                onClick={handleToggleColorScheme}
+              >
+                <span className="theme-branch if-dark">
+                  <Sun size={14} aria-hidden="true" />
+                  <span className="visually-hidden">{t.topbar.switchToLight}</span>
+                </span>
+                <span className="theme-branch if-light">
+                  <Moon size={14} aria-hidden="true" />
+                  <span className="visually-hidden">{t.topbar.switchToDark}</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`topbar-icon-btn ${rescanning ? "is-busy" : ""}`}
+                disabled={rescanning}
+                onClick={() => void refreshDevicesAndConfig(true)}
+                aria-label={t.topbar.rescanDevices}
+                title={t.topbar.rescanDevices}
+              >
+                <RefreshCw size={14} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="topbar-icon-btn settings-icon-btn"
+                onClick={openSettingsDialog}
+                aria-label={
+                  updateInfo?.available
+                    ? t.topbar.openSettingsWithUpdate
+                    : t.topbar.openSettings
+                }
+                title={
+                  updateInfo?.available
+                    ? t.topbar.openSettingsWithUpdate
+                    : t.topbar.openSettings
+                }
+              >
+                <Settings size={14} aria-hidden="true" />
+                {updateInfo?.available && (
+                  <span className="update-badge-dot" aria-hidden="true" />
+                )}
+              </button>
+            </div>
+            {!isMac && (
+              <>
+                <span
+                  className="topbar-divider"
+                  role="separator"
+                  aria-orientation="vertical"
+                />
+                <div className="win-caption-controls">
+                  <button
+                    type="button"
+                    className="win-caption-btn"
+                    onClick={handleMinimizeWindow}
+                    aria-label={t.topbar.minimizeWindow}
+                    title={t.topbar.minimizeWindow}
+                  >
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 10 10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                      aria-hidden="true"
+                    >
+                      <line x1="1" y1="5" x2="9" y2="5" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    className="win-caption-btn is-close"
+                    onClick={handleCloseWindow}
+                    aria-label={t.topbar.closeWindow}
+                    title={t.topbar.closeWindow}
+                  >
+                    <svg
+                      width="10"
+                      height="10"
+                      viewBox="0 0 10 10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                      strokeLinecap="round"
+                      aria-hidden="true"
+                    >
+                      <line x1="1.5" y1="1.5" x2="8.5" y2="8.5" />
+                      <line x1="8.5" y1="1.5" x2="1.5" y2="8.5" />
+                    </svg>
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </header>
+      </div>
 
       <main className="main-stack">
         {connState === "waiting_device" && (
@@ -1621,6 +1727,7 @@ export function App() {
               <span className="hero-mute-label">
                 {micMuted ? t.hero.micMutedLabel : t.hero.micLiveLabel}
               </span>
+              <HeroInlineStats />
               {config?.shortcut_toggle_mute && (
                 <kbd className="inline-kbd">
                   {formatShortcutLabel(
@@ -1844,8 +1951,10 @@ export function App() {
             <Sliders size={14} aria-hidden="true" />
             <span>{t.tuning.sectionTitle}</span>
             <span className="summary-meta">
-              {modelVariant === "standard" ? "DFN3" : "DFN3-LL"} ·{" "}
-              {attenValueText}
+              {modelVariant === "standard"
+                ? t.tuning.modelStandard
+                : t.tuning.modelLowLatency}{" "}
+              · {attenValueText}
             </span>
           </summary>
           <div className="disclosure-body">

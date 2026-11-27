@@ -38,7 +38,7 @@ Get the latest installers from **[GitHub Releases](https://github.com/naebox/shi
 ## Key Features
 
 - **Real-Time Neural Noise Cancellation (`DeepFilterNet3`)**
-  - Separates human speech from keyboard clatter, fans, and ambient noise in real time at 48 kHz. Switch effortlessly between **Standard Mode** (`DFN3`, maximum suppression accuracy) and **Low-Latency Mode** (`DFN3-LL`, zero lookahead for live monitoring).
+  - Separates human speech from keyboard clatter, fans, and ambient noise in real time at 48 kHz. Switch effortlessly between **High Accuracy** (maximum suppression clarity) and **Low Latency** (zero lookahead for live monitoring).
 - **Speaker Call Echo Cancellation (`WebRTC AEC3`)**
   - Talking on speakers without headphones? Built-in `WebRTC AEC3` taps your speaker output (WASAPI Loopback on Windows, CoreAudio Process Tap on macOS 14.2+) so remote voices and system audio never echo back into your microphone.
 - **Automatic Voice Isolation (`CAM++`)**

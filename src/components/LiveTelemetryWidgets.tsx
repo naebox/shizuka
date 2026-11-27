@@ -7,7 +7,7 @@ export function dbToRatio(db: number): number {
   return (clamped + 60) / 60;
 }
 
-export function TopBarStatPills() {
+export function HeroInlineStats() {
   const telemetry = useLiveTelemetry();
   const cpuPct = telemetry?.cpu_load_pct ?? 0;
   const cpuText = cpuPct >= 99.95 ? "100%" : `${cpuPct.toFixed(1)}%`;
@@ -17,8 +17,11 @@ export function TopBarStatPills() {
   );
 
   return (
-    <>
-      <span className="stat-pill stat-pill-cpu">
+    <span
+      className="hero-inline-stats"
+      aria-label={`CPU ${cpuText}, ${latencyMs} ms`}
+    >
+      <span className="hero-stat-item">
         <span>CPU</span>
         <span className="stat-pill-val">
           <span className="stat-pill-sizer" aria-hidden="true">
@@ -27,16 +30,19 @@ export function TopBarStatPills() {
           <span className="stat-pill-live">{cpuText}</span>
         </span>
       </span>
-      <span className="stat-pill stat-pill-ms">
+      <span className="hero-stat-dot" aria-hidden="true">
+        ·
+      </span>
+      <span className="hero-stat-item">
         <span className="stat-pill-val">
           <span className="stat-pill-sizer" aria-hidden="true">
-            999
+            99
           </span>
           <span className="stat-pill-live">{latencyMs}</span>
         </span>
         <span>ms</span>
       </span>
-    </>
+    </span>
   );
 }
 

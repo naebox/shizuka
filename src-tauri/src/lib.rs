@@ -14,7 +14,7 @@ use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tauri_plugin_global_shortcut::ShortcutState;
@@ -1025,6 +1025,15 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .setup(move |app| {
+            if let Some(base_win_cfg) = app.config().app.windows.first() {
+                let mut win_cfg = base_win_cfg.clone();
+                #[cfg(target_os = "windows")]
+                {
+                    win_cfg.decorations = false;
+                }
+                WebviewWindowBuilder::from_config(app, &win_cfg)?.build()?;
+            }
+
             let start_minimized = std::env::args().any(|arg| arg == "--minimized");
             diagnostics::info(format!(
                 "Shizuka v{} starting (minimized={})",
